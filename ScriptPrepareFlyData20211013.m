@@ -4,7 +4,7 @@ datafile = 'SocialFlyBubbleExperiments_v2.csv';
 analysis_protocol = 'current_non_olympiad_dickson_VNC';
 settingsdir = '/groups/branson/home/bransonk/behavioranalysis/code/FlyDiscoAnalysis/settings';
 rootdatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/data';
-finaldatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/finaldata';
+finaldatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/sharedata20211226';
 datalocparamsfilestr = 'dataloc_params.txt';
 fdapath = '/groups/branson/home/bransonk/behavioranalysis/code/FlyDiscoAnalysis'; 
 aptpath = '/groups/branson/home/bransonk/tracking/code/APT';
@@ -1571,10 +1571,18 @@ override_datalocparams.apttrkfilestr = 'apttrk.mat';
 override_datalocparams.aptresultsavefilestr = 'apt_results_movie';
 override_ctraxparams = struct;
 override_ctraxparams.figpos = [1,1,1200,856];
+override_ctraxparams.nframes = [1500 1500 1500];
 
-save OverrideParams_MakeAPTResultsMovie.mat override_datalocparams override_ctraxparams
+override_ctraxparams_opto = override_ctraxparams;
+override_ctraxparams_opto.nframes = 1000;
+override_ctraxparams_opto.nframes_beforeindicator = 500;
 
-mintimestamp = datenum('20211029T173000','yyyymmddTHHMMSS');
+hidemovietype = true;
+resultsvideo_nintervals = 3;
+
+save OverrideParams_MakeAPTResultsMovie.mat override_datalocparams override_ctraxparams override_ctraxparams_opto hidemovietype resultsvideo_nintervals
+
+mintimestamp = datenum('20211224T154800','yyyymmddTHHMMSS');
 %for expii = 1:nexps,
 for expi = 1:nexps,
   %expi = exporder(expii);
@@ -1591,8 +1599,10 @@ for expi = 1:nexps,
   
   if istrp,
     analysis_protocol_curr = reg_trp_analysis_protocol;
+    override_ctraxparams_varcurr = 'override_ctraxparams';
   else
     analysis_protocol_curr = analysis_protocol;
+    override_ctraxparams_varcurr = 'override_ctraxparams_opto';
   end
   
   logfile = fullfile(rundir,sprintf('aptresmov_%s_%s.out',expname,timestamp));
@@ -1605,10 +1615,13 @@ for expi = 1:nexps,
     if tmp.datenum >= mintimestamp,
       fprintf('APT results video exists for %d, %s, skipping\n',expi,expname);
       continue;
+    else
+      delete(movfile);
     end
   end
   
-  matlabcmd = sprintf('addpath %s; APT.setpath; addpath %s; modpath; load(''%s/OverrideParams_MakeAPTResultsMovie.mat''); FlyDiscoMakeAPTResultsMovie(''%s'',''settingsdir'',''%s'',''analysis_protocol'',''%s'',''override_datalocparams'',override_datalocparams,''override_ctraxparams'',override_ctraxparams);',aptpath,fdapath,cwd,expdir,reg_settingsdir,analysis_protocol_curr);
+  % FlyDiscoMakeAPTResultsMovie(expdir,'settingsdir',reg_settingsdir,'analysis_protocol',analysis_protocol_curr,'override_datalocparams',override_datalocparams,'override_ctraxparams',eval(override_ctraxparams_varcurr),'hidemovietype',hidemovietype,'nintervals',resultsvideo_nintervals);
+  matlabcmd = sprintf('addpath %s; APT.setpath; addpath %s; modpath; load(''%s/OverrideParams_MakeAPTResultsMovie.mat''); FlyDiscoMakeAPTResultsMovie(''%s'',''settingsdir'',''%s'',''analysis_protocol'',''%s'',''override_datalocparams'',override_datalocparams,''override_ctraxparams'',%s,''hidemovietype'',hidemovietype,''nintervals'',resultsvideo_nintervals);',aptpath,fdapath,cwd,expdir,reg_settingsdir,analysis_protocol_curr,override_ctraxparams_varcurr);
   jobcmd = sprintf('cd %s; %s -nodisplay -batch "%s exit;" > %s 2>&1',cwd,matlabpath,matlabcmd,logfile);
 %   sprintf('ssh login1 "bsub -n2 -J %s -o %s -e %s \\\"cd %s; %s -nodisplay -batch \\\\\\"addpath %s; modpath; FlyDiscoClassifySex(''%s'',''settingsdir'',''%s'',''analysis_protocol'',''%s''); exit;\\\\\\" > %s 2>&1\\\""',...
 %     expname,resfile,resfile,cwd,matlabpath,fdapath,expdir,reg_settingsdir,analysis_protocol,logfile);
@@ -1621,9 +1634,25 @@ end
 
 %% 
 
-
-
-
+resultsmovieisdone = false(1,nexps);
+for expi = 1:nexps,
+  
+  if ~isfinaldata(expi) || isbad(expi),
+    continue;
+  end
+  
+  expdir = expdirs{expi};
+  [~,expname] = fileparts(expdir);
+  movfile = fullfile(expdir,sprintf('%s_%s.mp4',override_datalocparams.aptresultsavefilestr,expname));
+  
+  if exist(movfile,'file')
+    tmp = dir(movfile);
+    if tmp.datenum >= mintimestamp,
+      resultsmovieisdone(expi) = true;
+    end
+  end  
+end
+  
 %%
 % 
 % isfinaldata = false(1,nexps);
@@ -1971,6 +2000,7 @@ if ~exist(finaldatadir,'dir'),
 end
 
 tocopy = {'apt_results_movie_<expname>.mp4','data.mat'};
+destname = {'preview.mp4','data.mat'};
 
 for expi = 1:nexps,
   if ~isfinaldata(expi) || isbad(expi),
@@ -1984,8 +2014,9 @@ for expi = 1:nexps,
   end
   for i = 1:numel(tocopy),
     filestr = strrep(tocopy{i},'<expname>',expname);
+    destfilestr = strrep(destname{i},'<expname>',expname);
     sourcefile = fullfile(expdir,filestr);
-    destfile = fullfile(finalexpdir,filestr);
+    destfile = fullfile(finalexpdir,destfilestr);
     if exist(destfile,'file'),
       continue;
     end
