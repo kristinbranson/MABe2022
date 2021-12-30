@@ -4,7 +4,7 @@ datafile = 'SocialFlyBubbleExperiments_v2.csv';
 analysis_protocol = 'current_non_olympiad_dickson_VNC';
 settingsdir = '/groups/branson/home/bransonk/behavioranalysis/code/FlyDiscoAnalysis/settings';
 rootdatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/data';
-finaldatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/sharedata20211226';
+finaldatadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/sharedata20211230';
 datalocparamsfilestr = 'dataloc_params.txt';
 fdapath = '/groups/branson/home/bransonk/behavioranalysis/code/FlyDiscoAnalysis'; 
 aptpath = '/groups/branson/home/bransonk/tracking/code/APT';
@@ -701,20 +701,31 @@ for i = 1:nmanuallabels,
   manualbehaviors{i} = jablbldata{i}.behaviors.names{1};
 end
 
-yidx = struct;
-yidx.light_strength = 1;
-yidx.light_period = 2;
-yidx.female = 3;
+isled = ~cellfun(@isempty,{activationinfo.LED_panel});
+% for each line with optogenetics, we will have a class for each of the led
+% categories:
+% off vs on
+% off vs strong
+% off vs weak
+% weak vs strong
+% first strong vs last strong
+nledlabels = 5;
+labels_include_opto = intersect({expinfo(isled).label},labels_include);
+% extra categories:
+% sex
+nextralabels = 1;
 nlabelclasses = numel(labels_include);
+noptolabelclasses = numel(labels_include_opto);
 superclasses = fieldnames(label_superclasses);
 nsuperclasses = numel(superclasses);
-nclasses = numel(fieldnames(yidx)) + nlabelclasses + nsuperclasses + nmanuallabels;
-ynames = [fieldnames(yidx);labels_include';superclasses;cellfun(@(x) ['perframe_',x],manualbehaviors','Uni',0)];
+
+nclasses = nextralabels + nlabelclasses + noptolabelclasses*nledlabels + nsuperclasses + nmanuallabels;
+%ynames = [fieldnames(yidx);labels_include';superclasses;cellfun(@(x) ['perframe_',x],manualbehaviors','Uni',0)];
 
 maxframesfillsex = 300;
 isfinaldata = false(1,nexps);
 
-for expii = 1:nexps,
+for expii = 35:nexps,
   expi = exporder(expii);
   
   if ~ismember(expinfo(expi).label,labels_include) || ~isapttracked(expi),
@@ -756,7 +767,7 @@ for expii = 1:nexps,
   fidx.min_fg_dist = find(strcmp(ftd.trk.names,'min fg dist'));
   
   
-  ndatapts = 13 + 3*npts;
+  ndatapts = 14 + 2*npts;
   Xnames = cell(1,ndatapts);
   
   X = nan(nflies,nframes,ndatapts);
@@ -773,8 +784,11 @@ for expii = 1:nexps,
     Xnames{j} = 'y_mm';
     X(i,ff:ef,j) = rtd.trx(i).y_mm;
     j = j+1;
-    Xnames{j} = 'ori_rad';
-    X(i,ff:ef,j) = rtd.trx(i).theta_mm;
+    Xnames{j} = 'cos_ori';
+    X(i,ff:ef,j) = cos(rtd.trx(i).theta_mm);
+    j = j+1;
+    Xnames{j} = 'sin_ori';
+    X(i,ff:ef,j) = sin(rtd.trx(i).theta_mm);
     j = j+1;
     Xnames{j} = 'maj_ax_mm';
     X(i,ff:ef,j) = rtd.trx(i).a_mm*4;
@@ -783,8 +797,9 @@ for expii = 1:nexps,
     X(i,ff:ef,j) = rtd.trx(i).b_mm*4;
     j = j+1;
     
-    x = ftd.trk.data(id,ff:ef,fidx.wing_left_x);
-    y = ftd.trk.data(id,ff:ef,fidx.wing_left_y);
+    % fill nans in wing tracking by linear interpolation
+    x = InterpFillNaNs(ftd.trk.data(id,ff:ef,fidx.wing_left_x));
+    y = InterpFillNaNs(ftd.trk.data(id,ff:ef,fidx.wing_left_y));
     [x_mm,y_mm] = reginfo.registerfn(x,y);
     Xnames{j} = 'wing_left_x';
     X(i,ff:ef,j) = x_mm;
@@ -793,8 +808,8 @@ for expii = 1:nexps,
     X(i,ff:ef,j) = y_mm;
     j = j+1;
     
-    x = ftd.trk.data(id,ff:ef,fidx.wing_right_x);
-    y = ftd.trk.data(id,ff:ef,fidx.wing_right_y);
+    x = InterpFillNaNs(ftd.trk.data(id,ff:ef,fidx.wing_right_x));
+    y = InterpFillNaNs(ftd.trk.data(id,ff:ef,fidx.wing_right_y));
     [x_mm,y_mm] = reginfo.registerfn(x,y);
     Xnames{j} = 'wing_right_x';
     X(i,ff:ef,j) = x_mm;
@@ -821,7 +836,7 @@ for expii = 1:nexps,
     
     
     p = aptd.getPTrkTgt(i);
-    conf = aptd.getPAuxTgt(i,'pTrkConf');
+%     conf = aptd.getPAuxTgt(i,'pTrkConf');
     for k = 1:npts,
       
       [x_mm,y_mm] = reginfo.registerfn(p(k,1,:),p(k,2,:));
@@ -831,9 +846,9 @@ for expii = 1:nexps,
       Xnames{j} = [landmark_names{k},'_y_mm'];
       X(i,:,j) = y_mm;
       j = j+1;
-      Xnames{j} = [landmark_names{k},'_conf'];
-      X(i,:,j) = conf(k,:)/2;
-      j = j+1;
+%       Xnames{j} = [landmark_names{k},'_conf'];
+%       X(i,:,j) = conf(k,:)/2;
+%       j = j+1;
     end
     
   end
@@ -845,16 +860,20 @@ for expii = 1:nexps,
     activation_period = zeros(1,nframes);
     for i = 1:nperiods,
       sf = indd.indicatorLED.startframe(i);
-      ef = indd.indicatorLED.endframe(i);
+      ef = min(indd.indicatorLED.endframe(i),nframes);
       activation_period(sf:ef) = i;
     end
     aic = activationinfo(expi);
     activation_strength = zeros(1,nframes);
     activation_strength(activation_period > 0) = aic.strengthclass(activation_period(activation_period>0));
-    
+    strong_strength = max(aic.strengthclass);
+    weak_strength = min(aic.strengthclass(aic.strengthclass>0));
+    first_strong = find(aic.strengthclass==strong_strength,1);
+    last_strong = find(aic.strengthclass==strong_strength,1,'last');
   end
   
   y = nan(nflies,nframes,nclasses);
+  ynames = cell(nclasses,1);
   
   expidx = nan(1,nmanuallabels);
   for k = 1:nmanuallabels,
@@ -870,15 +889,18 @@ for expii = 1:nexps,
   for fly = 1:nflies,
     ff = rtd.trx(fly).firstframe;
     ef = rtd.trx(fly).endframe;
-    
-    if istrp,
-      y(fly,ff:ef,yidx.light_strength) = 0;
-      y(fly,ff:ef,yidx.light_period) = 0;
-    else
-      y(fly,ff:ef,yidx.light_strength) = activation_strength(ff:ef);
-      y(fly,ff:ef,yidx.light_period) = activation_period(ff:ef) / max(1,max(activation_period(ff:ef)));
-    end
-    
+%     
+%     if istrp,
+%       y(fly,ff:ef,yidx.light_strength) = 0;
+%       y(fly,ff:ef,yidx.light_period) = 0;
+%     else
+%       y(fly,ff:ef,yidx.light_strength) = activation_strength(ff:ef);
+%       y(fly,ff:ef,yidx.light_period) = activation_period(ff:ef) / max(1,max(activation_period(ff:ef)));
+%     end
+%     
+
+    yidx = 1;
+
     isfemale = strcmpi(rtd.trx(fly).sex,'F');
     majfemale = nnz(isfemale) > (ef-ff+1)/2;
     ischange = isfemale(1:end-1)~=isfemale(2:end);
@@ -899,33 +921,123 @@ for expii = 1:nexps,
         fprintf('Lengths of unfilled intervals: %s\n',mat2str(l(l>maxframesfillsex)));
       end
     end
+
+    % fly sex
+    y(fly,ff:ef,yidx) = isfemale;
+    ynames{yidx} = 'female';
+    yidx = yidx+1;
     
-    
-    y(fly,ff:ef,yidx.female) = isfemale;
-    
-    off = numel(fieldnames(yidx));
-    for i=1:nlabelclasses,
-      y(fly,ff:ef,off+i) = strcmpi(expinfo(expi).label,labels_include{i});
+    % line (on frames) vs other lines 
+    for i = 1:nlabelclasses,
+      isclasscurr = strcmpi(expinfo(expi).label,labels_include{i});
+      if istrp,
+        y(fly,ff:ef,yidx) = isclasscurr;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+        y(fly,activation_strength > 0,yidx) = isclasscurr;
+      end
+      ynames{yidx} = labels_include{i};
+      yidx = yidx + 1;      
     end
-    off = off + nlabelclasses;
-    for i = 1:numel(superclasses),
-      y(fly,ff:ef,off+i) = ismember(expinfo(expi).label,label_superclasses.(superclasses{i}));
+
+    % opto experiments: different light periods
+    for i = 1:noptolabelclasses,      
+      isclasscurr = strcmpi(expinfo(expi).label,labels_include_opto{i});
+
+      % off vs on
+      if isclasscurr,
+        y(fly,activation_strength==0,yidx) = 0;
+        y(fly,activation_strength>0,yidx) = 1;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+      end
+      ynames{yidx} = sprintf('%s_offvson',labels_include_opto{i});
+      yidx = yidx + 1;
+
+      % off vs strong
+      if isclasscurr,
+        y(fly,:,yidx) = nan;
+        y(fly,activation_strength==0,yidx) = 0;
+        y(fly,activation_strength==strong_strength,yidx) = 1;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+      end
+      ynames{yidx} = sprintf('%s_offvsstrong',labels_include_opto{i});
+      yidx = yidx + 1;
+      
+      % off vs weak
+      if isclasscurr,
+        y(fly,:,yidx) = nan;
+        y(fly,activation_strength==0,yidx) = 0;
+        y(fly,activation_strength==weak_strength,yidx) = 1;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+      end
+      ynames{yidx} = sprintf('%s_offvsweak',labels_include_opto{i});
+      yidx = yidx + 1;
+      
+      % weak vs strong
+      if isclasscurr,
+        y(fly,:,yidx) = nan;
+        y(fly,activation_strength==weak_strength,yidx) = 0;
+        y(fly,activation_strength==strong_strength,yidx) = 1;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+      end
+      ynames{yidx} = sprintf('%s_weakvsstrong',labels_include_opto{i});
+      yidx = yidx + 1;
+      
+      % first strong vs last strong
+      if isclasscurr,
+        y(fly,:,yidx) = nan;
+        y(fly,activation_period==first_strong,yidx) = 0;
+        y(fly,activation_period==last_strong,yidx) = 1;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+      end
+      ynames{yidx} = sprintf('%s_firstvslast_strong',labels_include_opto{i});
+      yidx = yidx + 1;
+      
     end
-    off = off + nsuperclasses;
+    
+    % line superclasses (on frames) vs other lines 
+    for i = 1:nsuperclasses,
+      isclasscurr = ismember(expinfo(expi).label,label_superclasses.(superclasses{i}));
+      if istrp,
+        y(fly,ff:ef,yidx) = isclasscurr;
+      else
+        y(fly,ff:ef,yidx) = nan; % redundant, should be initialized to nan
+        y(fly,activation_strength > 0,yidx) = isclasscurr;
+      end
+      ynames{yidx} = superclasses{i};
+      yidx = yidx + 1;      
+    end
+    
+      
+%     for i=1:nlabelclasses,
+%       y(fly,ff:ef,off+i) = strcmpi(expinfo(expi).label,labels_include{i});
+%     end
+%     off = off + nlabelclasses;
+%     for i = 1:numel(superclasses),
+%       y(fly,ff:ef,off+i) = ismember(expinfo(expi).label,label_superclasses.(superclasses{i}));
+%     end
+%     off = off + nsuperclasses;
     for i = 1:nmanuallabels,
       expj = expidx(i);
       if isnan(expj),
-        y(fly,ff:ef,off+i) = nan;
-        continue;
+        y(fly,ff:ef,yidx) = nan;
+      else
+        flyj = find(fly == jablbldata{i}.labels(expj).flies);
+        if isempty(flyj) || isempty(jablbldata{i}.labels(expj).t0s{flyj}),
+          y(fly,ff:ef,yidx) = nan;
+        else
+          assert(all(jablbldata{i}.labels(expj).t0s{flyj}>=ff) & all(jablbldata{i}.labels(expj).t1s{flyj}<=ef));
+          y(fly,:,yidx) = set_interval_ends(jablbldata{i}.labels(expj).t0s{flyj},jablbldata{i}.labels(expj).t1s{flyj},...
+            nframes,jablbldata{i}.labels(expj).names{flyj},jablbldata{i}.behaviors.names{1});
+        end
       end
-      flyj = find(fly == jablbldata{i}.labels(expj).flies);
-      if isempty(flyj) || isempty(jablbldata{i}.labels(expj).t0s{flyj}),
-        y(fly,ff:ef,off+i) = nan;
-        continue;        
-      end
-      assert(all(jablbldata{i}.labels(expj).t0s{flyj}>=ff) & all(jablbldata{i}.labels(expj).t1s{flyj}<=ef));
-      y(fly,:,off+i) = set_interval_ends(jablbldata{i}.labels(expj).t0s{flyj},jablbldata{i}.labels(expj).t1s{flyj},...
-        nframes,jablbldata{i}.labels(expj).names{flyj},jablbldata{i}.behaviors.names{1});      
+      ynames{yidx} = sprintf('perframe_%s',manualbehaviors{i});
+      yidx = yidx+1;
     end
     
   end
@@ -939,7 +1051,7 @@ for expii = 1:nexps,
   end
   %yfly(isnan(yfly)) = -1;
   imagesc(reshape(permute(yfly,[2,1,3]),nflies*nframes,nclasses+1)');
-  set(gca,'YTick',1:nclasses+1,'YTickLabel',[fieldnames(yidx);labels_include';superclasses;cellfun(@(x) ['perframe_',x],manualbehaviors','Uni',0);{'fly'}],'TickLabelInterpreter','none');
+  set(gca,'YTick',1:nclasses+1,'YTickLabel',[ynames;{'fly'}],'TickLabelInterpreter','none');
   colorbar;
   impixelinfo;
   set(gca,'CLim',[-.25,1.001]);
@@ -988,6 +1100,7 @@ stats.y.fracperexp = cell(1,nclasses);
 stats.y.counts = cell(1,nclasses);
 stats.y.nframes = 0;
 
+fprintf('Collecting initial info for data set summary stats computation...\n');
 for expi = 1:nexps,
   if ~isfinaldata(expi) || isbad(expi),
     continue;
@@ -1015,6 +1128,7 @@ for k = 1:nclasses,
   stats.y.counts{k} = 0;
 end
 
+fprintf('Computing data set summary stats computation...\n');
 for expi = 1:nexps,
   if ~isfinaldata(expi) || isbad(expi),
     continue;
@@ -1066,74 +1180,58 @@ end
 %               feature |     mean |      std |      min |      max |      1th |      5th |     10th |     25th |     50th |     75th |     90th |     95th |     99th prctile
 % x_mm                  |    -1.10 |    13.44 |   -25.50 |    25.43 |   -22.49 |   -20.52 |   -18.37 |   -11.92 |    -0.73 |    10.98 |    17.76 |    20.15 |    22.32 
 % y_mm                  |     3.05 |    13.35 |   -24.91 |    25.35 |   -21.98 |   -19.68 |   -17.10 |    -9.69 |     2.09 |    12.95 |    18.95 |    20.94 |    22.74 
-% ori_rad               |     0.03 |     1.82 |    -3.14 |     3.14 |    -3.08 |    -2.83 |    -2.51 |    -1.55 |     0.02 |     1.57 |     2.51 |     2.82 |     3.08 
+% cos_ori               |    -0.00 |     0.71 |    -1.00 |     1.00 |    -1.00 |    -0.99 |    -0.95 |    -0.70 |     0.00 |     0.70 |     0.95 |     0.99 |     1.00 
+% sin_ori               |     0.01 |     0.71 |    -1.00 |     1.00 |    -1.00 |    -0.99 |    -0.95 |    -0.69 |     0.01 |     0.71 |     0.95 |     0.99 |     1.00 
 % maj_ax_mm             |     5.48 |     1.55 |     0.80 |     6.82 |     2.16 |     2.41 |     2.48 |     2.58 |     2.73 |     2.91 |     2.98 |     3.02 |     3.10 
 % min_ax_mm             |     1.92 |     0.53 |     0.48 |     2.86 |     0.85 |     0.87 |     0.88 |     0.90 |     0.96 |     1.00 |     1.03 |     1.04 |     1.06 
-% wing_left_x           |    -1.04 |    13.22 |   -26.59 |    25.92 |   -21.92 |   -20.01 |   -18.06 |   -11.84 |    -0.65 |    10.85 |    17.45 |    19.63 |    21.71 
-% wing_left_y           |     3.03 |    13.12 |   -25.87 |    26.60 |   -21.41 |   -19.21 |   -16.85 |    -9.60 |     2.12 |    12.82 |    18.61 |    20.40 |    22.12 
-% wing_right_x          |    -1.11 |    13.21 |   -26.59 |    25.91 |   -21.91 |   -20.01 |   -18.06 |   -11.83 |    -0.70 |    10.80 |    17.42 |    19.64 |    21.73 
-% wing_right_y          |     3.04 |    13.11 |   -25.92 |    26.39 |   -21.41 |   -19.21 |   -16.81 |    -9.56 |     2.12 |    12.79 |    18.58 |    20.39 |    22.11 
+% wing_left_x           |    -1.10 |    13.21 |   -26.59 |    25.92 |   -21.92 |   -20.00 |   -18.05 |   -11.83 |    -0.70 |    10.81 |    17.44 |    19.64 |    21.71 
+% wing_left_y           |     3.03 |    13.12 |   -25.87 |    26.60 |   -21.42 |   -19.22 |   -16.86 |    -9.59 |     2.11 |    12.80 |    18.60 |    20.39 |    22.11 
+% wing_right_x          |    -1.11 |    13.21 |   -26.59 |    25.91 |   -21.91 |   -20.01 |   -18.07 |   -11.82 |    -0.70 |    10.80 |    17.44 |    19.66 |    21.73 
+% wing_right_y          |     3.02 |    13.12 |   -25.92 |    26.39 |   -21.42 |   -19.22 |   -16.82 |    -9.58 |     2.10 |    12.80 |    18.59 |    20.39 |    22.11 
 % body_area_mm2         |     4.00 |     1.08 |     0.35 |     5.41 |     1.50 |     1.64 |     1.69 |     1.77 |     1.96 |     2.19 |     2.27 |     2.32 |     2.39 
 % fg_area_mm2           |    10.92 |     4.09 |     1.51 |    48.68 |     3.67 |     3.95 |     4.06 |     4.26 |     4.67 |     5.38 |     8.23 |    10.15 |    14.55 
 % img_contrast          |     0.67 |     0.21 |     0.06 |     1.04 |     0.25 |     0.27 |     0.28 |     0.30 |     0.33 |     0.37 |     0.41 |     0.43 |     0.47 
 % min_fg_dist           |     9.02 |     5.42 |     0.00 |    40.09 |     0.00 |     0.07 |     0.22 |     1.00 |     3.13 |     6.71 |    10.98 |    13.99 |    20.03 
 % antennae_x_mm         |    -1.10 |    13.66 |   -26.56 |    26.45 |   -23.17 |   -20.97 |   -18.65 |   -12.03 |    -0.70 |    11.08 |    18.03 |    20.59 |    23.03 
 % antennae_y_mm         |     3.07 |    13.57 |   -25.73 |    26.25 |   -22.68 |   -20.10 |   -17.31 |    -9.79 |     2.06 |    13.08 |    19.25 |    21.44 |    23.44 
-% antennae_conf         |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % right_eye_x_mm        |    -1.10 |    13.58 |   -26.28 |    26.07 |   -22.95 |   -20.80 |   -18.57 |   -11.98 |    -0.70 |    11.05 |    17.93 |    20.41 |    22.77 
 % right_eye_y_mm        |     3.06 |    13.49 |   -25.40 |    26.09 |   -22.44 |   -19.96 |   -17.24 |    -9.76 |     2.05 |    13.03 |    19.14 |    21.24 |    23.23 
-% right_eye_conf        |     2.00 |     0.58 |     0.99 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % left_eye_x_mm         |    -1.11 |    13.58 |   -26.28 |    26.22 |   -22.94 |   -20.79 |   -18.53 |   -11.98 |    -0.73 |    11.03 |    17.92 |    20.43 |    22.80 
 % left_eye_y_mm         |     3.06 |    13.49 |   -25.45 |    25.93 |   -22.46 |   -19.94 |   -17.22 |    -9.76 |     2.07 |    13.04 |    19.14 |    21.25 |    23.20 
-% left_eye_conf         |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % left_shoulder_x_mm    |    -1.11 |    13.56 |   -26.20 |    26.12 |   -22.87 |   -20.74 |   -18.50 |   -11.97 |    -0.73 |    11.02 |    17.89 |    20.38 |    22.72 
 % left_shoulder_y_mm    |     3.06 |    13.46 |   -25.36 |    25.84 |   -22.38 |   -19.89 |   -17.19 |    -9.74 |     2.08 |    13.03 |    19.11 |    21.20 |    23.12 
-% left_shoulder_conf    |     2.00 |     0.58 |     0.96 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % right_shoulder_x_mm   |    -1.10 |    13.56 |   -26.22 |    25.99 |   -22.88 |   -20.76 |   -18.54 |   -11.97 |    -0.70 |    11.04 |    17.90 |    20.36 |    22.69 
 % right_shoulder_y_mm   |     3.06 |    13.47 |   -25.28 |    26.02 |   -22.36 |   -19.91 |   -17.21 |    -9.74 |     2.06 |    13.02 |    19.11 |    21.19 |    23.15 
-% right_shoulder_conf   |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % end_notum_x_mm        |    -1.11 |    13.42 |   -25.42 |    25.24 |   -22.41 |   -20.46 |   -18.33 |   -11.92 |    -0.74 |    10.97 |    17.72 |    20.09 |    22.23 
 % end_notum_y_mm        |     3.05 |    13.33 |   -24.82 |    25.25 |   -21.90 |   -19.62 |   -17.07 |    -9.68 |     2.09 |    12.95 |    18.92 |    20.87 |    22.65 
-% end_notum_conf        |     2.00 |     0.58 |     0.99 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % end_abdomen_x_mm      |    -1.09 |    13.29 |   -26.12 |    25.32 |   -22.04 |   -20.17 |   -18.15 |   -11.86 |    -0.71 |    10.90 |    17.56 |    19.84 |    21.89 
 % end_abdomen_y_mm      |     3.02 |    13.19 |   -25.05 |    25.20 |   -21.58 |   -19.38 |   -16.94 |    -9.62 |     2.10 |    12.85 |    18.72 |    20.55 |    22.26 
-% end_abdomen_conf      |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % middle_left_b_x_mm    |    -1.10 |    13.47 |   -25.86 |    25.60 |   -22.60 |   -20.56 |   -18.41 |   -11.92 |    -0.72 |    11.00 |    17.77 |    20.17 |    22.39 
 % middle_left_b_y_mm    |     3.05 |    13.38 |   -24.91 |    25.61 |   -22.08 |   -19.73 |   -17.13 |    -9.69 |     2.07 |    12.95 |    18.98 |    20.97 |    22.86 
-% middle_left_b_conf    |     2.00 |     0.58 |     0.99 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % middle_left_e_x_mm    |    -1.09 |    13.46 |   -26.14 |    25.95 |   -22.67 |   -20.53 |   -18.39 |   -11.90 |    -0.72 |    11.01 |    17.76 |    20.14 |    22.43 
 % middle_left_e_y_mm    |     3.05 |    13.37 |   -25.14 |    25.97 |   -22.13 |   -19.71 |   -17.12 |    -9.69 |     2.06 |    12.92 |    18.98 |    20.94 |    22.94 
-% middle_left_e_conf    |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % middle_right_b_x_mm   |    -1.11 |    13.46 |   -25.97 |    25.59 |   -22.58 |   -20.54 |   -18.36 |   -11.93 |    -0.72 |    10.96 |    17.76 |    20.19 |    22.46 
 % middle_right_b_y_mm   |     3.05 |    13.37 |   -25.23 |    25.59 |   -22.09 |   -19.71 |   -17.11 |    -9.68 |     2.08 |    12.96 |    18.97 |    20.98 |    22.84 
-% middle_right_b_conf   |     2.00 |     0.58 |     0.99 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % middle_right_e_x_mm   |    -1.11 |    13.46 |   -26.31 |    25.90 |   -22.64 |   -20.50 |   -18.33 |   -11.91 |    -0.72 |    10.95 |    17.75 |    20.17 |    22.53 
 % middle_right_e_y_mm   |     3.05 |    13.36 |   -25.51 |    25.83 |   -22.14 |   -19.68 |   -17.09 |    -9.68 |     2.08 |    12.95 |    18.94 |    20.95 |    22.90 
-% middle_right_e_conf   |     2.00 |     0.58 |     0.98 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_front_right_x_mm  |    -1.06 |    13.72 |   -27.31 |    26.85 |   -23.49 |   -21.08 |   -18.70 |   -12.02 |    -0.67 |    11.13 |    18.10 |    20.73 |    23.34 
 % tip_front_right_y_mm  |     3.04 |    13.64 |   -26.49 |    27.11 |   -23.00 |   -20.22 |   -17.39 |    -9.82 |     2.02 |    13.04 |    19.32 |    21.58 |    23.81 
-% tip_front_right_conf  |     2.00 |     0.58 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_middle_right_x_mm |    -1.04 |    13.50 |   -27.17 |    27.02 |   -23.18 |   -20.56 |   -18.37 |   -11.88 |    -0.67 |    11.05 |    17.75 |    20.18 |    22.88 
 % tip_middle_right_y_mm |     3.02 |    13.42 |   -26.23 |    26.80 |   -22.61 |   -19.76 |   -17.12 |    -9.69 |     2.03 |    12.88 |    18.97 |    21.00 |    23.53 
-% tip_middle_right_conf |     2.00 |     0.58 |     0.97 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_back_right_x_mm   |    -1.05 |    13.29 |   -26.58 |    26.57 |   -22.39 |   -20.14 |   -18.11 |   -11.80 |    -0.69 |    10.91 |    17.53 |    19.79 |    22.10 
 % tip_back_right_y_mm   |     3.00 |    13.21 |   -25.74 |    26.19 |   -21.85 |   -19.37 |   -16.94 |    -9.61 |     2.06 |    12.79 |    18.70 |    20.52 |    22.67 
-% tip_back_right_conf   |     2.00 |     0.58 |     0.82 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_back_left_x_mm    |    -1.07 |    13.29 |   -26.80 |    26.14 |   -22.32 |   -20.10 |   -18.06 |   -11.81 |    -0.70 |    10.85 |    17.52 |    19.86 |    22.28 
 % tip_back_left_y_mm    |     3.01 |    13.19 |   -25.90 |    26.66 |   -21.85 |   -19.32 |   -16.88 |    -9.60 |     2.07 |    12.82 |    18.66 |    20.51 |    22.63 
-% tip_back_left_conf    |     2.00 |     0.58 |     0.73 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_middle_left_x_mm  |    -1.08 |    13.49 |   -27.16 |    26.79 |   -23.10 |   -20.50 |   -18.27 |   -11.88 |    -0.70 |    10.93 |    17.74 |    20.26 |    23.08 
 % tip_middle_left_y_mm  |     3.02 |    13.40 |   -26.39 |    26.87 |   -22.61 |   -19.68 |   -17.05 |    -9.68 |     2.05 |    12.92 |    18.91 |    21.00 |    23.45 
-% tip_middle_left_conf  |     2.00 |     0.58 |     0.97 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 % tip_front_left_x_mm   |    -1.08 |    13.72 |   -27.45 |    27.09 |   -23.47 |   -21.09 |   -18.67 |   -12.01 |    -0.70 |    11.10 |    18.09 |    20.75 |    23.43 
 % tip_front_left_y_mm   |     3.04 |    13.63 |   -26.51 |    26.91 |   -23.00 |   -20.21 |   -17.37 |    -9.83 |     2.04 |    13.06 |    19.31 |    21.57 |    23.78 
-% tip_front_left_conf   |     2.00 |     0.58 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 |     1.00 
 
 hfig = 2;
 figure(hfig);
-c = ceil(sqrt(nclasses));
+c = round(sqrt(nclasses));
 r = ceil(nclasses/c);
-hax = createsubplots(r,c,.05);
+hax = createsubplots(r,c,.025);
 for k = 1:nclasses,
   bar(hax(k),stats.y.uniquevals{k},stats.y.counts{k},1);
   title(hax(k),ynames{k},'Interpreter','none');
@@ -1157,32 +1255,56 @@ for k = 1:nclasses,
   fprintf('\n');
 end
 
-%         light_strength:  0 0.5 1
-%           light_period:  0 0.17 0.33 0.4 0.5 0.6 0.67 0.8 0.83 1
-%                 female:  0 1
-%                control:  0 1
-%       BDP_sexseparated:  0 1
-%            Control_RGB:  0 1
-%                  71G01:  0 1
-%    male71G01_femaleBDP:  0 1
-%                  65F12:  0 1
-%                  91B01:  0 1
-%           BlindControl:  0 1
-% aIPgpublished3_newstim:  0 1
-% pC1dpublished1_newstim:  0 1
-%      aIPgBlind_newstim:  0 1
-%              courtship:  0 1
-%                control:  0 1
-%                  blind:  0 1
-%                   aIPg:  0 1
-%             aggression:  0 1
-%               GMR71G01:  0 1
-%           sexseparated:  0 1
-%    perframe_aggression:  0 1
-%         perframe_chase:  0 1
-%     perframe_courtship:  0 1
-%    perframe_highfence2:  0 1
-%       perframe_wingext:  0 1
+%                                    female:  0 1
+%                                   control:  0 1
+%                          BDP_sexseparated:  0 1
+%                               Control_RGB:  0 1
+%                                     71G01:  0 1
+%                       male71G01_femaleBDP:  0 1
+%                                     65F12:  0 1
+%                                     91B01:  0 1
+%                              BlindControl:  0 1
+%                    aIPgpublished3_newstim:  0 1
+%                    pC1dpublished1_newstim:  0 1
+%                         aIPgBlind_newstim:  0 1
+%                      BlindControl_offvson:  0 1
+%                  BlindControl_offvsstrong:  0 1
+%                    BlindControl_offvsweak:  0 1
+%                 BlindControl_weakvsstrong:  0 1
+%           BlindControl_firstvslast_strong:  0 1
+%                       Control_RGB_offvson:  0 1
+%                   Control_RGB_offvsstrong:  0 1
+%                     Control_RGB_offvsweak:  0 1
+%                  Control_RGB_weakvsstrong:  0 1
+%            Control_RGB_firstvslast_strong:  0 1
+%                 aIPgBlind_newstim_offvson:  0 1
+%             aIPgBlind_newstim_offvsstrong:  0 1
+%               aIPgBlind_newstim_offvsweak:  0 1
+%            aIPgBlind_newstim_weakvsstrong:  0 1
+%      aIPgBlind_newstim_firstvslast_strong:  0 1
+%            aIPgpublished3_newstim_offvson:  0 1
+%        aIPgpublished3_newstim_offvsstrong:  0 1
+%          aIPgpublished3_newstim_offvsweak:  0 1
+%       aIPgpublished3_newstim_weakvsstrong:  0 1
+% aIPgpublished3_newstim_firstvslast_strong:  0 1
+%            pC1dpublished1_newstim_offvson:  0 1
+%        pC1dpublished1_newstim_offvsstrong:  0 1
+%          pC1dpublished1_newstim_offvsweak:  0 1
+%       pC1dpublished1_newstim_weakvsstrong:  0 1
+% pC1dpublished1_newstim_firstvslast_strong:  0 1
+%                                 courtship:  0 1
+%                                   control:  0 1
+%                                     blind:  0 1
+%                                      aIPg:  0 1
+%                                aggression:  0 1
+%                                  GMR71G01:  0 1
+%                              sexseparated:  0 1
+%                       perframe_aggression:  0 1
+%                            perframe_chase:  0 1
+%                        perframe_courtship:  0 1
+%                       perframe_highfence2:  0 1
+%                          perframe_wingext:  0 1
+%                        perframe_wingflick:  0 1
 
 %% save figures
 
@@ -1202,15 +1324,15 @@ for expi = 1:nexps,
   nframes = size(X,2);
   
   clf(hfig);
-  hax = [axes('Parent',hfig,'Position',[.1,.3050,.875,.645])
-    axes('Parent',hfig,'Position',[.1,.05,.875,.245])];
+  hax = [axes('Parent',hfig,'Position',[.2,.5050,.8,.445])
+    axes('Parent',hfig,'Position',[.2,.05,.8,.445])];
 
   t = repmat(linspace(-3,3,nframes),[1,nflies]);
   im = [((reshape(permute(X,[2,1,3]),nflies*nframes,ndatapts)-stats.X.mean)./stats.X.std)';t];
   imrgb = colormap_image(im,cm,[-3,3]);
   imrgb(isnan(repmat(im,[1,1,3]))) = 0;
   
-  imagesc(hax(1),imrgb);
+  image(hax(1),imrgb);
   set(hax(1),'YTick',1:ndatapts+1,'YTickLabel',[Xnames,{'Time'}],'TickLabelInterpreter','none','XtickLabel',[]);
   hcb = colorbar(hax(1));
   hcb.Label.String = 'Stds';
@@ -1230,7 +1352,7 @@ for expi = 1:nexps,
   imrgb = colormap_image(im,cm,[0,1]);
   imrgb(isnan(repmat(im,[1,1,3]))) = 0;
   image(hax(2),imrgb);
-  set(hax(2),'YTick',1:nclasses+1,'YTickLabel',[fieldnames(yidx);labels_include';superclasses;cellfun(@(x) ['perframe_',x],manualbehaviors','Uni',0);{'fly'}],'TickLabelInterpreter','none','XtickLabel',[]);
+  set(hax(2),'YTick',1:nclasses+1,'YTickLabel',[ynames;{'fly'}],'TickLabelInterpreter','none','XtickLabel',[]);
   colorbar(hax(2));
   set(hax(2),'CLim',[-.25,1.001]);
   colormap(hax(2),kjet(256));
@@ -1999,8 +2121,8 @@ if ~exist(finaldatadir,'dir'),
   mkdir(finaldatadir);
 end
 
-tocopy = {'apt_results_movie_<expname>.mp4','data.mat'};
-destname = {'preview.mp4','data.mat'};
+tocopy = {'apt_results_movie_<expname>.mp4','data.mat','DataPlot.png'};
+destname = {'preview.mp4','data.mat','DataPlot.png'};
 
 for expi = 1:nexps,
   if ~isfinaldata(expi) || isbad(expi),
