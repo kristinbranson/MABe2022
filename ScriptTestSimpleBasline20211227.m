@@ -1,5 +1,5 @@
 %% read in data locations
-rootdatadir = 'sharedata20211226';
+rootdatadir = 'sharedata20211230';
 splitinfofile = 'SplitInfo.csv';
 datafilestr = 'data.mat';
 % splitnames are
@@ -8,7 +8,9 @@ datafilestr = 'data.mat';
 % test1
 % test2
 
-load PrepareDataState20211223 Xnames ynames
+SetUpPaths;
+
+load PrepareDataState20211230 Xnames ynames
 Xnames0 = Xnames;
 ynames0 = ynames;
 nfeaturesX0 = numel(Xnames0);
@@ -31,7 +33,7 @@ for i = 1:nsplits,
   nexpspersplit(i) = nnz(exp2splitidx==i);
 end
 
-% how big will each split be? 
+%% how big will each split be? 
 expi = 1;
 load(fullfile(expdirs{expi},datafilestr),'X');
 sizeinfo = whos('X');
@@ -39,6 +41,11 @@ ngigspersplit = sizeinfo.bytes*nexpspersplit/2^30;
 for spliti = 1:nsplits,
   fprintf('Approx amount of space to hold %s split X: %.1f GB\n',splittypes{spliti},ngigspersplit(spliti));
 end
+
+% Approx amount of space to hold usertrain split X: 6.9 GB
+% Approx amount of space to hold testtrain split X: 3.5 GB
+% Approx amount of space to hold test1 split X: 2.4 GB
+% Approx amount of space to hold test2 split X: 2.9 GB
 
 %% create big files with each split
 
@@ -213,9 +220,9 @@ clear tmp;
 
 %% spot sanity check
 
-expi = 37;
+expi = randsample(nexps,1);
 expii = find(reorderinfo.exps==expi);
-spliti = splitidx(expi);
+spliti = exp2splitidx(expi);
 load(sprintf('X%s.mat',splittypes{spliti}));
 load(sprintf('y%s.mat',splittypes{spliti}));
 dcurr = load(fullfile(expdirs{expi},datafilestr));
@@ -239,24 +246,21 @@ for traji = 1:ntrajs,
   assert(isequaln(Xnew,Xbase),'data mismatch');
   assert(isequaln(framesnew,framesbase),'frame mismatch');
 end
+fprintf('Spot check succeeded!\n');
 
-%% raw data - no temporal or social information
-
-ynamesordinal = {
-  'light_strength'
-  'light_period'
-  };
+%% load data
 
 testdata = load('Xtest1.mat');
 tmp = load('ytest1.mat');
 testdata.y = tmp.y;
-[testdata.X,featurenames] = BasicCleanXFeatures(testdata.X,Xnames);
+featurenames = Xnames;
 
 traindata = load('Xtesttrain.mat');
 tmp = load('ytesttrain.mat');
 traindata.y = tmp.y;
-traindata.X = BasicCleanXFeatures(traindata.X,Xnames);
 clear tmp;
+
+%% raw data - no temporal or social information
 
 traindatacollapse = CollapseData_1Animal1Frame(traindata);
 testdatacollapse = CollapseData_1Animal1Frame(testdata);
@@ -269,39 +273,45 @@ trainsig = nanmean(traindatacollapse.X,2);
 
 maxntrain = 10000;
 
+% markers = {'o','+'};
+% colors = [0,0,1;.7,0,0];
+% hfig = 123;
+% figure(hfig);
+% clf;
+% nr = round(sqrt(numel(ynames)));
+% nc = ceil(numel(ynames)/nr);
+% hax = createsubplots(nr,nc,.025);
+
 for yi = 1:numel(ynames),
   
   yname = ynames{yi};
-  isordinal = ismember(yname,ynamesordinal);
   
   fprintf('%s:\n',yname);
   
   [Xtrain,ytrain] = BasicCleanXy(traindatacollapse.X,traindatacollapse.y(yi,:),trainmu,trainsig);
   labelscurr = unique(ytrain(:));
   nlabelscurr = numel(labelscurr);
-  if ~isordinal,
-    assert(nlabelscurr==2);
-  end
-  if isordinal,
-    continue;
-  end
+  assert(nlabelscurr==2);
       
-  % sample some data for training, use the rest for holdout
-  counts = hist(ytrain,labelscurr);
-  ncurr = numel(ytrain);
-  nsample = min(maxntrain,ncurr);
-  psample = min(1,nsample./counts/nlabelscurr);
-  dosample = rand(ncurr,1);
-  for labeli = 1:nlabelscurr,
-    label = labelscur(labeli);
-    dosample(ytrain==label) = dosample(ytrain==label) <= psample(labeli);
-  end
-  dosample = dosample ~= 0;
-  nsamplecurr = nnz(dosample);
+  % sample some data for training
+  [dosample] = BalancedSample(ytrain,maxntrain,labelscurr);
+  
+%   counts = hist(ytrain,labelscurr);
+%   ncurr = numel(ytrain);
+%   nsample = min(maxntrain,ncurr);
+%   psample = min(1,nsample./counts/nlabelscurr);
+%   dosample = rand(ncurr,1);
+%   for labeli = 1:nlabelscurr,
+%     label = labelscurr(labeli);
+%     dosample(ytrain==label) = dosample(ytrain==label) <= psample(labeli);
+%   end
+%   dosample = dosample ~= 0;
+%   nsamplecurr = nnz(dosample);
   Xsample = Xtrain(:,dosample);
   ysample = ytrain(dosample);
   
-  [~,ysampleidx] = ismember(ysample,labelscurr);
+  [ism,ysampleidx] = ismember(ysample,labelscurr);
+  assert(all(ism));
   
   [coeffs,dev,stats] = mnrfit(Xsample',ysampleidx');
   [~,order] = sort(abs(coeffs(2:end)),'descend');
@@ -311,9 +321,9 @@ for yi = 1:numel(ynames),
   end
   
   ysampleidxfit = mnrval(coeffs,Xsample');
-  ysampleidxfit = max(ysampleidxfit,[],2)';
-  %ysamplefit = (ysamplefit(:,2) > ysamplefit(:,1))';
-  trainconfusionmatrx = ComputeConfusionMatrix(ysampleidx,ysampleidxfit,1:nlabelscurr);
+  [~,ysampleidxfit] = max(ysampleidxfit,[],2);
+  ysamplefit = labelscurr(ysampleidxfit)';
+  trainconfusionmatrix = ComputeConfusionMatrix(ysample,ysamplefit,labelscurr);
   for labeli = 1:nlabelscurr,
     label = labelscurr(labeli);
     s = sum(trainconfusionmatrix(labeli,:));
@@ -321,10 +331,206 @@ for yi = 1:numel(ynames),
   end
 
   [Xtest,ytest] = BasicCleanXy(testdatacollapse.X,testdatacollapse.y(yi,:),trainmu,trainsig);
-  ytestfit = mnrval(coeffs,Xtest');
-  ytestfit = (ytestfit(:,2) > ytestfit(:,1))';
-  testconfusionmatrix = ComputeConfusionMatrix(ytest,ytestfit,[0,1]);
-  fprintf('Test n. false positives = %d / %d = %f\n',testconfusionmatrix(1,2),sum(testconfusionmatrix(1,:)),testconfusionmatrix(1,2)/sum(testconfusionmatrix(1,:)));
-  fprintf('Test n. false negatives = %d / %d = %f\n',testconfusionmatrix(2,1),sum(testconfusionmatrix(2,:)),testconfusionmatrix(2,1)/sum(testconfusionmatrix(2,:)));
+  ytestidxfit = mnrval(coeffs,Xtest');
+  [~,ytestidxfit] = max(ytestidxfit,[],2);
+  ytestfit = labelscurr(ytestidxfit)';
+  testconfusionmatrix = ComputeConfusionMatrix(ytest,ytestfit,labelscurr);
+  for labeli = 1:nlabelscurr,
+    label = labelscurr(labeli);
+    s = sum(testconfusionmatrix(labeli,:));
+    fprintf('Test label = %d, error fraction = %d / %d = %f\n',label,s-testconfusionmatrix(labeli,labeli),s,(s-testconfusionmatrix(labeli,labeli))/s);
+  end
 
+%   h = gobjects(nlabelscurr);
+%   legs = cell(nlabelscurr);
+%   hold(hax(yi),'on');
+%   for labeli = 1:nlabelscurr,
+%     for predi = 1:nlabelscurr,
+%       idxcurr = ytest==labelscurr(labeli)&ytestfit==labelscurr(predi);
+%       h(labeli,predi) = plot(hax(yi),Xtest(order(1),idxcurr),Xtest(order(2),idxcurr),...
+%         markers{mod(labeli-1,numel(markers))+1},...
+%         'Color',colors(mod(predi-1,numel(colors))+1,:),'MarkerSize',4);
+%       legs{labeli,predi} = sprintf('True = %d, Pred = %d',labelscurr(labeli),labelscurr(predi));
+%     end
+%   end
+%   if yi == 1,
+%     legend(h(:),legs(:));
+%   end
+%   xlabel(hax(yi),featurenames{order(1)},'Interpreter','none');
+%   ylabel(hax(yi),featurenames{order(2)},'Interpreter','none');
+%   title(hax(yi),ynames{yi},'Interpreter','none');
+%   axisalmosttight([],hax(yi));
+%   drawnow;
+end
+
+
+%% some social and temporal information, pca
+% 
+% maxntrain = 10000;
+% winrad = 150;
+% ntoffs2 = 10;
+% toffs2 = unique(round(logspace(0,log10(winrad),ntoffs2)));
+% toffs = [-toffs2(end:-1:1),0,toffs2];
+% ntoffs = numel(toffs);
+% 
+% nfliesclose = 4;
+% pcd = 500;
+% maxntest = maxntrain;
+% 
+% for yi = 1:numel(ynames),
+%   
+%   yname = ynames{yi};
+%   fprintf('%s:\n',yname);
+%   
+%   
+%   [dosample,labelscurr] = BalancedSample(traindata.y(yi,:,:),maxntrain);
+%   nlabelscurr = numel(labelscurr);
+%   dosample(:,:,1:winrad) = false;
+%   dosample(:,:,end-winrad+1:end) = false;
+%   nsamplescurr = nnz(dosample);
+%   ysample = traindata.y(yi,dosample);
+%   [ism,ysampleidx] = ismember(ysample,labelscurr);
+%   assert(all(ism));
+%   
+%   [Xsample] = SocialFeatureRepresentation(traindata.X,Xnames,'toffs',toffs,'dosample',dosample,'nfliesclose',nfliesclose,'verbose',0);
+%   nfeaturesperframe = size(Xsample,1);
+%   nfeaturestotal = nfeaturesperframe*nfliesclose*ntoffs;
+%   
+%   % z-score
+%   Zsample = reshape(Xsample,[nfeaturestotal,nsamplescurr])';
+%   mu = nanmean(Zsample,1);
+%   sig = nanstd(Zsample,1,1);
+%   sig(sig<eps) = 1;
+%   Zsample = (Zsample-mu)./sig;
+%   % fill missing data
+%   Zsample(isnan(Zsample)) = 0;
+%   
+%   % pca
+%   %pcd = min(nfeaturestotal,nsamplescurr);
+%   assert(pcd <= nfeaturestotal);
+%   fprintf('PCA...\n');
+%   [U,lambda] = pca(Zsample,'centered',false,'Economy',true,'NumComponents',pcd,'Rows','all');
+%   Xpca = Zsample*U;
+%   
+%   fprintf('Logistic regression...\n');
+%   [coeffs,dev,stats] = mnrfit(Xpca,ysampleidx');
+%   
+%   [~,order] = sort(abs(coeffs(2:end)),'descend');
+%   for ii = 1:3,
+%     i = order(ii);
+%     fprintf('PC %d: coeff = %f, p = %f\n',i,coeffs(i+1),stats.p(i+1));
+%   end
+%   
+%   ysampleidxfit = mnrval(coeffs,Xpca);
+%   [~,ysampleidxfit] = max(ysampleidxfit,[],2);
+%   ysamplefit = labelscurr(ysampleidxfit)';
+%   trainconfusionmatrix = ComputeConfusionMatrix(ysample,ysamplefit,labelscurr);
+%   for labeli = 1:nlabelscurr,
+%     label = labelscurr(labeli);
+%     s = sum(trainconfusionmatrix(labeli,:));
+%     fprintf('Train label = %d, error fraction = %d / %d = %f\n',label,s-trainconfusionmatrix(labeli,labeli),s,(s-trainconfusionmatrix(labeli,labeli))/s);
+%   end
+%   
+%   [dosampletest] = BalancedSample(testdata.y(yi,:,:),maxntest,labelscurr);
+%   dosampletest(:,:,1:winrad) = false;
+%   dosampletest(:,:,end-winrad+1:end) = false;
+%   nsamplestest = nnz(dosampletest);
+%   
+%   [Xtest] = SocialFeatureRepresentation(testdata.X,Xnames,'toffs',toffs,'dosample',dosampletest,'nfliesclose',nfliesclose,'verbose',0);
+%   % z-score
+%   Ztest = reshape(Xtest,[nfeaturestotal,nsamplestest])';
+%   Ztest = (Ztest-mu)./sig;
+%   % fill missing data
+%   Ztest(isnan(Ztest)) = 0;
+%   % PCA
+%   Xtestpca = Ztest*U;
+%   
+%   ytest = testdata.y(yi,dosampletest);
+%   ytestidxfit = mnrval(coeffs,Xtestpca);
+%   [~,ytestidxfit] = max(ytestidxfit,[],2);
+%   ytestfit = labelscurr(ytestidxfit)';
+%   
+%   testconfusionmatrix = ComputeConfusionMatrix(ytest,ytestfit,labelscurr);
+%   for labeli = 1:nlabelscurr,
+%     label = labelscurr(labeli);
+%     s = sum(testconfusionmatrix(labeli,:));
+%     fprintf('Test label = %d, error fraction = %d / %d = %f\n',label,s-testconfusionmatrix(labeli,labeli),s,(s-testconfusionmatrix(labeli,labeli))/s);
+%   end
+%   
+% end
+
+%% some social and temporal information, pca, on cluster
+
+maxntrain = 10000;
+winrad = 150;
+% winradpool = 1000;
+ntoffs2 = 10;
+% ntoffspool2 = 20;
+nfliesclose = 4;
+pcd = 500;
+maxntest = maxntrain;
+matlabpath = '/misc/local/matlab-2019a/bin/matlab';
+cwd = pwd;
+
+usecluster = false;
+
+testname = sprintf('winrad%03d',winrad);
+
+if usecluster,
+  loadfile = fullfile(cwd,'SocialPCATestData.mat');
+  save(loadfile,'maxntrain','winrad','ntoffs2','nfliesclose','pcd','maxntest','Xnames','ynames','traindata','testdata');%,'winradpool','ntoffspool2');
+else
+  data = struct;
+  data.maxntrain = maxntrain;
+  data.winrad = winrad;
+  data.ntoffs2 = ntoffs2;
+  data.nfliesclose = nfliesclose;
+  data.pcd = pcd;
+  data.maxntest = maxntest;
+  data.Xnames = Xnames;
+  data.ynames = ynames;
+  data.traindata = traindata;
+  data.testdata = testdata;
+end
+
+for yi = 1:numel(ynames)-1,
+  
+  savefile = fullfile(cwd,sprintf('SocialPCATestResult%02d_%s.mat',yi,testname));
+  if usecluster,
+    logfile = fullfile(cwd,'run',sprintf('SocialPCATestResult%02d_%s.out',yi,testname));
+    resfile = fullfile(cwd,'run',sprintf('SocialPCATestResult%02d_%s_bsub.out',yi,testname));
+    reserrfile = fullfile(cwd,'run',sprintf('SocialPCATestResult%02d_%s_bsub.err',yi,testname));  
+    matlabcmd = sprintf('SetUpPaths; SocialPCATest(%d,''%s'',''%s'');',yi,loadfile,savefile);
+    jobcmd = sprintf('cd %s; %s -nodisplay -batch "%s exit;" > %s 2>&1',cwd,matlabpath,matlabcmd,logfile);
+    bsubcmd = sprintf('bsub -n 4 -J socialtest%02d_%s -o %s -e %s "%s"',yi,testname,resfile,reserrfile,strrep(jobcmd,'"','\"'));
+    sshcmd = sprintf('ssh login1 "%s"',strrep(strrep(bsubcmd,'\','\\'),'"','\"'));
+    disp(sshcmd);
+    unix(sshcmd);
+  else
+    SocialPCATest(yi,data,savefile);
+  end
+  
+end
+
+for yi = 1:numel(ynames),
+  
+  savefile = fullfile(cwd,sprintf('SocialPCATestResult%02d.mat',yi));
+  fprintf('%s:\n',ynames{yi});
+  load(savefile);
+  [~,order] = sort(abs(coeffs(2:end)),'descend');
+  for ii = 1:3,
+    i = order(ii);
+    fprintf('PC %d: coeff = %f, p = %f\n',i,coeffs(i+1),stats.p(i+1));
+  end
+  for labeli = 1:nlabelscurr,
+    label = labelscurr(labeli);
+    s = sum(trainconfusionmatrix(labeli,:));
+    fprintf('Train label = %d, error fraction = %d / %d = %f\n',label,s-trainconfusionmatrix(labeli,labeli),s,(s-trainconfusionmatrix(labeli,labeli))/s);
+  end
+  for labeli = 1:nlabelscurr,
+    label = labelscurr(labeli);
+    s = sum(testconfusionmatrix(labeli,:));
+    fprintf('Test label = %d, error fraction = %d / %d = %f\n',label,s-testconfusionmatrix(labeli,labeli),s,(s-testconfusionmatrix(labeli,labeli))/s);
+  end
+  
 end

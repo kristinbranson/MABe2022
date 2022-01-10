@@ -1247,6 +1247,7 @@ for k = 1:nclasses,
 end
 delete(hax(nclasses+1:end));
 save2pdf('LabelInfo.pdf',hfig);
+save2png('LabelInfo.png',hfig);
 
 maxnamelength = max(cellfun(@numel,ynames));
 for k = 1:nclasses,
