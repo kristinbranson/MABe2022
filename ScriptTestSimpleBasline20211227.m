@@ -99,7 +99,7 @@ for spliti = 1:nsplits,
   fprintf('Split %d (%s)\n',spliti,splittypes{spliti});
     
   dataoff = 0;
-  idoff = 1;
+  idoff = 1; % this should be 0
   videooff = 1;
   
   X = nan(nfeaturesX,maxnflies,0);

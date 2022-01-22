@@ -23,12 +23,8 @@ else
 end
 rng('default');
 
-% if ~exist('ntoffspool2','var'),
-%   ntoffspool2 = 0;
-% end
-% if ~exist('fracpooltrain','var'),
-%   fracpooltrain = 1;
-% end
+yname = ynames{yi};
+fprintf('%s:\n',yname);
 
 % train classifier on short snippets
 if winrad < 5*ntoffs2,
@@ -37,16 +33,19 @@ else
   toffs2 = unique(round(logspace(0,log10(winrad),ntoffs2)));
 end
 toffs = [-toffs2(end:-1:1),0,toffs2];
-
-% % pool results over many windows
-% toffspool2 = unique(round(linspace(1,winradpool,ntoffspool2)));
-% toffspool = [-toffspool2(end:-1:1),0,toffspool2];
-
 ntoffs = numel(toffs);
-% ntoffspool = numel(toffspool);
-  
-yname = ynames{yi};
-fprintf('%s:\n',yname);
+
+% pool results over many windows
+dopool = exist('winradpool','var') && isempty(regexp(yname,'^perframe','once'));
+
+if dopool,
+  if ~exist('ntoffspool2','var'),
+    ntoffspool2 = 0;
+  end
+  toffspool2 = unique(round(linspace(1,winradpool,ntoffspool2)));
+  toffspool = [-toffspool2(end:-1:1),0,toffspool2];
+  ntoffspool = numel(toffspool);
+end
  
 [dosample,labelscurr] = BalancedSample(traindata.y(yi,:,:),maxntrain);
 nlabelscurr = numel(labelscurr);
