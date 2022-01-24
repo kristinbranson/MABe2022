@@ -77,7 +77,7 @@ class FlyDataset(Dataset):
   Load in the data from file xfile and initialize member variables
   Optional annotations from yfile
   """
-  def __init__(self,xfile,yfile=None,ntgtsout=None):
+  def __init__(self,xfile,yfile=None,ntgtsout=None,normalize=True):
     data = np.load(xfile,allow_pickle=True).item()
     # X is a dictionary keyed by random 20-character strings
     self.X = data['keypoints']
@@ -113,7 +113,11 @@ class FlyDataset(Dataset):
     # number of coordinates -- 2
     self.d = firstx.shape[1]
     
-
+    # for z-scoring
+    self.mu = None
+    self.sig = None
+    if normalize:
+      self.zscore()
     
     # y is optional, and not None only if annotations are provided in yfile
     # y is a dictionary keyed by the same 20-character strings as X, with
@@ -143,8 +147,8 @@ class FlyDataset(Dataset):
     # not all flies have data for each sequence
     self.nfliesperseq = {}
     i = 0
-    self.idx2seqnum = np.zeros(self.nseqs*self.ntgts,dtype=np.uint32)
-    self.idx2tgt = np.zeros(self.nseqs*self.ntgts,dtype=np.uint32)
+    self.idx2seqnum = np.zeros(self.nseqs*self.ntgts,dtype=np.int32)
+    self.idx2tgt = np.zeros(self.nseqs*self.ntgts,dtype=np.int32)
     for k,v in self.X.items():
       seqi = self.seqids.index(k)
       # x is nfeatures x d x seqlength x ntgts
@@ -169,21 +173,40 @@ class FlyDataset(Dataset):
         self.skeleton_edges[i,j] = featurenamesx.index(skeleton_edge_names[i][j])  
   
   def reformat_x(self,x):
-    x = x.reshape((self.nfeatures*self.d,x.shape[1],x.shape[2]))
+    x = x.reshape((self.nfeatures*self.d,x.shape[2],x.shape[3]))
     return x
   
-  # def zscore(self):
-  #   # compute mean
-  #   # could compute std at same time, but want to avoid overflow
-  #   self.mu = 0.
-  #   for seqid,x in self.X.items():
-  #     isgood = np.isnan(x) == False
-  #     self.mu += np.nansum(x,axis=(0,1))
-  #     n += np.sum(isgood,axis=(0,1))
-  #   self.mu /= n
-  #
+  def zscore(self):
     
-  
+    # compute mean
+    # could compute std at same time, but want to avoid overflow
+    self.mu = 0.
+    n = 0.
+    for x in self.X.values():
+      isgood = np.isnan(x) == False
+      self.mu += np.nansum(x,axis=(2,3))
+      n += np.sum(isgood,axis=(2,3))
+    self.mu /= n
+    self.mu = self.mu.reshape((self.mu.shape[0],self.mu.shape[1],1,1))
+    
+    # compute standard deviation
+    self.sig = 0.
+    for x in self.X.values():
+      self.sig += np.nansum( (x-self.mu)**2.,axis=(2,3) ) / n
+    self.sig = np.sqrt(self.sig)
+    self.sig = self.sig.reshape((self.mu.shape[0],self.mu.shape[1],1,1))
+    
+    for seqid in self.X:
+      # normalize
+      self.X[seqid] = (self.X[seqid]-self.mu)/self.sig
+      # set nans to the mean value
+      isreal = get_real_flies(self.X[seqid])
+      replace = np.isnan(self.X[seqid])
+      replace[:,:,:,isreal==False] = False
+      self.X[seqid][replace] = 0.
+      
+    return
+
   # total number of sequence-fly pairs
   def __len__(self):
     return self.n
@@ -240,18 +263,21 @@ class FlyDataset(Dataset):
   Input:
   idx: Integer between 0 and len(self)-1 specifying which sample to select.
   Output:
+  Dictionary with the following entries:
   x is an ndarray of size (nkeypoints*d) x seqlength x ntgts data sample
   y (only output for labeled dataset) is an ndarray of size
   ncategories x seqlength output data sample for target 0
+  seqnum: integer identifying the selected sequence
+  tgt: Integer identifying the selected fly.
   """
   def __getitem__(self,idx):
     if self.y is None:
-      x,_,_,_ = self.getitem(idx)
+      x,seqid,seqnum,tgt = self.getitem(idx)
       x = self.reformat_x(x)
-      return x
-    x,y,_,_,_ = self.getitem(idx)
+      return {'x': x, 'seqnum': seqnum, 'tgt': tgt}
+    x,y,seqid,seqnum,tgt = self.getitem(idx)
     x = self.reformat_x(x)
-    return x,y
+    return {'x': x, 'y': y, 'seqnum': seqnum, 'tgt': tgt}
 
   """
   d = data.get_fly_dists(x,tgt=0)
@@ -355,12 +381,12 @@ def get_Dark3_cmap():
 isreal = get_real_flies(x)
 Returns which flies in the input ndarray x correspond to real data (are not nan).
 Input:
-x: ndarray of arbitrary dimensions, as long as the first two dimensions are nfeatures x 2,
-and correspond to the keypoints and x,y coordinates.
+x: ndarray of arbitrary dimensions, as long as the last dimension corresponds to targets.
 """
 def get_real_flies(x):
-  # x is nfeatures x 2 x ntgts
-  isreal = np.all(np.isnan(x),axis=(0,1))==False
+  # x is ... x ntgts
+  dims = tuple(range(x.ndim-1))
+  isreal = np.all(np.isnan(x),axis=dims)==False
   return isreal
 
 """
