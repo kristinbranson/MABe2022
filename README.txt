@@ -11,6 +11,18 @@ can be used to visualize a fly, a frame, and a sequence of frames.
 
 =================================
 
+==models.py==
+
+Where nnet models will go. Currently, there is a very dumb UNet in there.
+
+=================================
+
+==main.py==
+
+Where code for training and testing nets will go. 
+
+=================================
+
 ==SaveFlyData.py==
 
 Convert from MATLAB data for videos to numpy data for sequences for

@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from typing import Callable, Optional
 
 # Define network structure - UNet
 # Copy-paste & modify from https://github.com/milesial/Pytorch-UNet

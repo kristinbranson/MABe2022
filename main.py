@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch import optim
 import torch.nn as nn
+import torch.nn.functional as F
 torch.manual_seed(0)
 
 import matplotlib
@@ -65,7 +66,7 @@ def TrainDriver():
   weight_decay = 1e-8 # how learning rate decays over time
   momentum = 0.9 # how much to use previous gradient direction
   nepochs_per_save = 1 # how often to save the network
-  niters_per_save = 100 # how often to store losses
+  niters_per_store = 5 # how often to store losses
 
   # some day we might want to be able to reload
   loadepoch = 0
@@ -98,8 +99,11 @@ def TrainDriver():
   # Following https://github.com/milesial/Pytorch-UNet
   # Use binary cross entropy loss combined with sigmoid output activation function.
   # We combine here for numerical improvements
-  criterion = nn.BCEWithLogitsLoss()
-
+  #criterion = nn.BCEWithLogitsLoss()
+  # inputs: (input, target, weight)
+  #criterion = models.BCEWithLogitsWeightedLoss()
+  criterion = F.binary_cross_entropy_with_logits
+  
   loadfile = None
   loadepoch = 0
   alllosses = None
@@ -127,7 +131,7 @@ def TrainDriver():
 
   # loop through entire training data set nepochs times
   if alllosses is None:
-    alllosses = {'iters': -np.ones(nepochs*len(train_dataset)//niters_per_save), 'epochs': -np.ones(nepochs)}
+    alllosses = {'iters': -100*np.ones((nepochs*len(train_dataloader))//niters_per_store), 'epochs': -100*np.ones(nepochs)}
   for epoch in range(loadepoch,nepochs):
     net.train() # put in train mode (affects batchnorm)
     epoch_loss = 0
@@ -145,10 +149,10 @@ def TrainDriver():
         ypred = net(x) # evaluate network on batch
         assert torch.any(torch.isnan(ypred)) == False , 'ypred contains nans, iter %d'%iters
         mask = torch.isnan(y)==False
-        loss = criterion(ypred[mask][...,0]*w[mask],y[mask]*w[mask]) # compute loss
+        loss = criterion(ypred[mask][...,0],y[mask],w[mask]) # compute loss
         assert torch.isnan(loss) == False , 'loss is nan, iter %d'%iters
-        if iters % niters_per_save == 0:
-          alllosses['iters'][iters//niters_per_save] = loss
+        if iters % niters_per_store == 0:
+          alllosses['iters'][iters//niters_per_store] = loss
 
         epoch_loss += loss.item()
         normloss = loss.item() / torch.count_nonzero(mask)
@@ -205,6 +209,16 @@ def TrainDriver():
   #
   # torch.save(net.state_dict(),os.path.join(checkpointdir,f'Final_epoch{epoch+1}.pth'))
 
-    
+def PlotTrainLoss(lossfile=None):
+  if lossfile is None:
+    savedir = os.path.join(rootsavedir,'unet')
+    checkpointdir = os.path.join(savedir,'UNet20220124T120509')
+    lossfile = os.path.join(checkpointdir,'alllosses.pkl')
+  with open(lossfile, 'rb') as fid:
+    alllosses = pickle.load(fid)
+  plt.plot(alllosses['iters'])
+  plt.show()
+  
 if __name__ == "__main__":
+  #PlotTrainLoss()
   TrainDriver()
