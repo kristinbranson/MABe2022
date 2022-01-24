@@ -77,7 +77,7 @@ class FlyDataset(Dataset):
   Load in the data from file xfile and initialize member variables
   Optional annotations from yfile
   """
-  def __init__(self,xfile,yfile=None,ntgtsout=None,normalize=True):
+  def __init__(self,xfile,yfile=None,ntgtsout=None,normalize=True,balance=True):
     data = np.load(xfile,allow_pickle=True).item()
     # X is a dictionary keyed by random 20-character strings
     self.X = data['keypoints']
@@ -116,6 +116,7 @@ class FlyDataset(Dataset):
     # for z-scoring
     self.mu = None
     self.sig = None
+    self.normalize = normalize
     if normalize:
       self.zscore()
     
@@ -141,7 +142,45 @@ class FlyDataset(Dataset):
       assert( set(self.y.keys()) == set(self.X.keys()) )
       assert( firsty.shape[1] == self.seqlength )
       assert( firsty.shape[2] == self.ntgts )
-
+      
+      # for balanced error
+      self.yvalues = None
+      self.yweights = None
+      self.weights = None
+      self.balance = balance
+      if balance:
+        # this will only work for categorical data
+        self.yvalues = [set(),]*self.ncategories
+        for y in self.y.values():
+          for c in range(self.ncategories):
+            ycurr = y[c,:]
+            yvaluescurr = set(np.unique(ycurr[np.isnan(ycurr)==False]))
+            self.yvalues[c] = self.yvalues[c].union(yvaluescurr)
+        self.yvalues = list(map(lambda x: list(x),self.yvalues))
+        ycounts = list(map(lambda x: np.zeros(len(x)),self.yvalues))
+        for y in self.y.values():
+          for c in range(self.ncategories):
+            for i in range(len(self.yvalues[c])):
+              v = self.yvalues[c][i]
+              ycounts[c][i] += np.count_nonzero(v==y[c,...])
+        self.yweights = []
+        for c in range(self.ncategories):
+          n = np.sum(ycounts[c])
+          w0 = n / len(self.yvalues[c])
+          self.yweights.append(w0 / ycounts[c])
+        # pre-compute weights for each frame, fly
+        self.weights = {}
+        for seqid,y in self.y.items():
+          w = np.zeros(y.shape)
+          for c in range(self.ncategories):
+            ycurr = y[c,...]
+            wcurr = np.zeros(ycurr.shape)
+            for i in range(len(self.yvalues[c])):
+              v = self.yvalues[c][i]
+              wcurr[ycurr==v] = self.yweights[c][i]
+            w[c,...] = wcurr
+          self.weights[seqid] = w
+          
     # features to use for computing inter-fly distances
     self.fidxdist = np.where(np.array(list(map(lambda x: x[0] in ['antennae_x_mm','end_notum_x_mm','end_abdomen_x_mm'],self.featurenames))))[0]
     # not all flies have data for each sequence
@@ -160,9 +199,6 @@ class FlyDataset(Dataset):
     self.idx2seqnum = self.idx2seqnum[:i]
     self.n = i
     self.idx2tgt = self.idx2tgt[:i]
-    
-    self.mu = np.nan
-    self.sig = np.nan
     
     # which feature numbers correspond to keypoints and are on the defined skeleton?
     featurenamesx = list(map(lambda x: x[0],self.featurenames))
@@ -206,7 +242,23 @@ class FlyDataset(Dataset):
       self.X[seqid][replace] = 0.
       
     return
-
+  
+  def unnormalize(self,x):
+    if not self.normalize:
+      return x
+    ndims = x.ndim
+    s = np.ones(ndims,dtype=int)
+    # nfeatures x 2 x ...
+    if x.shape[0] == self.nfeatures*self.d:
+      s[0] = self.nfeatures*self.d
+      return x*self.sig.reshape(s)+self.mu.reshape(s)
+    elif x.shape[0] == self.nfeatures:
+      s[0] = self.nfeatures
+      s[1] = self.d
+      return x*self.sig.reshape(s)+self.mu.reshape(s)
+    else:
+      assert True, 'x must be nfeatures x d x ... or nfeatures*d x ...'
+      
   # total number of sequence-fly pairs
   def __len__(self):
     return self.n
@@ -227,6 +279,8 @@ class FlyDataset(Dataset):
   x is an ndarray of size nkeypoints x 2 x seql x maxnflies input data sample
   y (only output for labeled dataset) is an ndarray of size
   ncategories x seqlength output data sample for target 0
+  w (only output for labeled dataset) is an
+  ncategories x seqlength array of weights for each sample and category for target 0
   seqid: 20-character string identifying the selected sequence
   seqnum: integer identifying the selected sequence
   tgt: Integer identifying the selected fly.
@@ -246,9 +300,13 @@ class FlyDataset(Dataset):
     
     if self.y is None:
       return x,seqid,seqnum,tgt
-    
+      
     y = self.y[seqid][:,:,tgt]
-    return x,y,seqid,seqnum,tgt
+    if self.balance:
+      w = self.weights[seqid][...,tgt]
+    else:
+      w = np.ones(y.shape)
+    return x,y,w,seqid,seqnum,tgt
   
   """
   Unlabeled dataset:
@@ -267,6 +325,8 @@ class FlyDataset(Dataset):
   x is an ndarray of size (nkeypoints*d) x seqlength x ntgts data sample
   y (only output for labeled dataset) is an ndarray of size
   ncategories x seqlength output data sample for target 0
+  weights (only output for labeled dataset) is an
+  ncategories x seqlength array of weights for each sample and category for target 0
   seqnum: integer identifying the selected sequence
   tgt: Integer identifying the selected fly.
   """
@@ -275,9 +335,9 @@ class FlyDataset(Dataset):
       x,seqid,seqnum,tgt = self.getitem(idx)
       x = self.reformat_x(x)
       return {'x': x, 'seqnum': seqnum, 'tgt': tgt}
-    x,y,seqid,seqnum,tgt = self.getitem(idx)
+    x,y,w,seqid,seqnum,tgt = self.getitem(idx)
     x = self.reformat_x(x)
-    return {'x': x, 'y': y, 'seqnum': seqnum, 'tgt': tgt}
+    return {'x': x, 'y': y, 'weights': w, 'seqnum': seqnum, 'tgt': tgt}
 
   """
   d = data.get_fly_dists(x,tgt=0)
@@ -321,13 +381,13 @@ class FlyDataset(Dataset):
   """
   def plot_fly(self, x=None, idx=None, f=None, **kwargs):
     if x is not None:
-      return plot_fly(pose=x, kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
+      return plot_fly(pose=self.unnormalize(x), kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
     else:
       assert(idx is not None)
       if f is None:
         f = self.ctrf
       x,seqid,seqnum,tgt = self[idx]
-      return plot_fly(pose=x[f, 0, :, :], kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
+      return plot_fly(pose=self.unnormalize(x[f, 0, :, :]), kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
     
   """
   hkpt,hedge,fig,ax = data.plot_flies(poses=None,, idx=None, f=None,
@@ -351,13 +411,13 @@ class FlyDataset(Dataset):
   """
   def plot_flies(self, x=None, idx=None, f=None, **kwargs):
     if x is not None:
-      return plot_flies(poses=x, kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
+      return plot_flies(poses=self.unnormalize(x), kptidx=self.keypointidx, skelidx=self.skeleton_edges, **kwargs)
     else:
       assert(idx is not None)
       if f is None:
         f = self.ctrf
       x,_,_,_ = self.get_item(idx=idx)
-      return plot_flies(x[:, :, f, :], self.keypointidx, self.skeleton_edges, **kwargs)
+      return plot_flies(self.unnormalize(x[:, :, f, :]), self.keypointidx, self.skeleton_edges, **kwargs)
     
 """
 dark3cm = get_Dark3_cmap()
@@ -436,7 +496,7 @@ def plot_fly(pose=None, kptidx=None, skelidx=None, fig=None, ax=None, kptcolors=
   assert(skelidx is not None)
 
   fig,ax,isnewaxis = set_fig_ax(fig=fig,ax=ax)
-  isreal = get_real_flies(pose)
+  isreal = get_real_flies(pose[:,:,np.newaxis])
   
   if plotkpts:
     if isreal:
@@ -637,8 +697,7 @@ def animate_pose_sequence(seq=None,start_frame=0,stop_frame=None,skip=1,
   fig,ax,isnewaxis = set_fig_ax(fig=fig,ax=ax)
   
   isreal = get_real_flies(seq)
-  idxreal = np.where(np.any(isreal,axis=0))[0]
-  seq = seq[...,idxreal]
+  seq = seq[...,isreal]
 
   # plot the arena wall
   theta = np.linspace(0,2*np.pi,360)
@@ -696,14 +755,14 @@ def DatasetTest():
   print('x.shape = {shape}, seqid = {seqid}, seqnum = {seqnum}, tgt = {tgt}'.format(shape=str(x.shape),seqid=seqid,seqnum=seqnum,tgt=tgt))
   # make sure the flies are sorted by distance to the first fly.
   print('These distances should be decreasing, with nans (if any) at the end): %s' % str(datatrain.get_fly_dists(x)))
-  #hkpts,hedges,fig,ax = datatrain.plot_flies(x[:,:,datatrain.ctrf,:],colors='hsv')
+  hkpts,hedges,fig,ax = datatrain.plot_flies(x[:,:,datatrain.ctrf,:],colors='hsv')
   
   # Set savefile if we want to save a video
   #savefile = 'seq.gif'
   savefile=None
 
   # plot that sequence
-  animate_pose_sequence(seq=x,kptidx=datatrain.keypointidx,skelidx=datatrain.skeleton_edges,savefile=savefile)
+  animate_pose_sequence(seq=datatrain.unnormalize(x),kptidx=datatrain.keypointidx,skelidx=datatrain.skeleton_edges,savefile=savefile)
 
 if __name__ == "__main__":
   DatasetTest()

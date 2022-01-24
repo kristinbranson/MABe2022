@@ -2,12 +2,15 @@ import os
 from datetime import datetime
 import numpy as np
 from tqdm import tqdm # waitbar
+import re
+import pickle
+import logging
 
 import torch
 from torch.utils.data import DataLoader
 from torch import optim
 import torch.nn as nn
-import torch.nn.functional as F
+torch.manual_seed(0)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -17,11 +20,12 @@ import MABeFlyUtils as mabe
 import models
 
 print('CUDA available: %d'%torch.cuda.is_available())
-device = 'cpu'
-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#device = 'cpu'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # local path to data -- modify this!
 datadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/seqdata20220118'
+rootsavedir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/savednets'
 
 def plot_annotations(train_dataset,pred0n):
   # plot
@@ -39,14 +43,29 @@ def TrainDriver():
   xfile = os.path.join(datadir,'Xtesttrain_seq.npy')
   yfile = os.path.join(datadir,'ytesttrain_seq.npy')
 
+  if not os.path.exists(rootsavedir):
+    os.mkdir(rootsavedir)
+  savedir = os.path.join(rootsavedir,'unet')
+  now = datetime.now()
+  timestamp = now.strftime('%Y%m%dT%H%M%S')
+  if not os.path.exists(savedir):
+    os.mkdir(savedir)
+  checkpointdir = os.path.join(savedir,'UNet'+timestamp)
+  os.mkdir(checkpointdir)
+  lossfile = os.path.join(checkpointdir,'alllosses.pkl')
+  logfile = os.path.join('train.log')
+  logging.basicConfig(filename=logfile,level=logging.DEBUG)
+  logging.getLogger().addHandler(logging.StreamHandler())
+  
   # hyperparameters
   ntgtsout = 8 # number of flies to keep -- helps us avoid nans
-  batch_size = 2
-  nepochs = 1   # number of times to cycle through all the data during training
+  batch_size = 12
+  nepochs = 3   # number of times to cycle through all the data during training
   learning_rate = 0.001 # initial learning rate
   weight_decay = 1e-8 # how learning rate decays over time
   momentum = 0.9 # how much to use previous gradient direction
   nepochs_per_save = 1 # how often to save the network
+  niters_per_save = 100 # how often to store losses
 
   # some day we might want to be able to reload
   loadepoch = 0
@@ -80,11 +99,26 @@ def TrainDriver():
   # Use binary cross entropy loss combined with sigmoid output activation function.
   # We combine here for numerical improvements
   criterion = nn.BCEWithLogitsLoss()
-  
-  # store loss per epoch
-  epoch_losses = np.zeros(nepochs)
-  epoch_losses[:] = np.nan
 
+  loadfile = None
+  loadepoch = 0
+  alllosses = None
+  #savefile = None
+  if loadfile is not None:
+    net.load_state_dict(
+      torch.load(loadfile,map_location=device)
+    )
+    m = re.search('[^\d](?P<epoch>\d+)\.pth$',loadfile)
+    if m is None:
+      logging.warning('Could not parse epoch from file name')
+    else:
+      loadepoch = int(m['epoch'])
+      logging.debug('Parsed epoch from loaded net file name: %d'%loadepoch)
+    net.to(device=device)
+    if os.path.exists(lossfile):
+      with open(lossfile, 'rb') as fid:
+        alllosses = pickle.load(fid)
+  
   # when we last saved the network
   saveepoch = None
 
@@ -92,6 +126,8 @@ def TrainDriver():
   iters = loadepoch*len(train_dataloader)
 
   # loop through entire training data set nepochs times
+  if alllosses is None:
+    alllosses = {'iters': -np.ones(nepochs*len(train_dataset)//niters_per_save), 'epochs': -np.ones(nepochs)}
   for epoch in range(loadepoch,nepochs):
     net.train() # put in train mode (affects batchnorm)
     epoch_loss = 0
@@ -109,9 +145,12 @@ def TrainDriver():
         mask = torch.isnan(y)==False
         loss = criterion(ypred[mask][...,0],y[mask]) # compute loss
         assert torch.isnan(loss) == False , 'loss is nan, iter %d'%iters
+        if iters % niters_per_save == 0:
+          alllosses['iters'][iters//niters_per_save] = loss
 
         epoch_loss += loss.item()
-        pbar.set_postfix(**{'norm loss (batch)': loss.item() / np.count_nonzero(mask)})
+        normloss = loss.item() / torch.count_nonzero(mask)
+        pbar.set_postfix(**{'norm loss (batch)': normloss})
         # gradient descent
         optimizer.zero_grad()
         loss.backward()
@@ -121,8 +160,30 @@ def TrainDriver():
   
         pbar.update(x.shape[0])
         
-  #   print('loss (epoch) = %f'%epoch_loss)
-  #   epoch_losses[epoch] = epoch_loss
+    logging.info('loss (epoch %d) = %f'%(epoch,epoch_loss))
+    alllosses['epochs'][epoch] = epoch_loss
+    
+    # save checkpoint networks every now and then
+    if epoch % nepochs_per_save == 0:
+      logging.info('Saving network state at epoch %d'%(epoch+1))
+      # only keep around the last two epochs for space purposes
+      if saveepoch is not None:
+        savefile0 = os.path.join(checkpointdir,f'CP_latest_epoch{saveepoch+1}.pth')
+        savefile1 = os.path.join(checkpointdir,f'CP_prev_epoch{saveepoch+1}.pth')
+        if os.path.exists(savefile0):
+          try:
+            os.rename(savefile0,savefile1)
+          except:
+            logging.warning('Failed to rename checkpoint file %s to %s'%(savefile0,savefile1))
+      saveepoch = epoch
+      savefile = os.path.join(checkpointdir,f'CP_latest_epoch{saveepoch+1}.pth')
+      torch.save(net.state_dict(),savefile)
+      
+      with open(lossfile, 'wb') as fid:
+        pickle.dump(alllosses, fid, protocol=pickle.HIGHEST_PROTOCOL)
+      
+  plt.plot(alllosses['iters'])
+  plt.show()
   #
   #   # save checkpoint networks every now and then
   #   if epoch % nepochs_per_save == 0:
