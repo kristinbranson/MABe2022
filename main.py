@@ -140,10 +140,12 @@ def TrainDriver():
         x = x.to(device=device, dtype=torch.float32) # transfer to GPU
         y = batch['y']
         y = y.to(device=device, dtype=torch.float32) # transfer to GPU
+        w = batch['weights']
+        w = w.to(device=device, dtype=torch.float32) # transfer to GPU
         ypred = net(x) # evaluate network on batch
         assert torch.any(torch.isnan(ypred)) == False , 'ypred contains nans, iter %d'%iters
         mask = torch.isnan(y)==False
-        loss = criterion(ypred[mask][...,0],y[mask]) # compute loss
+        loss = criterion(ypred[mask][...,0]*w[mask],y[mask]*w[mask]) # compute loss
         assert torch.isnan(loss) == False , 'loss is nan, iter %d'%iters
         if iters % niters_per_save == 0:
           alllosses['iters'][iters//niters_per_save] = loss
