@@ -456,14 +456,14 @@ Returns the handles to those figures and axes.
 isnewaxis is whether a new set of axes was created.
 """
 def set_fig_ax(fig=None,ax=None):
-    if ax is None:
-      if fig is None:
-        fig = plt.figure(figsize=(8, 8))
-      ax = fig.add_subplot(111)
-      isnewaxis = True
-    else:
-      isnewaxis = False
-    return fig, ax, isnewaxis
+  if ax is None:
+    if fig is None:
+      fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111)
+    isnewaxis = True
+  else:
+    isnewaxis = False
+  return fig, ax, isnewaxis
 
 """
 hkpt,hedge,fig,ax = plot_fly(pose=None, kptidx=None, skelidx=None,
