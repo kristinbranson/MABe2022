@@ -6,6 +6,7 @@ import re
 import pickle
 import logging
 import glob
+import shutil
 
 import torch
 from torch.utils.data import DataLoader
@@ -88,6 +89,115 @@ def SaveCheckpoint(epoch,net,optimizer,scheduler,alllosses,saveepoch,checkpointd
               'scheduler':scheduler.state_dict(),'alllosses':alllosses},savefile)
   return saveepoch,savefile
 
+def GetLatestCheckpoint():
+  savedir = os.path.join(rootsavedir,'unet')
+  checkpointdir = None
+  checkpointdate = ''
+  netfile = None
+  for cpd in os.scandir(savedir):
+    if cpd.is_dir():
+      m = re.search('UNet(\d{8}T\d{6})',cpd.path)
+      if m is None:
+        continue
+      nf = glob.glob(os.path.join(cpd,'CP_latest_epoch*.pth'))
+      if len(nf) == 0:
+        continue
+      if m.group(1) > checkpointdate:
+        checkpointdate = m.group(1)
+        checkpointdir = cpd.path
+        netfile = nf[0]
+  return checkpointdir,netfile
+  
+def SetCheckpointDir():
+  if not os.path.exists(rootsavedir):
+    os.mkdir(rootsavedir)
+  savedir = os.path.join(rootsavedir,'unet')
+  now = datetime.now()
+  timestamp = now.strftime('%Y%m%dT%H%M%S')
+  if not os.path.exists(savedir):
+    os.mkdir(savedir)
+  checkpointdir = os.path.join(savedir,'UNet'+timestamp)
+  os.mkdir(checkpointdir)
+  return checkpointdir
+
+def CleanOldNets(checkpointdir=None,deleteolddirs=False,deleteoldfiles=False):
+  deleted = []
+  savedir = os.path.join(rootsavedir,'unet')
+  lastcheckpointdir,_ = GetLatestCheckpoint()
+  
+  if deleteolddirs:
+    for cpd in os.scandir(savedir):
+      if not cpd.is_dir():
+        continue
+      if cpd.path == lastcheckpointdir:
+        continue
+      else:
+        logging.info('Deleting old checkpoint directory %s'%cpd.path)
+        shutil.rmtree(cpd.path)
+        deleted.append(cpd.path)
+        
+  if checkpointdir is None:
+    checkpointdir = lastcheckpointdir
+  else:
+    if checkpointdir in deleted:
+      return deleted
+      
+  if deleteoldfiles:
+    oldfiles = glob.glob(os.path.join(lastcheckpointdir,'CP_prev_epoch*.pth'))
+    for oldfile in oldfiles:
+      logging.info('Deleting checkpoint network %s'%oldfile)
+      os.remove(oldfile)
+      deleted.append(oldfile)
+
+  return deleted
+
+
+def PlotAllLosses(alllosses,h=None,ax=None,fig=None):
+  isnewaxis = False
+  if h is None:
+    h = {}
+  if ax is None:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    isnewaxis = True
+  if 'iters' in h:
+    hcurr = h['iters']
+  else:
+    hcurr = None
+  h['iters'],ax = PlotLoss(alllosses['iters'],ax=ax,label='Batch loss',h=hcurr,setlims=True)
+  ax.set_xlabel('Iterations')
+  ax.set_ylabel('Loss')
+  if 'epochs' in h:
+    hcurr = h['epochs']
+  else:
+    hcurr = None
+  h['epochs'],ax = PlotLoss(alllosses['epochs'],ax=ax,multiplier=alllosses['nbatches_per_epoch'],label='Epoch loss',h=hcurr)
+  if isnewaxis:
+    ax.legend()
+  return h,ax,fig
+  
+def PlotLoss(lossdict,ax=None,multiplier=1.,label=None,h=None,setlims=False):
+  if ax is None and h is None:
+    ax = plt.subplot(111)
+  iters0 = np.array(list(lossdict.keys()))
+  iters1 = iters0[1:]
+  iters1 = np.append(iters1,iters0[-1]+1.)
+  x = list(lossdict.values())[0]
+  if type(x) == float:
+    losses = np.array(list(lossdict.values()))
+  else:
+    losses = np.array(list(map( lambda x: x.item(), lossdict.values())))
+  iters = np.vstack((iters0,iters1)).T.flatten()*multiplier
+  losses = np.vstack((losses,losses)).T.flatten()
+  if h is None:
+    h = ax.plot(iters,losses,label=label)[0]
+  else:
+    h.set_data(iters,losses)
+  if setlims:
+    ax.set_yscale('log')
+    _ = ax.set_xlim((np.min(iters)-5,np.max(iters)+5))
+    _ = ax.set_ylim((np.maximum(1e-10,np.min(losses)/1.01),1.01*np.max(losses)))
+  return h,ax
   
 def TrainDriver(loadfile=None):
   # file containing the data
@@ -108,7 +218,7 @@ def TrainDriver(loadfile=None):
   learning_rate = 0.001 # initial learning rate
   weight_decay = 1e-8 # how learning rate decays over time
   momentum = 0.9 # how much to use previous gradient direction
-  nepochs_per_save = 1 # how often to save the network
+  nepochs_per_save = 5 # how often to save the network
   niters_per_store = 5 # how often to store losses
 
   # load data and initialize Dataset object
@@ -208,95 +318,19 @@ def TrainDriver(loadfile=None):
     if epoch % nepochs_per_save == 0:
       saveepoch,savefile = SaveCheckpoint(epoch,net,optimizer,scheduler,alllosses,saveepoch,checkpointdir)
       
-      # update plots
-      if figloss is not None and not plt.fignum_exists(figloss.number):
-        hloss = None
-        axloss = None
-        figloss = None
-      hloss,axloss,figloss = PlotAllLosses(alllosses,h=hloss,ax=axloss,fig=figloss)
-      plt.draw()
-      plt.pause(.001)
+    # update plots
+    if figloss is not None and not plt.fignum_exists(figloss.number):
+      hloss = None
+      axloss = None
+      figloss = None
+    hloss,axloss,figloss = PlotAllLosses(alllosses,h=hloss,ax=axloss,fig=figloss)
+    plt.draw()
+    plt.pause(.001)
       
   torch.save({'net':net.state_dict(),'optimizer':optimizer.state_dict(),
               'scheduler':scheduler.state_dict(),'alllosses':alllosses},savefile)
   PlotAllLosses(alllosses,h=hloss,ax=axloss)
   plt.show()
-
-def PlotAllLosses(alllosses,h=None,ax=None,fig=None):
-  isnewaxis = False
-  if h is None:
-    h = {}
-  if ax is None:
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    isnewaxis = True
-  if 'iters' in h:
-    hcurr = h['iters']
-  else:
-    hcurr = None
-  h['iters'],ax = PlotLoss(alllosses['iters'],ax=ax,label='Batch loss',h=hcurr)
-  ax.set_xlabel('Iterations')
-  ax.set_ylabel('Loss')
-  if 'epochs' in h:
-    hcurr = h['epochs']
-  else:
-    hcurr = None
-  h['epochs'],ax = PlotLoss(alllosses['epochs'],ax=ax,multiplier=alllosses['nbatches_per_epoch'],label='Epoch loss',h=hcurr)
-  ax.set_yscale('log')
-  _ = ax.axis('tight')
-  if isnewaxis:
-    ax.legend()
-  return h,ax,fig
-  
-def PlotLoss(lossdict,ax=None,multiplier=1.,label=None,h=None):
-  if ax is None and h is None:
-    ax = plt.subplot(111)
-  iters0 = np.array(list(lossdict.keys()))
-  iters1 = iters0[1:]
-  iters1 = np.append(iters1,iters0[-1]+1.)
-  x = list(lossdict.values())[0]
-  if type(x) == float:
-    losses = np.array(list(lossdict.values()))
-  else:
-    losses = np.array(list(map( lambda x: x.item(), lossdict.values())))
-  iters = np.vstack((iters0,iters1)).T.flatten()*multiplier
-  losses = np.vstack((losses,losses)).T.flatten()
-  if h is None:
-    h = ax.plot(iters,losses,label=label)[0]
-  else:
-    h.set_data(iters,losses)
-  return h,ax
-
-def GetLatestCheckpoint():
-  savedir = os.path.join(rootsavedir,'unet')
-  checkpointdir = None
-  checkpointdate = ''
-  netfile = None
-  for cpd in os.scandir(savedir):
-    if cpd.is_dir():
-      m = re.search('UNet(\d{8}T\d{6})',cpd.path)
-      if m is None:
-        continue
-      nf = glob.glob(os.path.join(cpd,'CP_latest_epoch*.pth'))
-      if len(nf) == 0:
-        continue
-      if m.group(1) > checkpointdate:
-        checkpointdate = m.group(1)
-        checkpointdir = cpd.path
-        netfile = nf[0]
-  return checkpointdir,netfile
-  
-def SetCheckpointDir():
-  if not os.path.exists(rootsavedir):
-    os.mkdir(rootsavedir)
-  savedir = os.path.join(rootsavedir,'unet')
-  now = datetime.now()
-  timestamp = now.strftime('%Y%m%dT%H%M%S')
-  if not os.path.exists(savedir):
-    os.mkdir(savedir)
-  checkpointdir = os.path.join(savedir,'UNet'+timestamp)
-  os.mkdir(checkpointdir)
-  return checkpointdir
   
 def PlotTrainLoss(loadfile=None):
   if loadfile is None:
@@ -308,7 +342,9 @@ def PlotTrainLoss(loadfile=None):
   plt.show()
   
 if __name__ == "__main__":
-  #PlotTrainLoss()
-  #loadfile = None
-  checkpointdir,loadfile = GetLatestCheckpoint()
+  #checkpointdir,loadfile = GetLatestCheckpoint()
+  #loadfile = os.path.join(rootsavedir,'unet','PerCategoryBalanced20220124T202455','CP_latest_epoch108.pth')
+  loadfile = None
+  #PlotTrainLoss(loadfile=loadfile)
   TrainDriver(loadfile=loadfile)
+  #_ = CleanOldNets(deleteolddirs=True,deleteoldfiles=True)

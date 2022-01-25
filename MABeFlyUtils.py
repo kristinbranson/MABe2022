@@ -151,11 +151,16 @@ class FlyDataset(Dataset):
       if balance:
         # this will only work for categorical data
         self.yvalues = [set(),]*self.ncategories
+        # set n so that weights sum to self.seqlength*self.ntgtsout*self.ncategories
+        n = self.seqlength*self.ntgts*self.nseqs
+        n = 0
         for y in self.y.values():
+          n += np.count_nonzero(np.isnan(y)==False)
           for c in range(self.ncategories):
             ycurr = y[c,:]
             yvaluescurr = set(np.unique(ycurr[np.isnan(ycurr)==False]))
             self.yvalues[c] = self.yvalues[c].union(yvaluescurr)
+        n = n / self.ncategories
         self.yvalues = list(map(lambda x: list(x),self.yvalues))
         ycounts = list(map(lambda x: np.zeros(len(x)),self.yvalues))
         for y in self.y.values():
@@ -165,7 +170,7 @@ class FlyDataset(Dataset):
               ycounts[c][i] += np.count_nonzero(v==y[c,...])
         self.yweights = []
         for c in range(self.ncategories):
-          n = np.sum(ycounts[c])
+          #n = np.sum(ycounts[c])
           w0 = n / len(self.yvalues[c])
           self.yweights.append(w0 / ycounts[c])
         # pre-compute weights for each frame, fly
