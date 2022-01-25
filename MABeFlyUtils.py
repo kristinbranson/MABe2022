@@ -77,7 +77,7 @@ class FlyDataset(Dataset):
   Load in the data from file xfile and initialize member variables
   Optional annotations from yfile
   """
-  def __init__(self,xfile,yfile=None,ntgtsout=None,normalize=True,balance=True):
+  def __init__(self,xfile,yfile=None,ntgtsout=None,normalize=True,balance=True,minweight=.1,maxweight=100):
     data = np.load(xfile,allow_pickle=True).item()
     # X is a dictionary keyed by random 20-character strings
     self.X = data['keypoints']
@@ -171,8 +171,10 @@ class FlyDataset(Dataset):
         self.yweights = []
         for c in range(self.ncategories):
           #n = np.sum(ycounts[c])
-          w0 = n / len(self.yvalues[c])
-          self.yweights.append(w0 / ycounts[c])
+          w0 = n / np.maximum(1,len(self.yvalues[c]))
+          w = w0 / ycounts[c]
+          w = np.minimum(np.maximum(w,minweight),maxweight)
+          self.yweights.append(w)
         # pre-compute weights for each frame, fly
         self.weights = {}
         for seqid,y in self.y.items():

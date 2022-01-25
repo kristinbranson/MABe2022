@@ -201,8 +201,8 @@ def PlotLoss(lossdict,ax=None,multiplier=1.,label=None,h=None,setlims=False):
   
 def TrainDriver(loadfile=None):
   # file containing the data
-  xfile = os.path.join(datadir,'Xtesttrain_seq.npy')
-  yfile = os.path.join(datadir,'ytesttrain_seq.npy')
+  xfile = os.path.join(datadir,'Xusertrain_seq.npy')
+  yfile = os.path.join(datadir,'yusertrain_seq.npy')
   assert(os.path.exists(xfile))
   assert(os.path.exists(yfile))
   
