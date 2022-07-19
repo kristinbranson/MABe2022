@@ -725,7 +725,7 @@ nclasses = nextralabels + nlabelclasses + noptolabelclasses*nledlabels + nsuperc
 maxframesfillsex = 300;
 isfinaldata = false(1,nexps);
 
-for expii = 35:nexps,
+for expii = 1:nexps,
   expi = exporder(expii);
   
   if ~ismember(expinfo(expi).label,labels_include) || ~isapttracked(expi),
@@ -747,8 +747,8 @@ for expii = 35:nexps,
   reginfo = load(registrationmatfile);
   reginfo = detectRegistrationMarks('registrationData',reginfo);
   
-  [xtmp] = reginfo.registerfn([1,size(reginfo.bkgdImage,2)],reginfo.circleCenterY+[0,0]);
-  pxpermm = size(reginfo.bkgdImage,2)/diff(xtmp);
+  [xcorner] = reginfo.registerfn([1,size(reginfo.bkgdImage,2)],reginfo.circleCenterY+[0,0]);
+  pxpermm = size(reginfo.bkgdImage,2)/diff(xcorner);
   
   newid2oldid = reginfo.newid2oldid;
   
@@ -2148,3 +2148,322 @@ for expi = 1:nexps,
   end
   
 end
+
+%% figure
+
+expi = 45; % 71G01
+expdir = expdirs{expi};
+[readframe,nframes,fid,headerinfo] = get_readframe_fcn(fullfile(expdir,dataloc_params.moviefilestr));
+apttrkfile = fullfile(expdir,'apttrk.mat');
+apttrk = TrkFile.load(apttrkfile);
+
+fr = 1078;
+
+defaults.headlandmark = 1;
+defaults.taillandmark = 7;
+bodylandmarks = [defaults.headlandmark,defaults.taillandmark];
+trx = apt2trx(apttrk,bodylandmarks);
+
+
+ftd = load(fullfile(expdir,'movie-track.mat'));
+registrationmatfile = fullfile(expdir,'registrationdata.mat');
+reginfo = load(registrationmatfile);
+reginfo = detectRegistrationMarks('registrationData',reginfo);
+[xedge] = reginfo.registerfn([1,size(reginfo.bkgdImage,2)],reginfo.circleCenterY+[0,0]);
+[~,yedge] = reginfo.registerfn(reginfo.circleCenterX+[0,0],[1,size(reginfo.bkgdImage,1)]);
+pxpermm = size(reginfo.bkgdImage,2)/mean([diff(xedge),diff(yedge)]);
+  
+newid2oldid = reginfo.newid2oldid;
+nflies = numel(rtd.trx);
+nframes = max([rtd.trx.endframe]);
+fidx = struct;
+fidx.wing_left_x = find(strcmp(ftd.trk.names,'wing l x'));
+fidx.wing_left_y = find(strcmp(ftd.trk.names,'wing l y'));
+fidx.wing_right_x = find(strcmp(ftd.trk.names,'wing r x'));
+fidx.wing_right_y = find(strcmp(ftd.trk.names,'wing r y'));
+
+wingl = permute(ftd.trk.data(newid2oldid,:,[fidx.wing_left_x,fidx.wing_left_y]),[2,3,1]);
+wingr = permute(ftd.trk.data(newid2oldid,:,[fidx.wing_right_x,fidx.wing_right_y]),[2,3,1]);
+
+
+
+%% make a figure showing tracking
+
+zoomfliesreal = [2,3,4,8,9];
+
+defaults.apttailalpha = .5;
+defaults.colormult = .7;
+defaults.lmkmarkersize = 6;
+taillength = 15;
+
+skeleton_edges = [
+  [ 7,  8],
+  [10, 14],
+  [11, 12],
+  [12, 17],
+  [ 7, 11],
+  [ 9, 10],
+  [ 7,  9],
+  [ 5,  7],
+  [ 2,  3],
+  [ 2,  7],
+  [ 5, 18],
+  [ 6, 13],
+  [ 7, 16],
+  [ 7, 15],
+  [ 2,  4],
+  [ 6,  7],
+  [ 7,  0],
+  [ 7,  1]
+  ]+1;
+
+ntgts = apttrk.ntlts;
+fliesmaybeplot = 1:ntgts;
+ncolorstmp = max(ntgts,64);
+colors0 = jet(ncolorstmp);
+colors0 = colors0(round(linspace(1,ncolorstmp,ntgts)),:);
+fliesnotzoom = setdiff(fliesmaybeplot,zoomfliesreal(:)');
+colors = nan(ntgts,3);
+coloridx = round(linspace(1,size(colors0,1),numel(zoomfliesreal)));
+colors(zoomfliesreal(:),:) = colors0(coloridx,:);
+colors0(coloridx,:) = [];
+if ~isempty(fliesnotzoom),
+  coloridx = round(linspace(1,size(colors0,1),numel(fliesnotzoom)));
+  colors(fliesnotzoom,:) = colors0(coloridx,:);
+  colors0(coloridx,:) = [];
+end
+
+[tfhaspred,xy,tfocc] = apttrk.getPTrkFrame(fr);
+xy = cat(1,wingl(fr,:,:),wingr(fr,:,:),xy);
+
+minbox = min(min(xy(:,:,zoomfliesreal),[],1),[],3);
+maxbox = max(max(xy(:,:,zoomfliesreal),[],1),[],3);
+boxsize = max((maxbox-minbox))*.5*1.25;
+midbox = (minbox+maxbox)/2;
+zoomax = [midbox(1)-boxsize,midbox(1)+boxsize,midbox(2)-boxsize,midbox(2)+boxsize];
+
+figure(1234);
+clf;
+hax = createsubplots(1,4,.025);
+im = readframe(fr);
+
+axes(hax(1));
+imagesc(im,[0,255]);
+colormap gray;
+axis image off;
+
+axes(hax(2));
+imagesc(im,[0,255]);
+colormap gray;
+axis image off;
+hold on;
+
+axes(hax(3));
+imagesc(im,[0,255]);
+colormap gray;
+axis image off;
+hold on;
+
+axes(hax(4));
+hold on;
+
+center = permute(mean(xy(bodylandmarks,:,:),1),[2,3,1]);
+
+for fly = 1:ntgts,
+  
+  fr0 = max(apttrk.startframes(fly),fr-taillength);
+  taillengthcurr = fr-fr0+1;
+  [haspredtail,xytail] = apttrk.getPTrkFT(fr0:fr,fly);
+  xytail(:,:,~haspredtail) = nan;
+  xytail = permute(xytail,[3,1,2]);
+  xytail = cat(2,permute(wingl(fr0:fr,:,fly),[1,3,2]),permute(wingr(fr0:fr,:,fly),[1,3,2]),xytail);
+  xytail = cat(1,xytail,nan([1,apttrk.npts+2,2]));
+  alphas0 = [linspace(0,defaults.apttailalpha,taillengthcurr),0]';
+  alphas = repmat(alphas0,[apttrk.npts+2,1]);
+  xytail = reshape(xytail,[(taillengthcurr+1)*(apttrk.npts+2),2]);
+  [xtailr,ytailr] = reginfo.registerfn(xytail(:,1),xytail(:,2));
+  
+  for axi = 2:3,
+    h = patch(xytail(:,1),xytail(:,2),[0,0,0],'FaceColor','none','EdgeColor',colors(fly,:).*defaults.colormult,...
+      'FaceVertexAlphaData',alphas(:),'EdgeAlpha','interp','AlphaDataMapping','none','Parent',hax(axi));
+    if axi == 3,
+      set(h,'LineWidth',1);
+    end
+  end
+  plot(hax(2),zoomax([1,2,2,1,1]),zoomax([3,3,4,4,3]),'r-');
+  patch(xtailr,ytailr,[0,0,0],'FaceColor','none','EdgeColor',colors(fly,:).*defaults.colormult,...
+    'FaceVertexAlphaData',alphas(:),'EdgeAlpha','interp','AlphaDataMapping','none','Parent',hax(4),'LineWidth',1);
+end
+
+for fly = 1:ntgts,
+  [xr,yr] = reginfo.registerfn(xy(:,1,fly),xy(:,2,fly));
+  xe = [xr(skeleton_edges),nan(size(skeleton_edges,1))]';
+  ye = [yr(skeleton_edges),nan(size(skeleton_edges,1))]';
+  plot(hax(4),xe(:),ye(:),'-','color',colors(fly,:).*defaults.colormult*.5);
+  for axi = 2:3,
+    h = plot(hax(axi),xy(:,1,fly),xy(:,2,fly),'.','color',colors(fly,:).*defaults.colormult,'MarkerSize',defaults.lmkmarkersize);
+    if axi == 3,
+      set(h,'MarkerSize',12);
+    end
+  end
+  plot(hax(4),xr,yr,'.','color',colors(fly,:).*defaults.colormult,'MarkerSize',12);
+  %text(center(1,fly),center(2,fly),num2str(fly),'HorizontalAlignment','center','VerticalAlignment','middle','color',colors(fly,:));
+end
+
+axis(hax(3),zoomax);
+axis(hax(4),'equal');
+axis(hax(4),[xedge,yedge]);
+set(hax(4),'YDir','reverse');
+[zoomaxrx,zoomaxry] = reginfo.registerfn(zoomax([1,2,2,1,1]),zoomax([3,3,4,4,3]));
+zoomaxr = [min(zoomaxrx),max(zoomaxrx),min(zoomaxry),max(zoomaxry)];
+axis(hax(4),zoomaxr);
+
+%SaveFigLotsOfWays(gcf,sprintf('ExampleTracking_%s_%05d',expname,fr));
+
+%%
+
+cm = jet(64);
+
+featurenames = {
+  'Left wing tip'
+  'Right wing tip'
+  'Antennae midpoint'
+  'Right eye'
+  'Left eye'
+  'Left front of thorax'
+  'Right front of thorax'
+  'Base of thorax'
+  'Tip of abdomen'
+  'Right middle femur base'
+  'Right middle femur-tibia joint'
+  'Left middle femur-base'
+  'Left middle femur-tibia joint'
+  'Right front leg tip'
+  'Right middle leg tip'
+  'Right rear leg tip'
+  'Left front leg tip'
+  'Left middle leg tip'
+  'Left rear leg tip'
+  'Fit ellipse center (x,y)'
+  'Orientation (cos,sin)'
+  'Axis length (major,minor)'
+  'Area (body, foreground)'
+  'Image contrast'
+  };
+
+tasknames = {
+  'Female vs male'
+  'Control 1'
+  'Control 1 sex-separated'
+  'Control 2'
+  'R71G01'
+  'male R71G01 female control'
+  'R65F12'
+  'R91B01'
+  'Blind Control'
+  'aIPG'
+  'pC1d'
+  'Blind aIPG'
+  'Blind control on vs off'
+  'Blind control strong vs off'
+  'Blind control weak vs off'
+  'Blind control strong vs weak'
+  'Blind control last vs first'
+  'Control 2 on vs off'
+  'Control 2 strong vs off'
+  'Control 2 weak vs off'
+  'Control 2 strong vs weak'
+  'Control 2 last vs first'
+  'Blind aIPg on vs off'
+  'Blind aIPg strong vs off'
+  'Blind aIPg weak vs off'
+  'Flies/Behavior Task type'
+  'Blind aIPg strong vs weak'
+  'Blind aIPg last vs first'
+  'aIPg on vs off'
+  'aIPg strong vs off'
+  'aIPg weak vs off'
+  'aIPg strong vs weak'
+  'aIPg last vs first'
+  'PC1d on vs off'
+  'PC1d strong vs off'
+  'PC1d weak vs off'
+  'PC1d strong vs weak'
+  'PC1d last vs first'
+  'Any courtship'
+  'Any control'
+  'Any blind'
+  'Any aIPg'
+  'Any aggression'
+  'Any R71G01'
+  'Any sex-separated'
+  'Aggression manual annotation'
+  'Chase manual annotation'
+  'Courtship manual annotation'
+  'High fence manual annotation'
+  'Wing ext. manual annotation'
+  'Wing flick manual annotation'
+  };
+
+isspecial = cellfun(@isempty,regexp(Xnames,'_[xy](_mm)?$','once'));
+xorder = [find(~isspecial),find(isspecial)];
+
+expi = 103;
+focusfly = 8;
+focusframes = [1,nframes];
+expdir = expdirs{expi};
+expname = fileBaseName(expdirs{expi});
+savefile = fullfile(expdirs{expi},'data.mat');
+load(savefile,'X','y');
+nflies = size(X,1);
+nframes = size(X,2);
+
+hfig = 1235;
+figure(hfig);
+clf(hfig);
+hax = [axes('Parent',hfig,'Position',[.2,.5050,.75,.445])
+  axes('Parent',hfig,'Position',[.2,.05,.75,.445])];
+
+%t = repmat(linspace(-3,3,nframes),[1,nflies]);
+im = [((reshape(permute(X,[2,1,3]),nflies*nframes,ndatapts)-stats.X.mean)./stats.X.std)'];
+im = im(xorder,:);
+imrgb = colormap_image(im,cm,[-3,3]);
+imrgb(isnan(repmat(im,[1,1,3]))) = 0;
+
+image(hax(1),imrgb);
+%set(hax(1),'YTick',1:ndatapts,'YTickLabel',[Xnames],'TickLabelInterpreter','none','XtickLabel',[]);
+set(hax(1),'YTick',1.5:2:ndatapts,'YTickLabel',featurenames);
+hcb = colorbar(hax(1));
+hcb.Label.String = 'Stds';
+title(hax(1),sprintf('%s, %s',expname,expinfo(expi).label),'interpreter','none');
+set(hax(1),'CLim',[-3,3]);
+colormap(hax(1),jet(256));
+
+% yfly = nan(nflies,nframes,nclasses+1);
+% yfly(:,:,1:end-1) = y;
+% for fly = 1:nflies,
+%   ff = find(~isnan(X(fly,:,1)),1);
+%   ef = find(~isnan(X(fly,:,1)),1,'last');
+%   yfly(fly,ff:ef,end) = fly/nflies;
+% end
+
+
+%yfly(isnan(yfly)) = -1;
+im = reshape(permute(y,[2,1,3]),nflies*nframes,nclasses)';
+imrgb = colormap_image(im,cm,[0,1]);
+imrgb(isnan(repmat(im,[1,1,3]))) = 0;
+image(hax(2),imrgb);
+set(hax(2),'YTick',1:nclasses,'YTickLabel',tasknames,'TickLabelInterpreter','none');
+%colorbar(hax(2));
+set(hax(2),'CLim',[-.25,1.001]);
+colormap(hax(2),kjet(256));
+
+set(hax,'XLim',[(focusfly-1)*nframes+focusframes(1),(focusfly-1)*nframes+focusframes(2)]);
+set(hax,'XTick',(focusfly-1)*nframes+focusframes(1)-1:5000:(focusfly-1)*nframes+focusframes(2))
+set(hax(2),'XTickLabel',num2str((focusframes(1)-1:5000:focusframes(2))'));
+set(hax(1),'XTick',[]);
+linkaxes(hax,'x');
+box(hax(2),'off');
+box(hax(1),'off');
+
+xlabel(hax(2),'Frame');

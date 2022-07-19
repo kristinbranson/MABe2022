@@ -25,48 +25,48 @@ Xnames = [
   'sin_ori',
   'maj_ax_mm',
   'min_ax_mm',
-  'wing_left_x',
-  'wing_left_y',
-  'wing_right_x',
-  'wing_right_y',
+  'wing_right_x_mm',
+  'wing_right_y_mm',
+  'wing_left_x_mm',
+  'wing_right_y_mm',
   'body_area_mm2',
   'fg_area_mm2',
   'img_contrast',
   'min_fg_dist',
-  'antennae_x_mm',
-  'antennae_y_mm',
+  'antennae_midpoint_x_mm',
+  'antennae_midpoint_y_mm',
   'right_eye_x_mm',
   'right_eye_y_mm',
   'left_eye_x_mm',
   'left_eye_y_mm',
-  'left_shoulder_x_mm',
-  'left_shoulder_y_mm',
-  'right_shoulder_x_mm',
-  'right_shoulder_y_mm',
-  'end_notum_x_mm',
-  'end_notum_y_mm',
-  'end_abdomen_x_mm',
-  'end_abdomen_y_mm',
-  'middle_left_b_x_mm',
-  'middle_left_b_y_mm',
-  'middle_left_e_x_mm',
-  'middle_left_e_y_mm',
-  'middle_right_b_x_mm',
-  'middle_right_b_y_mm',
-  'middle_right_e_x_mm',
-  'middle_right_e_y_mm',
-  'tip_front_right_x_mm',
-  'tip_front_right_y_mm',
-  'tip_middle_right_x_mm',
-  'tip_middle_right_y_mm',
-  'tip_back_right_x_mm',
-  'tip_back_right_y_mm',
-  'tip_back_left_x_mm',
-  'tip_back_left_y_mm',
-  'tip_middle_left_x_mm',
-  'tip_middle_left_y_mm',
-  'tip_front_left_x_mm',
-  'tip_front_left_y_mm'
+  'left_front_thorax_x_mm',
+  'left_front_thorax_y_mm',
+  'right_front_thorax_x_mm',
+  'right_front_thorax_y_mm',
+  'base_thorax_x_mm',
+  'base_thorax_y_mm',
+  'tip_abdomen_x_mm',
+  'tip_abdomen_y_mm',
+  'right_middle_femur_base_x_mm',
+  'right_middle_femur_base_y_mm',
+  'right_middle_femur_tibia_joint_x_mm',
+  'right_middle_femur_tibia_joint_y_mm',
+  'left_middle_femur_base_x_mm',
+  'left_middle_femur_base_y_mm',
+  'left_middle_femur_tibia_joint_x_mm',
+  'left_middle_femur_tibia_joint_y_mm',
+  'right_front_leg_tip_x_mm',
+  'right_front_leg_tip_y_mm',
+  'right_middle_leg_tip_x_mm',
+  'right_middle_leg_tip_y_mm',
+  'right_back_leg_tip_x_mm',
+  'right_back_leg_tip_y_mm',
+  'left_back_leg_tip_x_mm',
+  'left_back_leg_tip_y_mm',
+  'left_middle_leg_tip_x_mm',
+  'left_middle_leg_tip_y_mm',
+  'left_front_leg_tip_x_mm',
+  'left_front_leg_tip_y_mm'
 ]
 ynames = [
   'female',
@@ -107,7 +107,7 @@ ynames = [
   'pC1dpublished1_newstim_weakvsstrong',
   'pC1dpublished1_newstim_firstvslast_strong',
   'courtship',
-  'control',
+  'control_any',
   'blind',
   'aIPg',
   'aggression',
@@ -121,7 +121,11 @@ ynames = [
   'perframe_wingflick'
 ]
 
-
+sampletasks = [
+  'control',
+  'pC1dpublished1_newstim_offvson',
+  'aggression'
+]
 
 def loadmatdata(matfile):
   
@@ -215,6 +219,9 @@ def sampleresave(inxfile,inyfile,outxfile,outyfile,outrecordfile,seql=30*FPS,bor
                           np.all(data['ids'][:-1,:]==data['ids'][1:,:],axis=1)==False)
   idxbreak = np.where(isbreak)[0]
   idxbreak = np.append(idxbreak,nframes)
+  issampletask = np.array([task in sampletasks for task in ynames])
+  assert np.count_nonzero(issampletask) == len(sampletasks)
+
   for breaki in range(len(idxbreak)-1):
     i0 = idxbreak[breaki]
     maxi1 = idxbreak[breaki+1]
@@ -257,11 +264,12 @@ def sampleresave(inxfile,inyfile,outxfile,outyfile,outrecordfile,seql=30*FPS,bor
       nseqscurr+=1
 
   order_keys = sorted(record['names'])
-  xshuff = {'vocabulary':featurenames,'keypoints':{}}
-  yshuff = {'vocabulary':ynames,'annotations':{}}
+  xshuff = {'vocabulary':featurenames,'keypoints':{},'categories':sampletasks,'annotations':{}}
+  yshuff = {'vocabulary':[ynames[i] for i in np.where(issampletask==False)[0]],'annotations':{}}
   for key in order_keys:
     xshuff['keypoints'][key] = keypoints[key]
-    yshuff['annotations'][key] = annotations[key]
+    xshuff['annotations'][key] = annotations[key][issampletask,...]
+    yshuff['annotations'][key] = annotations[key][issampletask==False,...]
   
   print('N. labels within middles of sequences:')
   for i in range(nclasses):
