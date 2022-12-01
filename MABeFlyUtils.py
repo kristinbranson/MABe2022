@@ -15,6 +15,7 @@ from matplotlib import cm,animation,colors
 import copy
 import tqdm
 from itertools import compress
+import re
 
 # local path to data -- modify this!
 datadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/seqdata20220307'
@@ -26,26 +27,75 @@ ARENA_RADIUS_MM = 26.689
 
 # names of our keypoint features
 keypointnames = [
-  'wing_right_x_mm',
-  'wing_left_x_mm',
-  'antennae_midpoint_x_mm',
-  'right_eye_x_mm',
-  'left_eye_x_mm',
-  'left_front_thorax_x_mm',
-  'right_front_thorax_x_mm',
-  'base_thorax_x_mm',
-  'tip_abdomen_x_mm',
-  'right_middle_femur_base_x_mm',
-  'right_middle_femur_tibia_joint_x_mm',
-  'left_middle_femur_base_x_mm',
-  'left_middle_femur_tibia_joint_x_mm',
-  'right_front_leg_tip_x_mm',
-  'right_middle_leg_tip_x_mm',
-  'right_back_leg_tip_x_mm',
-  'left_back_leg_tip_x_mm',
-  'left_middle_leg_tip_x_mm',
-  'left_front_leg_tip_x_mm',
+  'wing_right',
+  'wing_left',
+  'antennae_midpoint',
+  'right_eye',
+  'left_eye',
+  'left_front_thorax',
+  'right_front_thorax',
+  'base_thorax',
+  'tip_abdomen',
+  'right_middle_femur_base',
+  'right_middle_femur_tibia_joint',
+  'left_middle_femur_base',
+  'left_middle_femur_tibia_joint',
+  'right_front_leg_tip',
+  'right_middle_leg_tip',
+  'right_back_leg_tip',
+  'left_back_leg_tip',
+  'left_middle_leg_tip',
+  'left_front_leg_tip',
 ]
+
+posenames = [
+  'thorax_front_x',
+  'thorax_front_y',
+  'orientation',
+  'head_base_x',
+  'head_base_y',
+  'head_angle',
+  'abdomen_angle',
+  'left_middle_femur_base_dist',
+  'left_middle_femur_base_angle',
+  'right_middle_femur_base_dist',
+  'right_middle_femur_base_angle',
+  'left_middle_femur_tibia_joint_dist',
+  'left_middle_femur_tibia_joint_angle',
+  'left_front_leg_tip_dist',
+  'left_front_leg_tip_angle',
+  'right_front_leg_tip_dist',
+  'right_front_leg_tip_angle',
+  'right_middle_femur_tibia_joint_dist',
+  'right_middle_femur_tibia_joint_angle',
+  'left_middle_leg_tip_dist',
+  'left_middle_leg_tip_angle',
+  'right_middle_leg_tip_dist',
+  'right_middle_leg_tip_angle',
+  'left_back_leg_tip_dist',
+  'left_back_leg_tip_angle',
+  'right_back_leg_tip_dist',
+  'right_back_leg_tip_angle',
+  'left_wing_angle',
+  'right_wing_angle',
+ ]
+
+scalenames = [
+  'thorax_width',
+  'thorax_length',
+  'abdomen_length',
+  'wing_length',
+  'head_width',
+  'head_height',
+  'std_thorax_width',
+  'std_thorax_length',
+  'std_abdomen_length',
+  'std_wing_length',
+  'std_head_width',
+  'std_head_height',
+]
+
+
 
 # hard-code indices of keypoints and skeleton edges
 keypointidx = np.arange(18,dtype=int)
@@ -82,31 +132,31 @@ tailidx = 8
 
 # edges to connect subsets of the keypoints that maybe make sense
 skeleton_edge_names = [
-  ('base_thorax_x_mm','tip_abdomen_x_mm'),
-  ('left_middle_femur_tibia_joint_x_mm','left_middle_leg_tip_x_mm'),
-  ('right_middle_femur_tibia_joint_x_mm','right_middle_leg_tip_x_mm'),
-  ('left_middle_femur_base_x_mm','left_middle_femur_tibia_joint_x_mm'),
-  ('base_thorax_x_mm','right_middle_femur_base_x_mm'),
-  ('right_middle_femur_base_x_mm','right_middle_femur_tibia_joint_x_mm'),
-  ('base_thorax_x_mm','left_middle_femur_base_x_mm'),
-  ('left_front_thorax_x_mm','base_thorax_x_mm'),
-  ('antennae_midpoint_x_mm','right_eye_x_mm'),
-  ('antennae_midpoint_x_mm','base_thorax_x_mm'),
-  ('left_front_thorax_x_mm','left_front_leg_tip_x_mm'),
-  ('right_front_thorax_x_mm','right_front_leg_tip_x_mm'),
-  ('base_thorax_x_mm','left_back_leg_tip_x_mm'),
-  ('base_thorax_x_mm','right_back_leg_tip_x_mm'),
-  ('antennae_midpoint_x_mm','left_eye_x_mm'),
-  ('right_front_thorax_x_mm','base_thorax_x_mm'),
-  ('base_thorax_x_mm','wing_left_x_mm'),
-  ('base_thorax_x_mm','wing_right_x_mm')
+  ('base_thorax','tip_abdomen'),
+  ('left_middle_femur_tibia_joint','left_middle_leg_tip'),
+  ('right_middle_femur_tibia_joint','right_middle_leg_tip'),
+  ('left_middle_femur_base','left_middle_femur_tibia_joint'),
+  ('base_thorax','right_middle_femur_base'),
+  ('right_middle_femur_base','right_middle_femur_tibia_joint'),
+  ('base_thorax','left_middle_femur_base'),
+  ('left_front_thorax','base_thorax'),
+  ('antennae_midpoint','right_eye'),
+  ('antennae_midpoint','base_thorax'),
+  ('left_front_thorax','left_front_leg_tip'),
+  ('right_front_thorax','right_front_leg_tip'),
+  ('base_thorax','left_back_leg_tip'),
+  ('base_thorax','right_back_leg_tip'),
+  ('antennae_midpoint','left_eye'),
+  ('right_front_thorax','base_thorax'),
+  ('base_thorax','wing_left'),
+  ('base_thorax','wing_right')
 ]
 
 # for computing distances between pairs of flies
 distkeypointnames = [
-  'antennae_midpoint_x_mm',
-  'base_thorax_x_mm',
-  'tip_abdomen_x_mm'
+  'antennae_midpoint',
+  'base_thorax',
+  'tip_abdomen'
 ]
 
 YTYPES = {'seq':0,'tgt':1,'frame':2}
@@ -234,12 +284,12 @@ class FlyDataset(Dataset):
     self.set_idx2seqnum()
     
     # which feature numbers correspond to keypoints and are on the defined skeleton?
-    featurenamesx = list(map(lambda x: x[0],self.featurenames))
+    featurenames = list(map(lambda x: re.sub('_x_mm$','',x[0]),self.featurenames))
     self.keypointidx = np.where(np.array(list(map(lambda x: x[0] in keypointnames,self.featurenames))))[0]
     self.skeleton_edges = np.zeros((len(skeleton_edge_names),2),dtype=int)
     for i in range(len(skeleton_edge_names)):
       for j in range(2):
-        self.skeleton_edges[i,j] = featurenamesx.index(skeleton_edge_names[i][j])
+        self.skeleton_edges[i,j] = featurenames.index(skeleton_edge_names[i][j])
 
     self.arena_radius = arena_radius
     if arena_center is None:
@@ -691,7 +741,7 @@ class FlyDataset(Dataset):
   
   def seqtgt2idx(self,seq=None,seqnum=None,tgt=None):
     if seqnum is None:
-      seqnum = np.seqids.index(seq)
+      seqnum = self.seqids.index(seq)
     idx = np.where(np.logical_and(self.idx2seqnum==seqnum,self.idx2tgt==tgt))[0]
     assert len(idx) == 1, 'Sanity check: found %d matches for seq %d and tgt %d'%(len(idx),seqnum,tgt)
     if np.isscalar(tgt):
@@ -1133,7 +1183,8 @@ hedge: Optional. Handle of edges to update instead of plot new edges. Default: N
 hkpt: Optional. Handle of keypoints to update instead of plot new key points. Default: None.
 """
 def plot_fly(pose=None, kptidx=None, skelidx=None, fig=None, ax=None, kptcolors=None, color=None, name=None,
-             plotskel=True, plotkpts=True, hedge=None, hkpt=None, textlabels=None, htxt=None):
+             plotskel=True, plotkpts=True, hedge=None, hkpt=None, textlabels=None, htxt=None, kpt_ms=6, skel_lw=1,
+             kpt_alpha=1.,skel_alpha=1.):
   # plot_fly(x,fig=None,ax=None,kptcolors=None):
   # x is nfeatures x 2
   assert(pose is not None)
@@ -1160,11 +1211,11 @@ def plot_fly(pose=None, kptidx=None, skelidx=None, fig=None, ax=None, kptcolors=
         kptname = 'keypoints'
         if name is not None:
           kptname = name + ' ' + kptname
-        hkpt = ax.plot(xc,yc,'.',color=kptcolors,label=kptname,zorder=10)[0]
+        hkpt = ax.plot(xc,yc,'.',color=kptcolors,label=kptname,zorder=10,ms=kpt_ms,alpha=kpt_alpha)[0]
       else:
         if type(kptcolors) == str:
           kptcolors = plt.get_cmap(kptcolors)
-        hkpt = ax.scatter(xc,yc,c=np.arange(len(kptidx)),marker='.',cmap=kptcolors,zorder=10)
+        hkpt = ax.scatter(xc,yc,c=np.arange(len(kptidx)),marker='.',cmap=kptcolors,s=kpt_ms,alpha=kpt_alpha,zorder=10)
     else:
       if type(hkpt) == matplotlib.lines.Line2D:
         hkpt.set_data(xc,yc)
@@ -1206,7 +1257,7 @@ def plot_fly(pose=None, kptidx=None, skelidx=None, fig=None, ax=None, kptcolors=
         edgename = name + ' ' + edgename
       if color is None:
         color = [.6,.6,.6]
-      hedge = ax.plot(xc.flatten(),yc.flatten(),'-',color=color,label=edgename,zorder=0)[0]
+      hedge = ax.plot(xc.flatten(),yc.flatten(),'-',color=color,label=edgename,zorder=0,lw=skel_lw,alpha=skel_alpha)[0]
     else:
       hedge.set_data(xc.flatten(),yc.flatten())
 
@@ -1620,6 +1671,535 @@ def DebugPreprocess():
     
   return
   
+
+def circle_fit_error(mu,x,forcemu=None):
+
+  if np.ndim(mu) == 1:
+    mu = mu[:,np.newaxis]
+
+  x = np.atleast_3d(x)
+  m = mu.shape[1]
+  n = x.shape[1]
+  # mu is 2 x 1 x m
+  mu = mu[:,np.newaxis,:]
+  # x is 2 x n x 1
+
+  if forcemu is not None:
+    # forcemu is of length 2
+    mu1 = np.tile(forcemu.reshape((2,1,1)),(1,1,m))
+    mu1[np.isnan(forcemu),...] = mu
+    mu = mu1
+
+  # dx is 2 x n x m
+  dx = x - mu
+  # n x m
+  z = np.sqrt(np.sum(dx**2.,axis=0))
+  # m
+  rho = np.mean(z,axis=0)
+  # n x m
+  theta = np.arctan2(dx[1,...]/z,dx[0,...]/z)
+  err = np.nanmean( (np.cos(theta)*rho.reshape((1,m)) - dx[0,...])**2. + \
+                    (np.sin(theta)*rho.reshape((1,m)) - dx[1,...])**2.,axis=0)
+  return np.sqrt(err)
+
+import scipy.optimize as optimize
+def fit_circle(x,mu0=None,forcemu=None,algorithm='sample',lb=None,ub=None,nsamples=100):
+
+  if mu0 is None:
+    mu0 = np.mean(x,axis=1)
+
+  if forcemu is None:
+    doforce = np.zeros(2,dtype=bool)
+    forcemu = mu0
+  else:
+    doforce = np.isnan(forcemu)==False
+
+  if algorithm == 'leastsq':
+    res = optimize.least_squares(lambda mu: circle_fit_error(mu,x,forcemu),mu0[doforce==False])
+    mufit = res.x
+  elif algorithm == 'sample':
+    assert lb is not None
+    assert ub is not None
+
+    if not any(doforce):
+      nsamples1 = int(np.ceil(np.sqrt(nsamples)))
+      mux_try,muy_try = np.meshgrid(np.linspace(lb[0],ub[0],nsamples1),np.linspace(lb[1],ub[1],nsamples1))
+      mu_try = np.vstack((mux_try.flatten(),muy_try.flatten()))
+    else:
+      mu_try = np.linspace(lb[doforce==False],ub[doforce==False],nsamples).reshape([1,nsamples])
+
+    err = circle_fit_error(mu_try,x,forcemu=forcemu)
+    i = np.argmin(err)
+    mufit = mu_try[:,i]
+    res = {'mu': mu_try, 'err': err, 'minerr': err[i]}
+
+  mu = forcemu
+  mu[doforce==False] = mufit
+  dx=x-mu[:,np.newaxis]
+  z=np.sqrt(np.sum(dx**2.,axis=0))
+  rho=np.mean(z)
+
+  return mu,rho,res
+
+def circle_rotation(x,mu):
+  dx = x - mu[:,np.newaxis]
+  theta = np.arctan2(dx[1,:],dx[0,:])
+  return theta
+
+def reconstruct_headpos(peye,headangle,meanheadwidth,meanheadheight):
+  deye = np.vstack((np.cos(headangle),np.sin(headangle)))*meanheadwidth/2.
+  dant = np.vstack((-np.sin(headangle),np.cos(headangle)))*meanheadheight
+  p = {'left_eye': peye - deye, 'right_eye': peye + deye, 'antenna': peye + dant}
+  return p
+
+def rotate_2d_points(X,theta):
+  costheta = np.cos(theta)
+  sintheta = np.sin(theta)
+  xr = X[:,0,...]*costheta+X[:,1,...]*sintheta
+  yr = -X[:,0,...]*sintheta+X[:,1,...]*costheta
+  Xr = np.concatenate((xr[:,np.newaxis,...],yr[:,np.newaxis,...]),axis=1)
+  return Xr
+
+def compute_scale_perfly(Xcurr):
+
+  if np.ndim(Xcurr) >= 3:
+    T = Xcurr.shape[2]
+  else:
+    T = 1
+  if np.ndim(Xcurr) >= 4:
+    nflies = Xcurr.shape[3]
+  else:
+    nflies = 1
+
+  scale_perfly = np.zeros((len(scalenames),nflies))
+  rfthorax = Xcurr[keypointnames.index('right_front_thorax'),...]
+  lfthorax = Xcurr[keypointnames.index('left_front_thorax'),...]
+  scale_perfly[scalenames.index('thorax_width'),:] = np.nanmedian(np.sqrt(np.sum((rfthorax-lfthorax)**2.,axis=0)),axis=0)
+  scale_perfly[scalenames.index('std_thorax_width'),:]=np.nanstd(np.sqrt(np.sum((rfthorax-lfthorax)**2.,axis=0)),axis=0)
+  fthorax=(rfthorax+lfthorax)/2.
+  bthorax = Xcurr[keypointnames.index('base_thorax'),...]
+  midthorax = (fthorax+bthorax)/2.
+  scale_perfly[scalenames.index('thorax_length'),:] = np.nanmedian(np.sqrt(np.sum((fthorax-bthorax)**2,axis=0)),axis=0)
+  scale_perfly[scalenames.index('std_thorax_length'),:]=np.nanstd(np.sqrt(np.sum((fthorax-bthorax)**2,axis=0)),axis=0)
+  abdomen = Xcurr[keypointnames.index('tip_abdomen'),...]
+  scale_perfly[scalenames.index('abdomen_length'),:]=np.nanmedian(np.sqrt(np.sum((bthorax-abdomen)**2.,axis=0)),axis=0)
+  scale_perfly[scalenames.index('std_abdomen_length'),:]=np.nanstd(np.sqrt(np.sum((bthorax-abdomen)**2.,axis=0)),axis=0)
+  lwing = Xcurr[keypointnames.index('wing_left'),...]
+  rwing = Xcurr[keypointnames.index('wing_right'),...]
+  scale_perfly[scalenames.index('wing_length'),:]=np.nanmedian(np.sqrt(np.sum(np.concatenate(((lwing-midthorax)**2.,(rwing-midthorax)**2.),axis=1),axis=0)),axis=0)
+  scale_perfly[scalenames.index('std_wing_length'),:]=np.nanstd(np.sqrt(np.sum(np.concatenate(((lwing-midthorax)**2.,(rwing-midthorax)**2.),axis=1),axis=0)),axis=0)
+
+  reye = Xcurr[keypointnames.index('right_eye'),...]
+  leye = Xcurr[keypointnames.index('left_eye'),...]
+  eye = (leye+reye)/2.
+  ant = Xcurr[keypointnames.index('antennae_midpoint'),...]
+  headwidth = np.sqrt(np.sum((reye-leye)**2.,axis=0))
+  scale_perfly[scalenames.index('head_width'),...] = np.nanmedian(headwidth)
+  scale_perfly[scalenames.index('std_head_width'),...] = np.nanstd(headwidth)
+  headheight = np.sqrt(np.sum((eye-ant)**2.,axis=0))
+  scale_perfly[scalenames.index('head_height'),...] = np.nanmedian(headheight)
+  scale_perfly[scalenames.index('std_head_height'),...] = np.nanstd(headheight)
+
+  return scale_perfly
+
+def angledist2xy(origin,angle,dist):
+  u = np.vstack((np.cos(angle[np.newaxis,...]),np.sin(angle[np.newaxis,...])))
+  d = u*dist[np.newaxis,...]
+  xy = origin + d
+  return xy
+
+def feat2kp(Xfeat,scale_perfly,flyid=None):
+  ndim = np.ndim(Xfeat)
+  if ndim >= 2:
+    T = Xfeat.shape[1]
+  else:
+    T = 1
+  if ndim >= 3:
+    nflies = Xfeat.shape[2]
+  else:
+    nflies = 1
+  if flyid is None:
+    assert(scale_perfly.shape[1]==nflies)
+    flyid=np.tile(np.arange(nflies,dtype=int)[np.newaxis,:],(T,1))
+
+  Xfeat = Xfeat.reshape((Xfeat.shape[0],T,nflies))
+
+  porigin = Xfeat[[posenames.index('thorax_front_x'),posenames.index('thorax_front_y')],...]
+  thorax_theta = Xfeat[posenames.index('orientation'),...]
+
+  # Xkpn will be normalized by the following translation and rotation
+  Xkpn = np.zeros((len(keypointnames),2,T,nflies))
+  Xkpn[:] = np.nan
+
+  # thorax
+  thorax_width = scale_perfly[scalenames.index('thorax_width'),flyid].reshape((T,nflies))
+  thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid].reshape((T,nflies))
+  Xkpn[keypointnames.index('left_front_thorax'),0,...] = -thorax_width/2.
+  Xkpn[keypointnames.index('left_front_thorax'),1,...] = 0.
+  Xkpn[keypointnames.index('right_front_thorax'),0,...] = thorax_width/2.
+  Xkpn[keypointnames.index('right_front_thorax'),1,...] = 0.
+  Xkpn[keypointnames.index('base_thorax'),0,...] = 0.
+  Xkpn[keypointnames.index('base_thorax'),1,...] = -thorax_length
+
+  # head
+  bhead = Xfeat[[posenames.index('head_base_x'),posenames.index('head_base_y')],...]
+  headangle = Xfeat[posenames.index('head_angle'),...]+np.pi/2.
+  headwidth = scale_perfly[scalenames.index('head_width'),flyid].reshape((T,nflies))
+  headheight = scale_perfly[scalenames.index('head_height'),flyid].reshape((T,nflies))
+  leye = bhead.copy()
+  leye[0,...] = bhead[0,...]-headwidth/2.
+  reye = bhead.copy()
+  reye[0,...] = bhead[0,...]+headwidth/2.
+  Xkpn[keypointnames.index('left_eye'),...] = leye
+  Xkpn[keypointnames.index('right_eye'),...] = reye
+  Xkpn[keypointnames.index('antennae_midpoint'),...] = angledist2xy(bhead,headangle,headheight)
+
+  # abdomen
+  pthorax = np.zeros((2,T,nflies))
+  pthorax[1,...] = -thorax_length
+  abdomenangle = Xfeat[posenames.index('abdomen_angle'),...]-np.pi/2.
+  abdomendist = scale_perfly[scalenames.index('abdomen_length'),flyid].reshape((T,nflies))
+  Xkpn[keypointnames.index('tip_abdomen'),...] = angledist2xy(pthorax,abdomenangle,abdomendist)
+
+  # front legs
+  legangle = np.pi-Xfeat[posenames.index('left_front_leg_tip_angle'),...]
+  legdist = Xfeat[posenames.index('left_front_leg_tip_dist'),...]
+  Xkpn[keypointnames.index('left_front_leg_tip'),...] = angledist2xy(np.zeros((2,T,nflies)),legangle,legdist)
+
+  legangle = Xfeat[posenames.index('right_front_leg_tip_angle'),...]
+  legdist = Xfeat[posenames.index('right_front_leg_tip_dist'),...]
+  Xkpn[keypointnames.index('right_front_leg_tip'),...] = angledist2xy(np.zeros((2,T,nflies)),legangle,legdist)
+
+  # middle leg femur base
+  pmidthorax = np.zeros((2,T,nflies))
+  pmidthorax[1,...] = -thorax_length/2.
+
+  lfemurbaseangle = np.pi-Xfeat[posenames.index('left_middle_femur_base_angle'),...]
+  legdist = Xfeat[posenames.index('left_middle_femur_base_dist'),...]
+  lfemurbase = angledist2xy(pmidthorax,lfemurbaseangle,legdist)
+  Xkpn[keypointnames.index('left_middle_femur_base'),...] = lfemurbase
+
+  rfemurbaseangle = Xfeat[posenames.index('right_middle_femur_base_angle'),...]
+  legdist = Xfeat[posenames.index('right_middle_femur_base_dist'),...]
+  rfemurbase = angledist2xy(pmidthorax,rfemurbaseangle,legdist)
+  Xkpn[keypointnames.index('right_middle_femur_base'),...] = rfemurbase
+
+  # middle leg femur tibia joint
+
+  # lftangleoffset = np.pi-lftangle-(np.pi-lbaseangle)
+  #                = lbaseangle - lftangle
+  # lftangle = lbaseangle - lftangleoffset
+  lftangleoffset = Xfeat[posenames.index('left_middle_femur_tibia_joint_angle'),...]
+  lftangle = lfemurbaseangle-lftangleoffset
+  legdist=Xfeat[posenames.index('left_middle_femur_tibia_joint_dist'),...]
+  lftjoint = angledist2xy(lfemurbase,lftangle,legdist)
+  Xkpn[keypointnames.index('left_middle_femur_tibia_joint'),...] = lftjoint
+
+  rftangleoffset = Xfeat[posenames.index('right_middle_femur_tibia_joint_angle'),...]
+  rftangle = rfemurbaseangle+rftangleoffset
+  legdist=Xfeat[posenames.index('right_middle_femur_tibia_joint_dist'),...]
+  rftjoint = angledist2xy(rfemurbase,rftangle,legdist)
+  Xkpn[keypointnames.index('right_middle_femur_tibia_joint'),...] = rftjoint
+
+  # middle leg tip
+  ltipoffset = Xfeat[posenames.index('left_middle_leg_tip_angle'),...]
+  ltipangle = lftangle-ltipoffset
+  legdist=Xfeat[posenames.index('left_middle_leg_tip_dist'),...]
+  ltip = angledist2xy(lftjoint,ltipangle,legdist)
+  Xkpn[keypointnames.index('left_middle_leg_tip'),...] = ltip
+
+  rtipoffset = Xfeat[posenames.index('right_middle_leg_tip_angle'),...]
+  rtipangle = rftangle+rtipoffset
+  legdist=Xfeat[posenames.index('right_middle_leg_tip_dist'),...]
+  rtip = angledist2xy(rftjoint,rtipangle,legdist)
+  Xkpn[keypointnames.index('right_middle_leg_tip'),...] = rtip
+
+  # back leg
+  legangle = np.pi-Xfeat[posenames.index('left_back_leg_tip_angle'),...]
+  legdist = Xfeat[posenames.index('left_back_leg_tip_dist'),...]
+  Xkpn[keypointnames.index('left_back_leg_tip'),...] = angledist2xy(pthorax,legangle,legdist)
+
+  legangle = Xfeat[posenames.index('right_back_leg_tip_angle'),...]
+  legdist = Xfeat[posenames.index('right_back_leg_tip_dist'),...]
+  Xkpn[keypointnames.index('right_back_leg_tip'),...] = angledist2xy(pthorax,legangle,legdist)
+
+  wingangle = np.pi+Xfeat[posenames.index('left_wing_angle'),...]
+  wingdist = scale_perfly[scalenames.index('wing_length'),flyid].reshape((T,nflies))
+  Xkpn[keypointnames.index('wing_left'),...] = angledist2xy(pmidthorax,wingangle,wingdist)
+
+  wingangle = -Xfeat[posenames.index('right_wing_angle'),...]
+  Xkpn[keypointnames.index('wing_right'),...] = angledist2xy(pmidthorax,wingangle,wingdist)
+
+  Xkp = rotate_2d_points(Xkpn,-thorax_theta)+porigin[np.newaxis,...]
+
+  return Xkp
+
+def kp2feat(Xkp,scale_perfly=None,flyid=None):
+  ndim = np.ndim(Xkp)
+  if ndim >= 3:
+    T = Xkp.shape[2]
+  else:
+    T = 1
+  if ndim >= 4:
+    nflies = Xkp.shape[3]
+  else:
+    nflies = 1
+
+  sz = Xkp.shape[:2]
+  Xkp = Xkp.reshape(sz+(T,nflies))
+
+  assert((flyid is None) == (scale_perfly is None))
+
+  if scale_perfly is None:
+    scale_perfly = compute_scale_perfly(Xkp)
+    flyid=np.tile(np.arange(nflies,dtype=int)[np.newaxis,:],(T,1))
+
+  bthorax = Xkp[keypointnames.index('base_thorax'),...]
+  lthorax = Xkp[keypointnames.index('left_front_thorax'),...]
+  rthorax = Xkp[keypointnames.index('right_front_thorax'),...]
+  fthorax = (lthorax+rthorax)/2.
+  d = fthorax - bthorax
+
+  # center on mean point of "shoulders", rotate so that thorax points "up"
+  thorax_theta = modrange(np.arctan2(d[1,...],d[0,...])-np.pi/2.,-np.pi,np.pi)
+  porigin = fthorax
+  Xn = rotate_2d_points(Xkp-porigin[np.newaxis,...],thorax_theta)
+
+  Xfeat = np.zeros((len(posenames),T,nflies))
+  Xfeat[posenames.index('thorax_front_x'),...] = fthorax[0,...]
+  Xfeat[posenames.index('thorax_front_y'),...]=fthorax[1,...]
+  Xfeat[posenames.index('orientation'),...] = thorax_theta
+
+  thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid].reshape((T,nflies))
+  pthoraxbase = np.zeros((2,T,nflies))
+  pthoraxbase[1,...] = -thorax_length
+  d = Xn[keypointnames.index('tip_abdomen'),...]-pthoraxbase
+  Xfeat[posenames.index('abdomen_angle'),...] = modrange(np.arctan2(d[1,...],d[0,...])+np.pi/2,-np.pi,np.pi)
+
+  ant = Xn[keypointnames.index('antennae_midpoint'),...]
+  eye = (Xn[keypointnames.index('right_eye'),...]+Xn[keypointnames.index('left_eye'),...])/2.
+
+  # represent with the midpoint of the eyes and the angle from here to the antenna
+  Xfeat[posenames.index('head_base_x'),...] = eye[0,...]
+  Xfeat[posenames.index('head_base_y'),...] = eye[1,...]
+  Xfeat[posenames.index('head_angle'),...] = np.arctan2(ant[1,:]-eye[1,:],ant[0,:]-eye[0,:])-np.pi/2.
+
+  # parameterize the front leg tips based on angle and distance from origin (shoulder mid-point)
+  d = Xn[keypointnames.index('left_front_leg_tip'),...]
+  Xfeat[posenames.index('left_front_leg_tip_dist'),...] = np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('left_front_leg_tip_angle'),...] = modrange(np.pi-np.arctan2(d[1,:],d[0,:]),-np.pi,np.pi)
+  d = Xn[keypointnames.index('right_front_leg_tip'),...]
+  Xfeat[posenames.index('right_front_leg_tip_dist'),...] = np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('right_front_leg_tip_angle'),...] = np.arctan2(d[1,:],d[0,:])
+
+  # for middle leg femur base, compute angle around and distance from
+  # halfway between the thorax base and thorax front
+  pmidthorax = np.zeros((2,T,nflies))
+  pmidthorax[1,...] = -thorax_length/2.
+  d = Xn[keypointnames.index('left_middle_femur_base'),...]-pmidthorax
+  Xfeat[posenames.index('left_middle_femur_base_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('left_middle_femur_base_angle'),...] = modrange(np.pi-np.arctan2(d[1,:],d[0,:]),-np.pi,np.pi)
+  d = Xn[keypointnames.index('right_middle_femur_base'),...]-pmidthorax
+  Xfeat[posenames.index('right_middle_femur_base_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('right_middle_femur_base_angle'),...] = np.arctan2(d[1,:],d[0,:])
+
+  # femur tibia joint is represented as distance from and angle around femur base
+  d = Xn[keypointnames.index('left_middle_femur_tibia_joint'),...]-\
+          Xn[keypointnames.index('left_middle_femur_base'),...]
+  Xfeat[posenames.index('left_middle_femur_tibia_joint_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  left_angle = modrange(np.pi-np.arctan2(d[1,:],d[0,:]),-np.pi,np.pi)
+  Xfeat[posenames.index('left_middle_femur_tibia_joint_angle'),...] = \
+    modrange(left_angle-Xfeat[posenames.index('left_middle_femur_base_angle'),...],-np.pi,np.pi)
+
+  d = Xn[keypointnames.index('right_middle_femur_tibia_joint'),...]-\
+          Xn[keypointnames.index('right_middle_femur_base'),...]
+  Xfeat[posenames.index('right_middle_femur_tibia_joint_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  right_angle = np.arctan2(d[1,:],d[0,:])
+  Xfeat[posenames.index('right_middle_femur_tibia_joint_angle'),...] = \
+    modrange(right_angle-Xfeat[posenames.index('right_middle_femur_base_angle'),...],-np.pi,np.pi)
+
+  # middle leg tip is represented as distance from and angle around femur tibia joint
+  d = Xn[keypointnames.index('left_middle_leg_tip'),...]-\
+          Xn[keypointnames.index('left_middle_femur_tibia_joint'),...]
+  Xfeat[posenames.index('left_middle_leg_tip_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('left_middle_leg_tip_angle'),...] = \
+    modrange(np.pi-np.arctan2(d[1,:],d[0,:])-left_angle,-np.pi,np.pi)
+
+  d = Xn[keypointnames.index('right_middle_leg_tip'),...]-\
+          Xn[keypointnames.index('right_middle_femur_tibia_joint'),...]
+  Xfeat[posenames.index('right_middle_leg_tip_dist'),...]=np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('right_middle_leg_tip_angle'),...] = \
+    modrange(np.arctan2(d[1,:],d[0,:])-right_angle,-np.pi,np.pi)
+
+  # for the back legs, use the thorax base as the origin
+  d = Xn[keypointnames.index('left_back_leg_tip'),...]-pthoraxbase
+  Xfeat[posenames.index('left_back_leg_tip_dist'),...] = np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('left_back_leg_tip_angle'),...] = modrange(np.pi-np.arctan2(d[1,:],d[0,:]),-np.pi,np.pi)
+  d = Xn[keypointnames.index('right_back_leg_tip'),...]-pthoraxbase
+  Xfeat[posenames.index('right_back_leg_tip_dist'),...] = np.sqrt(np.sum(d**2,axis=0))
+  Xfeat[posenames.index('right_back_leg_tip_angle'),...] = np.arctan2(d[1,:],d[0,:])
+
+  # wings relative to thorax middle
+  d = Xn[keypointnames.index('wing_left'),...]-pmidthorax
+  Xfeat[posenames.index('left_wing_angle'),...] = modrange(-np.pi+np.arctan2(d[1,:],d[0,:]),-np.pi,np.pi)
+  d = Xn[keypointnames.index('wing_right'),...]
+  Xfeat[posenames.index('right_wing_angle'),...] = -np.arctan2(d[1,:],d[0,:])
+
+  return Xfeat
+
+# def explore_pose(X,scale_perfly,flyid,all_dataset):
+#
+#   pb = X[keypointnames.index('base_thorax'),...]
+#   pl = X[keypointnames.index('left_front_thorax'),...]
+#   pr = X[keypointnames.index('right_front_thorax'),...]
+#   pf = (pl+pr)/2.
+#   d = pf - pb
+#
+#   # center on mean point of "shoulders", rotate so that thorax points "up"
+#   thorax_theta = np.arctan2(d[1,...],d[0,...])-np.pi/2.
+#   porigin = (pl+pr)/2.
+#
+#   Xn = rotate_2d_points(X-porigin[np.newaxis,...],thorax_theta)
+#
+#   reX = {}
+#   reX['thorax_front'] = pf
+#   reX['orientation'] = thorax_theta
+#   reX['thorax_width'] = np.sqrt(np.sum((pr-pl)**2,axis=0))
+#   reX['thorax_length'] = np.sqrt(np.sum(d**2,axis=0))
+#
+#   #R = np.array([[np.cos(thorax_theta[0]),-np.sin(thorax_theta[0])],[np.sin(thorax_theta[0]),np.cos(thorax_theta[0])]])
+#   #Xn = (X-porigin)@R
+#
+#   # eyelen = np.sqrt(np.sum((Xn[keypointnames.index('right_eye'),...]-\
+#   #                          Xn[keypointnames.index('left_eye'),...])**2.,axis=0))
+#   # torsolen = np.sqrt(np.sum((pf-pb)**2.,axis=0))
+#   # torsowid = np.sqrt(np.sum((pr-pl)**2.,axis=0))
+#
+#   # examine fly head positions
+#
+#   pant = Xn[keypointnames.index('antennae_midpoint'),...]
+#   peye = (Xn[keypointnames.index('right_eye'),...]+\
+#            Xn[keypointnames.index('left_eye'),...])/2.
+#
+#   headangle = np.arctan2(pant[1,:]-peye[1,:],pant[0,:]-peye[0,:])
+#   delta_headangle = np.pi/8
+#   sample_headangle = np.linspace(np.pi/2-delta_headangle,np.pi/2+delta_headangle,200)
+#
+#   xhead=np.vstack(list(map(lambda x:np.expand_dims(x,axis=0),
+#                            [Xn[keypointnames.index('antennae_midpoint'),...],
+#                             Xn[keypointnames.index('right_eye'),...],
+#                             Xn[keypointnames.index('left_eye'),...]])))
+#
+#   cmap=cm.plasma
+#   plt.figure()
+#   rtmp = .2
+#
+#   for i in range(len(sample_headangle)):
+#     j = np.argmin(np.abs(sample_headangle[i]-headangle))
+#     headanglecurr = headangle[j]
+#     color = cmap(np.minimum(1,np.maximum(0,(headanglecurr-sample_headangle[0])/(2*delta_headangle))))
+#     if i == 0 or jprev != j:
+#       plt.plot(np.concatenate((xhead[:,0,j],[xhead[0,0,j],])),
+#                np.concatenate((xhead[:,1,j],[xhead[0,1,j],])),'.-',color=color,lw=1)
+#       plt.plot([peye[0,j]-np.cos(headanglecurr)*rtmp,pant[0,j]+np.cos(headanglecurr)*rtmp],
+#                [peye[1,j]-np.sin(headanglecurr)*rtmp,pant[1,j]+np.sin(headanglecurr)*rtmp],'-',color=color,lw=.5)
+#
+#     jprev = j
+#   plt.axis('equal')
+#
+#   # based on this plot, i think it makes most sense to represent with the midpoint of the eyes
+#   # and the angle from here to the antenna, phead and headangle above
+#   # It looks like head size and shape is fairly stereotyped, except when the flies are doing
+#   # weird stuff, so let's compute the average head shape. should be symmetrical!
+#   headwidth = np.sqrt(np.sum((Xn[keypointnames.index('right_eye'),...]-\
+#                               Xn[keypointnames.index('left_eye'),...])**2.,axis=0))
+#   meanheadwidth = np.nanmedian(headwidth)
+#   headheight = np.sqrt(np.sum((peye-pant)**2.,axis=0))
+#   meanheadheight = np.nanmedian(headheight)
+#   reX['head_base'] = (Xn[keypointnames.index('right_eye'),...]+\
+#                       Xn[keypointnames.index('left_eye'),...])/2.
+#
+#   reX['head_angle'] = np.arctan2(Xn[keypointnames.index('antennae_midpoint'),1,:]-reX['head_base'][1,:],
+#                                  Xn[keypointnames.index('antennae_midpoint'),0,:]-reX['head_base'][0,:])-np.pi/2.
+#
+#   frontlegtip = np.concatenate((Xn[keypointnames.index('right_front_leg_tip'),...],
+#                                 np.array([-1,1]).reshape((2,1))*Xn[keypointnames.index('left_front_leg_tip'),...]),axis=1)
+#
+#   plt.figure()
+#   flyid2=np.tile(flyid,2)
+#   idx=np.random.permutation(frontlegtip.shape[1])
+#   plt.scatter(frontlegtip[0,idx],frontlegtip[1,idx],marker='.',s=.2,c=flyid2[idx],cmap=cm.hsv,alpha=.05)
+#   all_dataset.plot_fly(Xn[:,:,0],ax=plt.gca())
+#   plt.axis('equal')
+#
+#   forcemu = np.zeros(2)
+#   forcemu[:] = np.nan
+#   lb = np.zeros(2)
+#   ub = np.zeros(2)
+#   lb[0] = 0
+#   ub[0] = np.mean(Xn[keypointnames.index('right_front_thorax'),0,:])
+#   lb[1] = np.mean(Xn[keypointnames.index('base_thorax'),1,:])
+#   ub[1] = np.mean(Xn[keypointnames.index('right_front_thorax'),1,:])
+#   mufrontleg,rhofrontleg,res = fit_circle(frontlegtip,forcemu=forcemu,lb=lb,ub=ub,nsamples=1000,algorithm='leastsq')
+#
+#   # based on this plot and analysis, i think it makes most sense to fully parameterize the front leg tips
+#   # I think it makes most sense to use angle and distance from origin (shoulder mid-point)
+#   pcurr = Xn[keypointnames.index('left_front_leg_tip'),...]
+#   reX['left_front_leg_tip_dist'] = np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['left_front_leg_tip_angle'] = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:]),-np.pi,np.pi)
+#   pcurr = Xn[keypointnames.index('right_front_leg_tip'),...]
+#   reX['right_front_leg_tip_dist'] = np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['right_front_leg_tip_angle'] = np.arctan2(pcurr[1,:],pcurr[0,:])
+#
+#   # for middle legs, I'm using halfway between the thorax base and thorax front as the base
+#   # each subsequent point is based on the point on the leg
+#   pmidthorax = np.vstack((np.zeros(X.shape[2]),-scale_perfly['thorax_length'][flyid]/2.))
+#   pcurr = Xn[keypointnames.index('left_middle_femur_base'),...]-pmidthorax
+#   reX['left_middle_femur_base_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['left_middle_femur_base_angle'] = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:]),-np.pi,np.pi)
+#   pcurr = Xn[keypointnames.index('right_middle_femur_base'),...]-pmidthorax
+#   reX['right_middle_femur_base_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['right_middle_femur_base_angle'] = np.arctan2(pcurr[1,:],pcurr[0,:])
+#
+#   pcurr = Xn[keypointnames.index('left_middle_femur_tibia_joint'),...]-\
+#           Xn[keypointnames.index('left_middle_femur_base'),...]
+#   reX['left_middle_femur_tibia_joint_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   left_angle = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:]),-np.pi,np.pi)
+#   reX['left_middle_femur_tibia_joint_angle'] = modrange(left_angle-reX['left_middle_femur_base_angle'],-np.pi,np.pi)
+#
+#   pcurr = Xn[keypointnames.index('right_middle_femur_tibia_joint'),...]-\
+#           Xn[keypointnames.index('right_middle_femur_base'),...]
+#   reX['right_middle_femur_tibia_joint_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   right_angle = np.arctan2(pcurr[1,:],pcurr[0,:])
+#   reX['right_middle_femur_tibia_joint_angle'] = modrange(right_angle-reX['right_middle_femur_base_angle'],-np.pi,np.pi)
+#
+#   pcurr = Xn[keypointnames.index('left_middle_leg_tip'),...]-\
+#           Xn[keypointnames.index('left_middle_femur_tibia_joint'),...]
+#   reX['left_middle_leg_tip_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['left_middle_leg_tip_angle'] = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:])-left_angle,-np.pi,np.pi)
+#
+#   pcurr = Xn[keypointnames.index('right_middle_leg_tip'),...]-\
+#           Xn[keypointnames.index('right_middle_femur_tibia_joint'),...]
+#   reX['right_middle_leg_tip_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['right_middle_leg_tip_angle'] = modrange(np.arctan2(pcurr[1,:],pcurr[0,:])-right_angle,-np.pi,np.pi)
+#
+#   # for the back legs, use the thorax base as the origin
+#   pthoraxbase = np.vstack((np.zeros(X.shape[2]),-scale_perfly['thorax_length'][flyid]))
+#   pcurr = Xn[keypointnames.index('left_back_leg_tip'),...]-pthoraxbase
+#   reX['left_back_leg_tip_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['left_back_leg_tip_angle'] = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:]),-np.pi,np.pi)
+#   pcurr = Xn[keypointnames.index('right_back_leg_tip'),...]-pthoraxbase
+#   reX['right_back_leg_tip_dist']=np.sqrt(np.sum(pcurr**2,axis=0))
+#   reX['right_back_leg_tip_angle'] = np.arctan2(pcurr[1,:],pcurr[0,:])
+#
+#   # plot wings relative to origin
+#   pcurr = Xn[keypointnames.index('wing_left'),...]
+#   reX['left_wing_angle'] = modrange(np.pi-np.arctan2(pcurr[1,:],pcurr[0,:]),-np.pi,np.pi)
+#   pcurr = Xn[keypointnames.index('wing_right'),...]
+#   reX['left_wing_angle'] = np.arctan2(pcurr[1,:],pcurr[0,:])
+#
+#   all_dataset
+
 
 if __name__ == "__main__":
   DebugPreprocess()

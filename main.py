@@ -696,6 +696,111 @@ def EvalDriver(loadfile=None):
   print('Test error rates:')
   PrintConfusionMatrix(testdataset,testaconfusionmatrix)
 
+def PoseRepDriver():
+  # file containing the data
+  xfile = os.path.join(datadir, 'Xusertrain_seq.npy')
+  yfile = os.path.join(datadir, 'yusertrain_seq.npy')
+  nsample = 500
+  assert (os.path.exists(xfile))
+  assert (os.path.exists(yfile))
+
+  # load data and initialize Dataset object
+  logging.info('Loading dataset...')
+  all_dataset = mabe.FlyDataset(xfile, yfile, arena_radius=mabe.ARENA_RADIUS_MM)
+
+  X = next(iter(all_dataset.X.values()))
+  sz = X.shape[:2]
+  y = next(iter(all_dataset.y.values()))
+  maxnflies = X.shape[3]
+  T = X.shape[2]
+  X = np.zeros((X.shape[0],X.shape[1],nsample*len(all_dataset.X)))
+  y = np.zeros((y.shape[0],nsample*len(all_dataset.X)))
+  flyid = np.zeros(nsample*len(all_dataset.X),dtype=int)
+  flyid0=np.tile(np.arange(maxnflies,dtype=int).reshape(1,maxnflies),(T,1)).flatten()
+  count = 0
+  flycount = 0
+  scale_perfly = np.zeros((len(mabe.scalenames),0))
+
+  for id in all_dataset.seqids:
+
+    Xcurr = all_dataset.X[id]
+    ycurr = all_dataset.y[id]
+
+    isreal = mabe.get_real_flies(Xcurr.reshape((Xcurr.shape[0]*Xcurr.shape[1],)+Xcurr.shape[2:]))
+    scale_perfly_curr = np.zeros((len(mabe.scalenames),maxnflies))
+    scale_perfly_curr[:] = np.nan
+    scale_perfly_curr[:,isreal] = mabe.compute_scale_perfly(Xcurr[...,isreal])
+
+    Xcurr = Xcurr.reshape(sz+(Xcurr.shape[-2]*Xcurr.shape[-1],))
+    ycurr = ycurr.reshape((ycurr.shape[0],ycurr.shape[-2]*ycurr.shape[-1]))
+    isreal = mabe.get_real_flies(Xcurr.reshape((Xcurr.shape[0]*Xcurr.shape[1],Xcurr.shape[2])))
+    Xcurr = Xcurr[:,:,isreal]
+    ycurr = ycurr[:,isreal]
+    flyidcurr = flyid0[isreal]
+    idx = np.sort(np.random.choice(Xcurr.shape[2],nsample,replace=False))
+    X[:,:,count*nsample:(count+1)*nsample] = Xcurr[:,:,idx]
+    y[:,count*nsample:(count+1)*nsample] = ycurr[:,idx]
+
+    minfly = np.min(flyidcurr[idx])
+    maxfly = np.max(flyidcurr[idx])
+    scale_perfly_curr = scale_perfly_curr[:,minfly:maxfly+1]
+    flyid[count*nsample:(count+1)*nsample] = flyidcurr[idx]-minfly+flycount
+    scale_perfly = np.concatenate((scale_perfly,scale_perfly_curr),axis=1)
+
+    count += 1
+    flycount += maxfly-minfly+1
+
+  nscalefeats = len(mabe.scalenames)//2
+  order=np.argsort(scale_perfly[mabe.scalenames.index('thorax_length'),:])
+  colors = cm.Dark2(np.arange(nscalefeats)/nscalefeats)
+  plt.clf()
+  for i in range(nscalefeats):
+    plt.errorbar(np.arange(len(order)),scale_perfly[i,order],scale_perfly[i+nscalefeats,order],fmt='none',color=colors[i,:-1],alpha=.1)
+
+  for i in range(nscalefeats):
+    plt.plot(np.arange(len(order)),scale_perfly[i,order],'.',color=colors[i,:-1],alpha=.5,label=mabe.scalenames[i])
+
+  plt.legend()
+
+  seqcurr = 1
+  flycurr = 0
+  id = all_dataset.seqids[seqcurr]
+  Xcurr = all_dataset.X[id]
+  isreal=mabe.get_real_flies(Xcurr.reshape((Xcurr.shape[0]*Xcurr.shape[1],)+Xcurr.shape[2:]))
+  Xcurr = Xcurr[...,isreal]
+  #scale_perfly_curr = compute_scale_perfly(Xcurr)
+  #flyidcurr = np.tile(np.arange(Xcurr.shape[-1],dtype=int)[np.newaxis,:],(Xcurr.shape[-2],1))
+
+  Xfeat = mabe.kp2feat(X,scale_perfly,flyid)
+  Xfeatcurr = mabe.kp2feat(Xcurr)#,scale_perfly_curr,flyidcurr)
+
+  plt.figure()
+  plt.clf()
+  yticks = np.zeros(len(mabe.posenames))
+  maxsig = 4
+  for i in range(len(mabe.posenames)):
+    key = mabe.posenames[i]
+    x = Xfeatcurr[mabe.posenames.index(key),...]
+    dx = x
+    #dx = np.diff(x,axis=0)
+    if key == 'orientation' or len(re.findall('angle',key)) > 0:
+      dx = mabe.modrange(dx,-np.pi,np.pi)
+
+    mu = np.nanmean(dx.flatten())
+    sig = np.nanstd(dx.flatten())
+    dz = (dx-mu)/sig
+    midy = (i+.5)*2*maxsig
+    plt.plot(dz[:,flycurr]+midy,'-',label=f'delta {key}')
+    yticks[i] = midy
+
+  plt.gca().set_yticks(yticks)
+  plt.gca().set_yticklabels(mabe.posenames)
+  plt.gca().grid('on','major','both')
+
+  plt.tight_layout()
+
+  Xkp_reconstruct = mabe.feat2kp(Xfeat,scale_perfly,flyid)
+
 def LoadFullData(loadfile=None):
   if loadfile is None:
     loadfile = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/fulldata20220118/Xusertrain.npz'
@@ -712,8 +817,10 @@ if __name__ == "__main__":
   #loadfile = os.path.join(rootsavedir,'unet','PerCategoryBalanced20220124T202455','CP_latest_epoch108.pth')
   loadfile = None
   #PlotTrainLossDriver(loadfile=loadfile)
-  TrainDriver(loadfile=loadfile)
+  #TrainDriver(loadfile=loadfile)
   #ClassCountDriver()
   #EvalDriver(loadfile=loadfile)
   #LoadFullData()
   #_ = CleanOldNets(deleteolddirs=True,deleteoldfiles=True)
+
+  PoseRepDriver()
