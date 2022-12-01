@@ -1,0 +1,28 @@
+# Expose the X server on the host.
+echo "You should have already run this: sudo xhost +local:root"
+
+export workdir="/groups/branson/home/bransonk/behavioranalysis/code/MABe2022"
+
+mkdir -p $workdir/.cache
+
+# --rm: Make the container ephemeral (delete on exit).
+# -it: Interactive TTY.
+# --gpus all: Expose all GPUs to the container.
+docker run \
+  --rm \
+  -it \
+  --gpus all \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -e DISPLAY=$DISPLAY \
+  -e QT_X11_NO_MITSHM=1 \
+  -e MPLCONFIGDIR=/workspace/mplcache \
+  --user $(id -u):$(id -g) \
+  -v /groups/branson:/groups/branson \
+  -v /nrs/branson:/nrs/branson \
+  -v /nearline/branson:/nearline/branson \
+  --volume $workdir/.cache:/.cache \
+  --volume $workdir:/root \
+  --volume $workdir:/workdir \
+  --volume $workdir:/workspace torch_transformer /bin/bash
+
+echo "Goodbye!"
