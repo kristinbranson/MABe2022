@@ -16,6 +16,8 @@ docker run \
   -e DISPLAY=$DISPLAY \
   -e QT_X11_NO_MITSHM=1 \
   -e MPLCONFIGDIR=/workspace/mplcache \
+  -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  -e CUDA_VISIBLE_DEVICES=1 \
   --user $(id -u):$(id -g) \
   -v /groups/branson:/groups/branson \
   -v /nrs/branson:/nrs/branson \

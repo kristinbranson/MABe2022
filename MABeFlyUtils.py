@@ -98,7 +98,7 @@ scalenames = [
 
 
 # hard-code indices of keypoints and skeleton edges
-keypointidx = np.arange(18,dtype=int)
+keypointidx = np.arange(19,dtype=int)
 skeleton_edges = np.array([
   [ 7,  8],
   [10, 14],
@@ -142,10 +142,12 @@ skeleton_edge_names = [
   ('left_front_thorax','base_thorax'),
   ('antennae_midpoint','right_eye'),
   ('antennae_midpoint','base_thorax'),
+  ('left_front_thorax','right_front_thorax'),
   ('left_front_thorax','left_front_leg_tip'),
   ('right_front_thorax','right_front_leg_tip'),
   ('base_thorax','left_back_leg_tip'),
   ('base_thorax','right_back_leg_tip'),
+  ('left_eye','right_eye'),
   ('antennae_midpoint','left_eye'),
   ('right_front_thorax','base_thorax'),
   ('base_thorax','wing_left'),
@@ -222,6 +224,7 @@ class FlyDataset(Dataset):
     # featurenames is a list of pairs of strings with a string descriptor
     # of each feature. featurenames[j][j] corresponds to X[seqid][:,:,j,j]
     self.featurenames = xdata['vocabulary']
+    self.featurenames = list(map(lambda x: re.sub('_x_mm$','',x[0]),self.featurenames))
     
     # number of sequences
     self.nseqs = len(self.X)
@@ -278,18 +281,20 @@ class FlyDataset(Dataset):
     self.yvalues = None
       
     # features to use for computing inter-fly distances
-    self.fidxdist = np.where(np.array(list(map(lambda x: x[0] in distkeypointnames,self.featurenames))))[0]
+    self.fidxdist = np.sort(np.array([self.featurenames.index(x) for x in distkeypointnames]))
+    assert(self.fidxdist.size == len(distkeypointnames))
     
     # not all flies have data for each sequence
     self.set_idx2seqnum()
     
     # which feature numbers correspond to keypoints and are on the defined skeleton?
-    featurenames = list(map(lambda x: re.sub('_x_mm$','',x[0]),self.featurenames))
-    self.keypointidx = np.where(np.array(list(map(lambda x: x[0] in keypointnames,self.featurenames))))[0]
+    self.keypointidx = np.sort(np.array([self.featurenames.index(x) for x in keypointnames]))
+    assert(self.keypointidx.size == len(keypointnames))
+
     self.skeleton_edges = np.zeros((len(skeleton_edge_names),2),dtype=int)
     for i in range(len(skeleton_edge_names)):
       for j in range(2):
-        self.skeleton_edges[i,j] = featurenames.index(skeleton_edge_names[i][j])
+        self.skeleton_edges[i,j] = self.featurenames.index(skeleton_edge_names[i][j])
 
     self.arena_radius = arena_radius
     if arena_center is None:
@@ -1846,10 +1851,14 @@ def feat2kp(Xfeat,scale_perfly,flyid=None):
   headangle = Xfeat[posenames.index('head_angle'),...]+np.pi/2.
   headwidth = scale_perfly[scalenames.index('head_width'),flyid].reshape((T,nflies))
   headheight = scale_perfly[scalenames.index('head_height'),flyid].reshape((T,nflies))
+  cosha = np.cos(headangle-np.pi/2.)
+  sinha = np.sin(headangle-np.pi/2.)
   leye = bhead.copy()
-  leye[0,...] = bhead[0,...]-headwidth/2.
+  leye[0,...] -= headwidth/2.*cosha
+  leye[1,...] -= headwidth/2.*sinha
   reye = bhead.copy()
-  reye[0,...] = bhead[0,...]+headwidth/2.
+  reye[0,...] += headwidth/2.*cosha
+  reye[1,...] += headwidth/2.*sinha
   Xkpn[keypointnames.index('left_eye'),...] = leye
   Xkpn[keypointnames.index('right_eye'),...] = reye
   Xkpn[keypointnames.index('antennae_midpoint'),...] = angledist2xy(bhead,headangle,headheight)
@@ -1934,7 +1943,36 @@ def feat2kp(Xfeat,scale_perfly,flyid=None):
 
   return Xkp
 
-def kp2feat(Xkp,scale_perfly=None,flyid=None):
+def body_centric_kp(Xkp):
+
+  ndim = np.ndim(Xkp)
+  if ndim >= 3:
+    T = Xkp.shape[2]
+  else:
+    T = 1
+  if ndim >= 4:
+    nflies = Xkp.shape[3]
+  else:
+    nflies = 1
+
+  sz = Xkp.shape[:2]
+  Xkp = Xkp.reshape(sz+(T,nflies))
+
+  bthorax = Xkp[keypointnames.index('base_thorax'),...]
+  lthorax = Xkp[keypointnames.index('left_front_thorax'),...]
+  rthorax = Xkp[keypointnames.index('right_front_thorax'),...]
+  fthorax = (lthorax+rthorax)/2.
+  d = fthorax - bthorax
+
+  # center on mean point of "shoulders", rotate so that thorax points "up"
+  thorax_theta = modrange(np.arctan2(d[1,...],d[0,...])-np.pi/2.,-np.pi,np.pi)
+  porigin = fthorax
+  Xn = rotate_2d_points(Xkp-porigin[np.newaxis,...],thorax_theta)
+
+  return Xn,porigin,thorax_theta
+
+def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
+
   ndim = np.ndim(Xkp)
   if ndim >= 3:
     T = Xkp.shape[2]
@@ -1954,20 +1992,11 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None):
     scale_perfly = compute_scale_perfly(Xkp)
     flyid=np.tile(np.arange(nflies,dtype=int)[np.newaxis,:],(T,1))
 
-  bthorax = Xkp[keypointnames.index('base_thorax'),...]
-  lthorax = Xkp[keypointnames.index('left_front_thorax'),...]
-  rthorax = Xkp[keypointnames.index('right_front_thorax'),...]
-  fthorax = (lthorax+rthorax)/2.
-  d = fthorax - bthorax
-
-  # center on mean point of "shoulders", rotate so that thorax points "up"
-  thorax_theta = modrange(np.arctan2(d[1,...],d[0,...])-np.pi/2.,-np.pi,np.pi)
-  porigin = fthorax
-  Xn = rotate_2d_points(Xkp-porigin[np.newaxis,...],thorax_theta)
+  Xn,fthorax,thorax_theta = body_centric_kp(Xkp)
 
   Xfeat = np.zeros((len(posenames),T,nflies))
   Xfeat[posenames.index('thorax_front_x'),...] = fthorax[0,...]
-  Xfeat[posenames.index('thorax_front_y'),...]=fthorax[1,...]
+  Xfeat[posenames.index('thorax_front_y'),...]= fthorax[1,...]
   Xfeat[posenames.index('orientation'),...] = thorax_theta
 
   thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid].reshape((T,nflies))
@@ -2045,7 +2074,10 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None):
   d = Xn[keypointnames.index('wing_right'),...]
   Xfeat[posenames.index('right_wing_angle'),...] = -np.arctan2(d[1,:],d[0,:])
 
-  return Xfeat
+  if return_scale:
+    return Xfeat,scale_perfly,flyid
+  else:
+    return Xfeat
 
 # def explore_pose(X,scale_perfly,flyid,all_dataset):
 #

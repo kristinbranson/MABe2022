@@ -215,7 +215,11 @@ class PositionalEncoding(nn.Module):
 # ``G`` and ``F`` can not be learned in the example above.
 #
 
-def data_process(raw_text_iter: dataset.IterableDataset, vocab, tokenizer) -> Tensor:
+from torchtext.datasets import WikiText2
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+
+def data_process_torchtext(raw_text_iter: dataset.IterableDataset, vocab, tokenizer) -> Tensor:
   """Converts raw text into a flat Tensor."""
   data = [torch.tensor(vocab(tokenizer(item)),dtype=torch.long) for item in raw_text_iter]
   return torch.cat(tuple(filter(lambda t: t.numel() > 0, data)))
@@ -234,9 +238,33 @@ def batchify(data: Tensor, bsz: int) -> Tensor:
   data = data.view(bsz,seq_len).t().contiguous()
   return data.to(device)
 
-from torchtext.datasets import WikiText2
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator
+# from datasets import load_dataset
+# from transformers import AutoTokenizer
+
+# def create_wikipedia_dataset(params):
+
+#   # load in wikipedia data
+#   dataset = load_dataset("wikipedia", "20200501.en")
+
+#   # split into train, val, test
+#   frac_test = .1
+#   frac_val = frac_test
+#   split = dataset.train_test_split(test_size=frac_test)
+#   dataset = split['train']
+#   dataset.set_format(type='torch')
+#   test_dataset = split['test']
+#   split = dataset.train_test_split(test_size=frac_val/(1.-frac_test))
+#   train_dataset = split['train']
+#   val_dataset = split['test']
+
+#   # set tokenizer
+#   tokenizer = AutoTokenizer.from_pretrained('bert-base-cased')
+
+# def data_process_huggingface(dataset, vocab, tokenizer):
+
+#   dataset = [vocab(tokenizer(e['text'])) for e in dataset]
+#   return dataset
+
 
 def create_wikitext_dataset(params):
 
@@ -251,9 +279,9 @@ def create_wikitext_dataset(params):
   # train_iter was "consumed" by the process of building the vocab, so we have to create it again
   # I have no idea what that means!!
   train_iter, val_iter, test_iter = WikiText2()
-  train_data = data_process(train_iter,vocab,tokenizer)
-  val_data = data_process(val_iter,vocab,tokenizer)
-  test_data = data_process(test_iter,vocab,tokenizer)
+  train_data = data_process_torchtext(train_iter,vocab,tokenizer)
+  val_data = data_process_torchtext(val_iter,vocab,tokenizer)
+  test_data = data_process_torchtext(test_iter,vocab,tokenizer)
 
   train_data = batchify(train_data,params['batch_size'])
   val_data = batchify(val_data,params['batch_size'])
