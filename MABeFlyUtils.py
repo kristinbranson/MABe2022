@@ -223,8 +223,7 @@ class FlyDataset(Dataset):
     
     # featurenames is a list of pairs of strings with a string descriptor
     # of each feature. featurenames[j][j] corresponds to X[seqid][:,:,j,j]
-    self.featurenames = xdata['vocabulary']
-    self.featurenames = list(map(lambda x: re.sub('_x_mm$','',x[0]),self.featurenames))
+    self.featurenames = [re.sub('_x_mm$','',x[0]) for x in xdata['vocabulary']]
     
     # number of sequences
     self.nseqs = len(self.X)
@@ -911,7 +910,7 @@ class FlyDataset(Dataset):
   
   def deepcopy(self):
     return copy.deepcopy(self)
-  
+
 # def compute_y_values(dataset,yvalues=None,binary=False):
 #
 #   if binary:
@@ -1141,12 +1140,17 @@ def get_Dark3_cmap():
 isreal = get_real_flies(x)
 Returns which flies in the input ndarray x correspond to real data (are not nan).
 Input:
-x: ndarray of arbitrary dimensions, as long as the last dimension corresponds to targets.
+x: ndarray of arbitrary dimensions, as long as the tgtdim-dimension corresponds to targets.
+tgtdim: dimension corresponding to targets. default: -1 (last)
 """
-def get_real_flies(x):
+def get_real_flies(x,tgtdim=-1):
   # x is ... x ntgts
-  dims = tuple(range(x.ndim-1))
-  isreal = np.all(np.isnan(x),axis=dims)==False
+  dims = list(range(x.ndim))
+  if tgtdim < 0:
+    tgtdim = x.ndim+tgtdim
+  dims.remove(tgtdim)
+    
+  isreal = np.all(np.isnan(x),axis=tuple(dims))==False
   return isreal
 
 """
@@ -1823,6 +1827,9 @@ def feat2kp(Xfeat,scale_perfly,flyid=None):
     nflies = Xfeat.shape[2]
   else:
     nflies = 1
+  if np.ndim(scale_perfly)==1:
+    scale_perfly = scale_perfly[:,None]
+      
   if flyid is None:
     assert(scale_perfly.shape[1]==nflies)
     flyid=np.tile(np.arange(nflies,dtype=int)[np.newaxis,:],(T,1))
@@ -1986,7 +1993,8 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
   sz = Xkp.shape[:2]
   Xkp = Xkp.reshape(sz+(T,nflies))
 
-  assert((flyid is None) == (scale_perfly is None))
+  assert((flyid is None) or scale_perfly is not None)
+  #assert((flyid is None) == (scale_perfly is None))
 
   if scale_perfly is None:
     scale_perfly = compute_scale_perfly(Xkp)
@@ -1999,7 +2007,10 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
   Xfeat[posenames.index('thorax_front_y'),...]= fthorax[1,...]
   Xfeat[posenames.index('orientation'),...] = thorax_theta
 
-  thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid].reshape((T,nflies))
+  # thorax_length can be a scalar or an array of size T x nflies
+  thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid]
+  if thorax_length.size > 1:
+    thorax_length = thorax_length.reshape((T,nflies))
   pthoraxbase = np.zeros((2,T,nflies))
   pthoraxbase[1,...] = -thorax_length
   d = Xn[keypointnames.index('tip_abdomen'),...]-pthoraxbase

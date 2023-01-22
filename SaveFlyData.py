@@ -170,6 +170,47 @@ def CreateSeq(keypoints):
   seq = {'keypoints',keypoints}
   return seq
 
+def formatresave(inxfile,inyfile,outfile):
+  
+  print(f'Loading {inxfile} and {inyfile}, saving to {outfile}')
+  
+  data = {}
+  with np.load(inxfile) as data1:
+    for key in data1:
+      data[key] = data1[key]
+
+  with np.load(inyfile) as data1:
+    data['y'] = data1['y']
+
+  # data['X'] is nframes x nflies x nfeatures
+  # data['y'] is nframes x nflies x nclasses
+  nframes = data['y'].shape[0]
+  nflies = data['y'].shape[1]
+  nclasses = data['y'].shape[2]
+  nfeatures = data['X'].shape[2]
+  
+  xidx = np.where(np.array(list(map(lambda x: re.search('_x(_mm)?$',x) is not None,Xnames))))[0]
+  yidx = np.where(np.array(list(map(lambda x: re.search('_y(_mm)?$',x) is not None,Xnames))))[0]
+  assert(len(xidx)==len(yidx))
+  nkeypoints = len(xidx)
+
+  kpnames = [re.sub('_x_mm$','',Xnames[i]) for i in xidx]
+
+  # output X is nkeypoints x nframes x nflies
+  X = np.zeros((nkeypoints,2,nframes,nflies),dtype=np.float32)
+  X[:,0,:,:] = np.transpose(data['X'][:,:,xidx],[2,0,1])
+  X[:,1,:,:] = np.transpose(data['X'][:,:,yidx],[2,0,1])
+
+  y = np.transpose(data['y'],[2,0,1])
+  
+  data['X'] = X
+  data['y'] = y
+  data['kpnames'] = kpnames
+  data['categories'] = ynames
+  np.savez(outfile,**data)
+
+
+
 def sampleresave(inxfile,inyfile,outxfile,outyfile,outrecordfile,seql=30*FPS,borderl=5*FPS,skipl=(FPS//2,2*FPS)):
   data = {}
   with np.load(inxfile) as data1:
@@ -313,5 +354,10 @@ def CutAllIntoSeqs():
   
 if __name__ == "__main__":
   #resave()
-  CutAllIntoSeqs()
+  #CutAllIntoSeqs()
+
+  formatresave(xusertrainfile,yusertrainfile,os.path.join(datadir,'usertrain.npz'))
+  formatresave(xtesttrainfile,ytesttrainfile,os.path.join(datadir,'testtrain.npz'))
+  formatresave(xtest1file,ytest1file,os.path.join(datadir,'test1.npz'))
+  formatresave(xtest2file,ytest2file,os.path.join(datadir,'test2.npz'))
   
