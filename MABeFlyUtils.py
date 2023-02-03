@@ -1191,7 +1191,7 @@ plotkpts: Optional. Whether to plot key points. Default: True.
 hedge: Optional. Handle of edges to update instead of plot new edges. Default: None.
 hkpt: Optional. Handle of keypoints to update instead of plot new key points. Default: None.
 """
-def plot_fly(pose=None, kptidx=None, skelidx=None, fig=None, ax=None, kptcolors=None, color=None, name=None,
+def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax=None, kptcolors=None, color=None, name=None,
              plotskel=True, plotkpts=True, hedge=None, hkpt=None, textlabels=None, htxt=None, kpt_ms=6, skel_lw=1,
              kpt_alpha=1.,skel_alpha=1.):
   # plot_fly(x,fig=None,ax=None,kptcolors=None):
@@ -1405,6 +1405,14 @@ def plot_annotations(y=None,yvalues=None,names=None,fig=None,ax=None,
     ax.set_yticks(np.arange(0,ncategories))
     ax.set_yticklabels(names)
   return hpatch,fig,ax
+
+def plot_arena(ax=None):
+  if ax is None:
+    ax = plt.gca()
+  theta = np.linspace(0,2*np.pi,360)
+  h = ax.plot(ARENA_RADIUS_MM*np.cos(theta),ARENA_RADIUS_MM*np.sin(theta),'k-',zorder=-10)
+  return h
+
 
 """
 animate_pose_sequence(seq=None, kptidx=None, skelidx=None,
