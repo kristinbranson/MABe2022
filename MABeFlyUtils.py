@@ -2017,8 +2017,14 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
 
   # thorax_length can be a scalar or an array of size T x nflies
   thorax_length = scale_perfly[scalenames.index('thorax_length'),flyid]
-  if thorax_length.size > 1:
+  if np.isscalar(thorax_length) or thorax_length.size == 1:
+    pass
+  elif thorax_length.size == nflies:
+    thorax_length = thorax_length.reshape((1,nflies))
+  elif thorax_length.size == T*nflies:    
     thorax_length = thorax_length.reshape((T,nflies))
+  else:
+    raise ValueError(f'thorax_length size {thorax_length.size} is unexpected')
   pthoraxbase = np.zeros((2,T,nflies))
   pthoraxbase[1,...] = -thorax_length
   d = Xn[keypointnames.index('tip_abdomen'),...]-pthoraxbase
