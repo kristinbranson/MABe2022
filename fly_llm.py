@@ -6,6 +6,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import cm,animation,colors
 import copy
+import typing
 import tqdm
 from itertools import compress
 import re
@@ -26,14 +27,34 @@ legtipnames = [
   'left_front_leg_tip',
 ]
 
+vision_kpnames_v1 = [
+  'antennae_midpoint',
+  'tip_abdomen',
+  'left_middle_femur_base',
+  'right_middle_femur_base',
+]
+
+touch_other_kpnames_v1 = [
+  'antennae_midpoint',
+  'left_front_thorax',
+  'right_front_thorax',
+  'base_thorax',
+  'tip_abdomen',
+]
+
 SENSORY_PARAMS = {
   'n_oma': 72,
   'inner_arena_radius': 17.5, # in mm
   'outer_arena_radius': mabe.ARENA_RADIUS_MM,
   'arena_height': 3.5,
   'otherflies_vision_exp': .6,
-  'wallkpnames': mabe.keypointnames,
-  #'wallkpnames': legtipnames,
+  'touch_kpnames': mabe.keypointnames,
+  #'touch_kpnames': legtipnames,
+  'vision_kpnames': vision_kpnames_v1,
+  'touch_other_kpnames': touch_other_kpnames_v1,
+  'compute_otherflies_touch': True,
+  'otherflies_touch_exp': 1.3,
+  'otherflies_touch_mult': np.nan,
 }
 SENSORY_PARAMS['otherflies_vision_mult'] = 1./((2.*mabe.ARENA_RADIUS_MM)**SENSORY_PARAMS['otherflies_vision_exp'])
 
@@ -230,50 +251,75 @@ def debug_plot_wall_touch(t,xwall,ywall,distleg,wall_touch):
   ax.plot(np.cos(theta_arena)*SENSORY_PARAMS['inner_arena_radius'],np.sin(theta_arena)*SENSORY_PARAMS['inner_arena_radius'],'-')
   ax.plot(np.cos(theta_arena)*SENSORY_PARAMS['outer_arena_radius'],np.sin(theta_arena)*SENSORY_PARAMS['outer_arena_radius'],'-')
   hpts = []
-  for pti in range(nkpwall):
+  for pti in range(nkptouch):
     hpts.append(ax.plot(xwall[pti,t],ywall[pti,t],'o')[0])
   ax.set_aspect('equal')
   ax = plt.subplot(1,2,2)
   ax.plot(distleg.flatten(),wall_touch.flatten(),'k.')
   ax.plot([0,SENSORY_PARAMS['inner_arena_radius'],SENSORY_PARAMS['outer_arena_radius']],
           [SENSORY_PARAMS['arena_height'],SENSORY_PARAMS['arena_height'],0],'-')
-  for pti in range(nkpwall):
+  for pti in range(nkptouch):
     ax.plot(distleg[pti,t],wall_touch[pti,t],'o',color=hpts[pti].get_color())
   ax.set_aspect('equal')
 
-# compute vision features
+# compute sensory input
 #
 # inputs:
 # xeye_main: x-coordinate of main fly's position for vision. shape = (T).
 # yeye_main: y-coordinate of main fly's position for vision. shape = (T).
 # theta_main: orientation of main fly. shape = (T).
-# xother: x-coordinate of 4 points on the other flies. shape = (4,T,nflies)
-# yother: y-coordinate of 4 points on the other flies. shape = (4,T,nflies)
-# params: dictionary of parameters with the following entries:
-# params['n_oma']: number of bins representing visual scene. constant scalar. 
-# params['mindist']: minimum distance from a fly to a chamber feature point. constant scalar.
-# params['I']: y-coordinates in pixels of points along the chamber outline. shape = (n_oma).
-# params['J']: x-coordinates in pixels of points along the chamber outline. shape = (n_oma).
+# xtouch_main: x-coordinates of main fly's keypoints for computing touch inputs (both wall and other fly). shape = (npts_touch,T).
+# ytouch_main: y-coordinates of main fly's keypoints for computing touch inputs (both wall and other fly). shape = (npts_touch,T).
+# xvision_other: x-coordinate of keypoints on the other flies for computing vision input. shape = (npts_vision,T,nflies)
+# yvision_other: y-coordinate of keypoints on the other flies for computing vision input. shape = (npts_vision,T,nflies)
+# xtouch_other: x-coordinate of keypoints on the other flies for computing touch input. shape = (npts_touch_other,T,nflies)
+# ytouch_other: y-coordinate of keypoints on the other flies for computing touch input. shape = (npts_touch_other,T,nflies)
 #
 # outputs:
-# flyvision: appearance of other flies to input fly. shape = (n_oma).
-# chambervision: appearance of arena to input fly. shape = (n_oma).
+# otherflies_vision: appearance of other flies to input fly. this is computed as a 
+# 1. - np.minimum(1.,SENSORY_PARAMS['otherflies_vision_mult'] * dist**SENSORY_PARAMS['otherflies_vision_exp'])
+# where dist is the minimum distance to some point on some other fly x,y_vision_other in each of n_oma directions. 
+# shape = (SENSORY_PARAMS['n_oma'],T).  
+# wall_touch: height of arena chamber at each keypoint in x,y_touch_main. this is computed as
+# np.minimum(SENSORY_PARAMS['arena_height'],np.maximum(0.,SENSORY_PARAMS['arena_height'] - 
+# (distleg-SENSORY_PARAMS['inner_arena_radius'])*SENSORY_PARAMS['arena_height']/(SENSORY_PARAMS['outer_arena_radius']-
+# SENSORY_PARAMS['inner_arena_radius'])))
+# shape = (npts_touch,T), 
+# otherflies_touch: information about touch from other flies to input fly. this is computed as
+# 1. - np.minimum(1.,SENSORY_PARAMS['otherflies_touch_mult'] * dist**SENSORY_PARAMS['otherflies_touch_exp'])
+# where dist is the minimum distance over all other flies from each keypoint in x,y_touch_main to each keypoint in x,y_touch_other
+# there are two main difference between this and otherflies_vision. first is this uses multiple keypoints on the main and other flies
+# and has an output for each of them. conversely, otherflies_vision has an output for each direction. the second difference is
+# based on the parameters in SENSORY_PARAMS. The parameters for touch should be set so that the maximum distance over which there is a 
+# signal is about how far any keypoint can be from any of the keypoints in x,y_touch_other, which the maximum distance for 
+# vision is over the entire arena. 
+# shape = (npts_touch*npts_touch_other,T).
+
 def compute_sensory(xeye_main,yeye_main,theta_main,
-                    xwall_main,ywall_main,
-                    xother,yother):
+                    xtouch_main,ytouch_main,
+                    xvision_other,yvision_other,
+                    xtouch_other,ytouch_other):
 
   # increase dimensions if only one frame input
-  if xother.ndim < 3:
-    xother = xother[:,None]
+  if xvision_other.ndim < 3:
+    T = 1
+  else:
+    T = xvision_other.shape[2]
 
-  npts = xother.shape[0]
-  nflies = xother.shape[1]
-  T = xother.shape[2]
+  npts_touch = xtouch_main.shape[0]
+  npts_vision = xvision_other.shape[0]
+  npts_touch_other = xtouch_other.shape[0]
+  nflies = xvision_other.shape[1]
   
-  yother = np.reshape(yother,(npts,nflies,T))
+  xvision_other = np.reshape(xvision_other,(npts_vision,nflies,T))
+  yvision_other = np.reshape(yvision_other,(npts_vision,nflies,T))
+  xtouch_other = np.reshape(xtouch_other,(npts_touch_other,nflies,T))
+  ytouch_other = np.reshape(ytouch_other,(npts_touch_other,nflies,T))
   xeye_main = np.reshape(xeye_main,(1,1,T))
   yeye_main = np.reshape(yeye_main,(1,1,T))
   theta_main = np.reshape(theta_main,(1,1,T))
+  xtouch_main = np.reshape(xtouch_main,(npts_touch,T))
+  ytouch_main = np.reshape(ytouch_main,(npts_touch,T))
   
   # don't deal with missing data :)    
   assert(np.any(np.isnan(xeye_main))==False)
@@ -286,8 +332,8 @@ def compute_sensory(xeye_main,yeye_main,theta_main,
   # compute other flies view
 
   # convert to this fly's coord system
-  dx = xother-xeye_main
-  dy = yother-yeye_main
+  dx = xvision_other-xeye_main
+  dy = yvision_other-yeye_main
   
   # distance
   dist = np.sqrt(dx**2+dy**2)
@@ -348,7 +394,7 @@ def compute_sensory(xeye_main,yeye_main,theta_main,
 
   # distance from center of arena
   # center of arena is assumed to be [0,0]
-  distleg = np.sqrt( xwall_main**2. + ywall_main**2 )
+  distleg = np.sqrt( xtouch_main**2. + ytouch_main**2 )
 
   # height of chamber 
   wall_touch = np.zeros(distleg.shape)
@@ -360,9 +406,178 @@ def compute_sensory(xeye_main,yeye_main,theta_main,
   # debug_plot_wall_touch(t,xlegtip_main,ylegtip_main,distleg,wall_touch,params)
 
   # to do: add something related to whether the fly is touching another fly
+  # xtouch_main: npts_touch x T, xtouch_other: npts_touch_other x nflies x T
+  if SENSORY_PARAMS['compute_otherflies_touch']:
+    dx = xtouch_main.reshape((npts_touch,1,1,T)) - xtouch_other.reshape((1,npts_touch_other,nflies,T)) 
+    dy = ytouch_main.reshape((npts_touch,1,1,T)) - ytouch_other.reshape((1,npts_touch_other,nflies,T)) 
+    d = np.sqrt(np.nanmin(dx**2 + dy**2,axis=2)).reshape(npts_touch*npts_touch_other,T)
+    otherflies_touch = 1. - np.minimum(1.,SENSORY_PARAMS['otherflies_touch_mult'] * d**SENSORY_PARAMS['otherflies_touch_exp'])
+  else:
+    otherflies_touch = None
   
-  return (otherflies_vision, wall_touch)
+  return (otherflies_vision, wall_touch, otherflies_touch)
 
+def compute_sensory_torch(xeye_main,yeye_main,theta_main,
+                          xtouch_main,ytouch_main,
+                          xvision_other,yvision_other,
+                          xtouch_other,ytouch_other):
+
+  """
+  compute sensory input
+  compute_sensory_torch(xeye_main,yeye_main,theta_main,
+                          xtouch_main,ytouch_main,
+                          xvision_other,yvision_other,
+                          xtouch_other,ytouch_other)
+
+  inputs:
+  xeye_main: x-coordinate of main fly's position for vision. shape = (T).
+  yeye_main: y-coordinate of main fly's position for vision. shape = (T).
+  theta_main: orientation of main fly. shape = (T).
+  xtouch_main: x-coordinates of main fly's keypoints for computing touch inputs (both wall and other fly). shape = (npts_touch,T).
+  ytouch_main: y-coordinates of main fly's keypoints for computing touch inputs (both wall and other fly). shape = (npts_touch,T).
+  xvision_other: x-coordinate of keypoints on the other flies for computing vision input. shape = (npts_vision,T,nflies)
+  yvision_other: y-coordinate of keypoints on the other flies for computing vision input. shape = (npts_vision,T,nflies)
+  xtouch_other: x-coordinate of keypoints on the other flies for computing touch input. shape = (npts_touch_other,T,nflies)
+  ytouch_other: y-coordinate of keypoints on the other flies for computing touch input. shape = (npts_touch_other,T,nflies)
+
+  outputs:
+  otherflies_vision: appearance of other flies to input fly. this is computed as a 
+  1. - np.minimum(1.,SENSORY_PARAMS['otherflies_vision_mult'] * dist**SENSORY_PARAMS['otherflies_vision_exp'])
+  where dist is the minimum distance to some point on some other fly x,y_vision_other in each of n_oma directions. 
+  shape = (SENSORY_PARAMS['n_oma'],T).  
+  wall_touch: height of arena chamber at each keypoint in x,y_touch_main. this is computed as
+  np.minimum(SENSORY_PARAMS['arena_height'],np.maximum(0.,SENSORY_PARAMS['arena_height'] - 
+  (distleg-SENSORY_PARAMS['inner_arena_radius'])*SENSORY_PARAMS['arena_height']/(SENSORY_PARAMS['outer_arena_radius']-
+  SENSORY_PARAMS['inner_arena_radius'])))
+  shape = (npts_touch,T), 
+  otherflies_touch: information about touch from other flies to input fly. this is computed as
+  1. - np.minimum(1.,SENSORY_PARAMS['otherflies_touch_mult'] * dist**SENSORY_PARAMS['otherflies_touch_exp'])
+  where dist is the minimum distance over all other flies from each keypoint in x,y_touch_main to each keypoint in x,y_touch_other
+  there are two main difference between this and otherflies_vision. first is this uses multiple keypoints on the main and other flies
+  and has an output for each of them. conversely, otherflies_vision has an output for each direction. the second difference is
+  based on the parameters in SENSORY_PARAMS. The parameters for touch should be set so that the maximum distance over which there is a 
+  signal is about how far any keypoint can be from any of the keypoints in x,y_touch_other, which the maximum distance for 
+  vision is over the entire arena. 
+  shape = (npts_touch*npts_touch_other,T).
+  """
+
+  device = xeye_main.device
+  dtype = xeye_main.dtype
+
+  # increase dimensions if only one frame input
+  if xvision_other.ndim < 3:
+    T = 1
+  else:
+    T = xvision_other.shape[2]
+
+  npts_touch = xtouch_main.shape[0]
+  npts_vision = xvision_other.shape[0]
+  npts_touch_other = xtouch_other.shape[0]
+  nflies = xvision_other.shape[1]
+
+  xvision_other = torch.reshape(xvision_other,(npts_vision,nflies,T))
+  yvision_other = torch.reshape(yvision_other,(npts_vision,nflies,T))
+  xtouch_other = torch.reshape(xtouch_other,(npts_touch_other,nflies,T))
+  ytouch_other = torch.reshape(ytouch_other,(npts_touch_other,nflies,T))
+  xeye_main = torch.reshape(xeye_main,(1,1,T))
+  yeye_main = torch.reshape(yeye_main,(1,1,T))
+  theta_main = torch.reshape(theta_main,(1,1,T))
+  xtouch_main = torch.reshape(xtouch_main,(npts_touch,T))
+  ytouch_main = torch.reshape(ytouch_main,(npts_touch,T))
+
+  # don't deal with missing data :)
+  assert(torch.any(torch.isnan(xeye_main))==False)
+  assert(torch.any(torch.isnan(yeye_main))==False)
+  assert(torch.any(torch.isnan(theta_main))==False)
+  
+  # vision bin size
+  step = 2.*torch.pi/SENSORY_PARAMS['n_oma']
+
+  # compute other flies view
+
+  # convert to this fly's coord system
+  dx = xvision_other-xeye_main
+  dy = yvision_other-yeye_main
+  
+  # distance
+  dist = torch.sqrt(dx**2+dy**2)
+  
+  # angle in the original coordinate system
+  angle0 = torch.arctan2(dy,dx)  
+  
+  # subtract off angle of main fly
+  angle = angle0 - theta_main
+  angle = torch.fmod(angle + torch.pi, 2 * torch.pi) - torch.pi
+
+  # which other flies pass beyond the -pi to pi border
+  isbackpos = angle > torch.pi/2
+  isbackneg = angle < -torch.pi/2
+  isfront = torch.abs(angle) <= torch.pi/2
+  idxmod = torch.any(isbackpos,dim=0) & torch.any(isbackneg,dim=0) & (~torch.any(isfront,dim=0))
+
+  # bin - npts x nflies x T
+  b_all = torch.floor((angle+np.pi)/step)
+  
+  # bin range
+  # shape: nflies x T
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=RuntimeWarning)
+    minb = torch.nanmin(b_all, dim=0)
+    maxb = torch.nanmax(b_all, dim=0)
+    mind = torch.nanmin(dist, dim=0)
+    
+  # n_oma x 1 x 1
+  tmpbins = torch.arange(SENSORY_PARAMS['n_oma'],dtype=dtype,device=device)[:,None,None]
+
+  # n_oma x nflies x T
+  mindrep = mind[None,...].repeat((SENSORY_PARAMS['n_oma'],1,1))
+  mask = (tmpbins >= minb[None,...]) & (tmpbins <= maxb[None,...])
+
+  if torch.any(idxmod):
+    # this is complicated!!
+    # find the max bin for negative angles
+    # and the min bin for positive angles
+    # store them in min and max for consistency with non-wraparound
+    isbackpos1 = isbackpos[:,idxmod]
+    isbackneg1 = isbackneg[:,idxmod]
+    bmodneg = b_all[:,idxmod]
+    bmodneg[isbackpos1] = torch.nan
+    minbmod = torch.nanmax(bmodneg,dim=0)
+    bmodpos = b_all[:,idxmod]
+    bmodpos[isbackneg1] = torch.nan
+    maxbmod = torch.nanmin(bmodpos,dim=0)
+    mask[:,idxmod] = (tmpbins[...,0] >= maxbmod.unsqueeze(0)) | (tmpbins[...,0] <= minbmod.unsqueeze(0))
+
+  otherflies_vision = torch.nanmin(torch.where(mask, mindrep, torch.full_like(mindrep, float('inf'))), dim=1, keepdim=False, initial=float('inf'))
+  otherflies_vision = 1. - torch.min(1., SENSORY_PARAMS['otherflies_vision_mult'] * otherflies_vision**SENSORY_PARAMS['otherflies_vision_exp'])
+
+  # t = 249
+  # debug_plot_otherflies_vision(t,xother,yother,xeye_main,yeye_main,theta_main,
+  #                                 angle0,angle,dist,b_all,otherflies_vision,params)
+
+  # distance from center of arena
+  # center of arena is assumed to be [0,0]
+  distleg = torch.sqrt( xtouch_main**2. + ytouch_main**2 )
+
+  # height of chamber 
+  wall_touch = torch.zeros(distleg.shape,dtype=dtype,device=device)
+  wall_touch[:] = SENSORY_PARAMS['arena_height']
+  wall_touch = torch.minimum(SENSORY_PARAMS['arena_height'],torch.maximum(0.,SENSORY_PARAMS['arena_height'] - (distleg-SENSORY_PARAMS['inner_arena_radius'])*SENSORY_PARAMS['arena_height']/(SENSORY_PARAMS['outer_arena_radius']-SENSORY_PARAMS['inner_arena_radius'])))
+  wall_touch[distleg >= SENSORY_PARAMS['outer_arena_radius']] = 0.
+  
+  # t = 0
+  # debug_plot_wall_touch(t,xlegtip_main,ylegtip_main,distleg,wall_touch,params)
+
+  # xtouch_main: npts_touch x T, xtouch_other: npts_touch_other x nflies x T
+  if SENSORY_PARAMS['compute_otherflies_touch']:
+    dx = xtouch_main.reshape((npts_touch,1,1,T)) - xtouch_other.reshape((1,npts_touch_other,nflies,T)) 
+    dy = ytouch_main.reshape((npts_touch,1,1,T)) - ytouch_other.reshape((1,npts_touch_other,nflies,T)) 
+    d = torch.sqrt(torch.nanmin(dx**2 + dy**2,dim=2)).reshape(npts_touch*npts_touch_other,T)
+    otherflies_touch = 1. - torch.minimum(1.,SENSORY_PARAMS['otherflies_touch_mult'] * d**SENSORY_PARAMS['otherflies_touch_exp'])
+  else:
+    otherflies_touch = None
+  
+  return (otherflies_vision, wall_touch, otherflies_touch)
 
 featorigin = [mabe.posenames.index('thorax_front_x'),mabe.posenames.index('thorax_front_y')]
 feattheta = mabe.posenames.index('orientation')
@@ -376,28 +591,40 @@ nfeatures = len(mabe.posenames)
 featangle = np.array([re.search('angle$',s) is not None for s in mabe.posenames])
 featangle[feattheta] = True
 
-kpother = [mabe.keypointnames.index('antennae_midpoint'),
-            mabe.keypointnames.index('tip_abdomen'),
-            mabe.keypointnames.index('left_middle_femur_base'),
-            mabe.keypointnames.index('right_middle_femur_base'),
-            ]
+kpvision_other = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['vision_kpnames']]
 kpeye = mabe.keypointnames.index('antennae_midpoint')
-kpwall = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['wallkpnames']]
-nkpwall = len(kpwall)
+kptouch = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['touch_kpnames']]
+nkptouch = len(kptouch)
+kptouch_other = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['touch_other_kpnames']]
+nkptouch_other = len(kptouch_other)
 
-def split_features(X,simplify=None):
+def split_features(X,simplify=None,axis=-1):
   res = {}
-  res['pose'] = X[...,:nrelative]
-  if simplify == 'no_sensory':
-    res['otherflies_vision'] = None
-    res['wall_touch'] = None
-  else:
-    i0 = nrelative
-    i1 = nrelative+SENSORY_PARAMS['n_oma']
-    res['otherflies_vision'] = X[...,i0:i1]
+  res['pose'] = X.take(range(nrelative),axis=axis)
+  i0 = nrelative
+  res['otherflies_vision'] = None
+  res['wall_touch'] = None
+  res['otherflies_touch'] = None
+  if simplify is None:
+    i1 = nrelative+nkptouch
+    res['wall_touch'] = X.take(range(i0,i1),axis=axis)
     i0 = i1
-    i1 = i0 + nkpwall
-    res['wall_touch'] = X[...,i0:i1]
+    i1 = i0 + SENSORY_PARAMS['n_oma']
+    res['otherflies_vision'] = X.take(range(i0,i1),axis=axis)
+    if SENSORY_PARAMS['compute_otherflies_touch']:
+      i0 = i1
+      i1 = i0 + nkptouch*nkptouch_other
+      res['otherflies_touch'] = X.take(range(i0,i1),axis=axis)
+
+  return res
+
+def split_inputs(X,simplify_in=None,simplify_out=None,axis=-1):
+  if simplify_out is None:
+    nlabels = nfeatures
+  else:
+    nlabels = nglobal
+  res = split_features(X.take(range(nlabels,X.shape[axis]),simplify=simplify_in,axis=axis))
+  res['movement'] = X.take(range(nlabels),axis=axis)
   return res
 
 def combine_relative_global(Xrelative,Xglobal):
@@ -474,22 +701,27 @@ def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False):
   
   xeye_main = Xkp[kpeye,0,:,flynum]
   yeye_main = Xkp[kpeye,1,:,flynum]
-  xwall_main = Xkp[kpwall,0,:,flynum]
-  ywall_main = Xkp[kpwall,1,:,flynum]
-  xother = Xkp_other[kpother,0,...].transpose((0,2,1))
-  yother = Xkp_other[kpother,1,...].transpose((0,2,1))
+  xtouch_main = Xkp[kptouch,0,:,flynum]
+  ytouch_main = Xkp[kptouch,1,:,flynum]
+  xvision_other = Xkp_other[kpvision_other,0,...].transpose((0,2,1))
+  yvision_other = Xkp_other[kpvision_other,1,...].transpose((0,2,1))
+  xtouch_other = Xkp_other[kptouch_other,0,...].transpose((0,2,1))
+  ytouch_other = Xkp_other[kptouch_other,1,...].transpose((0,2,1))
   
   if theta_main is None:
     _,_,theta_main = mabe.body_centric_kp(Xkp[...,[flynum,]])
     theta_main = theta_main[...,0]
   
-  otherflies_vision,wall_touch = \
+  otherflies_vision,wall_touch,otherflies_touch = \
     compute_sensory(xeye_main,yeye_main,theta_main+np.pi/2,
-                    xwall_main,ywall_main,
-                    xother,yother)
+                    xtouch_main,ytouch_main,
+                    xvision_other,yvision_other,
+                    xtouch_other,ytouch_other)
   sensory = np.r_[wall_touch,otherflies_vision]
+  if otherflies_touch is not None:
+    sensory = np.r_[sensory,otherflies_touch]
   if returnall:
-    return sensory,wall_touch,otherflies_vision
+    return sensory,wall_touch,otherflies_vision,otherflies_touch
   else:
     return sensory
 
@@ -515,7 +747,7 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
   relpose,globalpos = compute_pose_features(X[...,flynum],scale)
   relpose = relpose[...,0]
   globalpos = globalpos[...,0]
-  sensory,wall_touch,otherflies_vision = \
+  sensory,wall_touch,otherflies_vision,otherflies_touch = \
     compute_sensory_wrapper(X,flynum,theta_main=globalpos[featthetaglobal,...],
                             returnall=True)
   input = combine_inputs(relpose=relpose,sensory=sensory).T
@@ -545,6 +777,9 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
       res['otherflies_vision'] = otherflies_vision[:,:-1]
       res['next_wall_touch'] = wall_touch[:,-1]
       res['next_otherflies_vision'] = otherflies_vision[:,-1]
+      if otherflies_touch is not None:
+        res['otherflies_touch'] = otherflies_touch[:,:-1]
+        res['next_otherflies_touch'] = otherflies_touch[:,-1]
     
   # debug_plot_compute_features(X,porigin,theta,Xother,Xnother)
     
@@ -643,6 +878,25 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
 #   if outtype is not None:
 #     res = {key: val.astype(outtype) for key,val in res.items()}
 #   return res
+
+def compute_otherflies_touch_mult(data,prct=99):
+  
+  # 1/maxd^exp = mult*maxd^exp
+  
+  # X is nkeypts x 2 x T x nflies
+  nkpts = data['X'].shape[0]
+  T = data['X'].shape[2]
+  nflies = data['X'].shape[3]
+  # isdata is T x nflies
+  # X will be nkpts x 2 x N
+  X = data['X'].reshape([nkpts,2,T*nflies])[:,:,data['isdata'].flatten()]
+  # maximum distance from some keypoint to any keypoint included in kpother
+  d = np.sqrt(np.max(np.min(np.sum((X[None,:,:,:] - X[kpvision_other,None,:,:])**2.,axis=2),axis=0),axis=0))
+  maxd = np.percentile(d,prct)
+
+  otherflies_touch_mult = 1./((maxd)**SENSORY_PARAMS['otherflies_touch_exp'])
+  return otherflies_touch_mult
+  
     
 def debug_plot_compute_features(X,porigin,theta,Xother,Xnother):
   
@@ -654,7 +908,7 @@ def debug_plot_compute_features(X,porigin,theta,Xother,Xnother):
   ax.plot(porigin[0,t],porigin[1,t],'rx',linewidth=2)
   ax.plot([porigin[0,t,0],porigin[0,t,0]+np.cos(theta[t,0])*rplot],
           [porigin[1,t,0],porigin[1,t,0]+np.sin(theta[t,0])*rplot],'r-')
-  ax.plot(Xother[kpother,0,t,:],Xother[kpother,1,t,:],'o')
+  ax.plot(Xother[kpvision_other,0,t,:],Xother[kpvision_other,1,t,:],'o')
   ax.set_aspect('equal')
   
   ax = plt.subplot(1,2,2)
@@ -1453,6 +1707,22 @@ class TransformerStateModel(torch.nn.Module):
     out = perstate[torch.arange(perstate.shape[0],dtype=int),:,state.flatten()].reshape(pred['perstate'].shape[:-1])
     return out
   
+class myTransformerEncoderLayer(torch.nn.TransformerEncoderLayer):
+  
+  def __init__(self,*args,need_weights=False,**kwargs):
+    super().__init__(*args,**kwargs)
+    self.need_weights = need_weights
+  
+  def _sa_block(self, x: torch.Tensor,
+                attn_mask: typing.Optional[torch.Tensor], key_padding_mask: typing.Optional[torch.Tensor]) -> torch.Tensor:
+    x = self.self_attn(x, x, x,
+                       attn_mask=attn_mask,
+                       key_padding_mask=key_padding_mask,
+                       need_weights=self.need_weights)[0]
+    return self.dropout1(x)
+  def set_need_weights(self,need_weights):
+    self.need_weights = need_weights
+  
 class TransformerModel(torch.nn.Module):
 
   def __init__(self, d_input: int, d_output: int,
@@ -1469,7 +1739,7 @@ class TransformerModel(torch.nn.Module):
     # nhead: number of heads in the multiheadattention models
     # dhid: dimension of the feedforward network model
     # dropout: dropout value
-    encoder_layers = torch.nn.TransformerEncoderLayer(d_model,nhead,d_hid,dropout,batch_first=True)
+    encoder_layers = myTransformerEncoderLayer(d_model,nhead,d_hid,dropout,batch_first=True)
 
     # stack of nlayers self-attention + feedforward layers
     # nlayers: number of sub-encoder layers in the encoder
@@ -1515,6 +1785,10 @@ class TransformerModel(torch.nn.Module):
 
     return output
   
+  def set_need_weights(self,need_weights):
+    for layer in self.transformer_encoder.layers:
+      layer.set_need_weights(need_weights)
+  
 def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
   """
   Generates an upper-triangular matrix of -inf, with zeros on and below the diagonal.
@@ -1529,7 +1803,39 @@ def generate_square_full_mask(sz: int) -> torch.Tensor:
   """
   return torch.zeros(sz,sz)
 
-def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.inf,debug=False):
+def get_output_and_attention_weights(model, inputs, src_mask):  
+
+  # set need_weights to True for this function call
+  model.set_need_weights(True)
+
+  # where attention weights will be stored, one list element per layer
+  activation = [None,]*model.transformer_encoder.num_layers
+  def get_activation(layer_num):
+    # the hook signature
+    def hook(model, inputs, output):
+      # attention weights are the second output
+      activation[layer_num] = output[1]
+    return hook
+
+  # register the hooks
+  hooks = [None,]*model.transformer_encoder.num_layers
+  for i,layer in enumerate(model.transformer_encoder.layers):
+    hooks[i] = layer.self_attn.register_forward_hook(get_activation(i))
+
+  # call the model
+  with torch.no_grad():
+    output = model(inputs, src_mask)
+  
+  # remove the hooks    
+  for hook in hooks:
+    hook.remove()
+
+  # return need_weights to False
+  model.set_need_weights(False)    
+
+  return output,activation
+
+def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.inf,debug=False,need_weights=False):
 # def predict_open_loop(example0,Xkp_others,scale,dataset,tpred,
 #                       sensory_params,movementtrue=None,maxcontextl=None):
   """
@@ -1563,6 +1869,8 @@ def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.i
   zmovement = np.zeros((tpred-1,nfeatures,nfliespred),dtype=dtype)
   sensory = None
   zinputs = None
+  if need_weights:
+    attn_weights = [None,]*tpred
 
   if debug:
     movement_true = compute_movement(X=Xkp[...,fliespred],scale=scales,simplify=dataset.simplify_out).transpose((1,0,2)).astype(dtype)
@@ -1623,7 +1931,7 @@ def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.i
       net_mask = generate_square_full_mask(t-t0-1).to(device)
     else:
       net_mask = generate_square_subsequent_mask(t-t0-1).to(device)
-    
+          
     for i in range(nfliespred):
       flynum = fliespred[i]
       zinputcurr = zinputs[t0:t,:,i]
@@ -1640,17 +1948,27 @@ def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.i
       if debug:
         zmovementout = dataset.zscore_labels(movement_true[t-1,:,i]).astype(dtype)
       else:
-        with torch.no_grad():
-          # predict for all frames
-          # masked: movement from 0->1, ..., t->t+1
-          # causal: movement from 1->2, ..., t->t+1
-          # last prediction: t->t+1
-          pred = model(xcurr[None,...].to(device),net_mask)
-          if model.model_type == 'TransformerBestState' or model.model_type == 'TransformerState':
-            pred = model.randpred(pred)
-          # z-scored movement from t to t+1
-          pred = pred[0,-1,:].cpu()
-        zmovementout = pred.numpy()
+        if need_weights:
+          pred,attn_weights_curr = get_output_and_attention_weights(model,xcurr[None,...].to(device),net_mask)
+          # dimensions correspond to layer, output frame, input frame
+          attn_weights_curr = torch.cat(attn_weights_curr,dim=0).cpu().numpy()
+          if i == 0:
+            attn_weights[t] = np.tile(attn_weights_curr[...,None],(1,1,1,nfliespred))
+            attn_weights[t][...,1:] = np.nan
+          else:
+            attn_weights[t][...,i] = attn_weights_curr
+        else:
+          with torch.no_grad():
+            # predict for all frames
+            # masked: movement from 0->1, ..., t->t+1
+            # causal: movement from 1->2, ..., t->t+1
+            # last prediction: t->t+1
+            pred = model(xcurr[None,...].to(device),net_mask)
+        if model.model_type == 'TransformerBestState' or model.model_type == 'TransformerState':
+          pred = model.randpred(pred)
+        # z-scored movement from t to t+1
+        pred = pred[0,-1,:].cpu()
+      zmovementout = pred.numpy()
       relposenext,globalposnext = dataset.pred2pose(relposecurr,globalposcurr,zmovementout)
       relpose[t,:,i] = relposenext
       globalpos[t,:,i] = globalposnext
@@ -1676,7 +1994,26 @@ def predict_open_loop(Xkp,fliespred,scales,burnin,dataset,model,maxcontextl=np.i
       zinputsnext = dataset.zscore_input(rawinputsnext)
       zinputs[t,:,i] = zinputsnext
 
-  return Xkp
+  if need_weights:
+    return Xkp,zinputs,attn_weights
+  else:
+    return Xkp,zinputs
+  
+def compute_attention_weight_rollout(w0):
+  # w0 is nlayers x T x T x ...
+  w = np.zeros(w0.shape,dtype=w0.dtype)
+  wcurr = np.ones(list(w0.shape)[1:],dtype=w0.dtype)
+  # I = np.eye(w0.shape[1],dtype=w0.dtype)
+  # sz = np.array(w0.shape[1:])
+  # sz[2:] = 1
+  # I = I.reshape(sz)
+
+  for i in range(w0.shape[0]):
+    wcurr = wcurr * (w0[i,...])
+    z = np.maximum(np.sum(wcurr,axis=0,keepdims=True),np.finfo(w0.dtype).eps)
+    wcurr = wcurr / z
+    w[i,...]  = wcurr
+  return w
 
 def save_model(savefile,model,lr_optimizer=None,scheduler=None,loss=None,val_loss=None):
   tosave = {'model':model.state_dict()}
@@ -1910,8 +2247,11 @@ def debug_plot_sample_inputs(example,simplify_in):
   if simplify_in != 'no_sensory':
     inputidxstart.append(inputidxstart[-1]+np.count_nonzero(featrelative))
     inputidxtype.append('wall_touch')
-    inputidxstart.append(inputidxstart[-1]+nkpwall)
+    inputidxstart.append(inputidxstart[-1]+nkptouch)
     inputidxtype.append('otherflies_vision')
+    if SENSORY_PARAMS['compute_otherflies_touch']:
+      inputidxstart.append(inputidxstart[-1]+SENSORY_PARAMS['n_oma'])
+      inputidxtype.append('otherflies_touch')
     
   for iplot in range(3):
     ax[iplot,0].cla()
@@ -1981,23 +2321,54 @@ def debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx=None,ax=None
 
 def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
                  figsizebase=11,ms=6,lw=1,focus_ms=12,focus_lw=3,
-                 titletexts={},savevidfile=None,fps=30):
+                 titletexts={},savevidfile=None,fps=30,trel0=0,
+                 inputs=None,nstd_input=3,contextl=10,axinput=None,
+                 attn_weights=None):
 
-  nax = len(Xkps)
-  naxc = int(np.ceil(np.sqrt(nax)))
-  naxr = int(np.ceil(nax/naxc))
+  plotinput = inputs is not None and len(inputs) > 0
+
+  # attn_weights[key] should be T x >=contextl x nfocusflies
+  plotattn = attn_weights is not None
+
+  ninputs = 0
+  if plotinput:
+    inputnames = []
+    for v in inputs.values():
+      if v is not None:
+        inputnames = list(v.keys())
+        break
+    ninputs = len(inputnames)
+    if ninputs == 0:
+      plotinput = False
+      
+  if plotinput or plotattn:
+    naxc = len(Xkps)
+    naxr = 1
+    nax = naxc*naxr
+  else:
+    naxc = int(np.ceil(np.sqrt(nax)))
+    naxr = int(np.ceil(nax/naxc))
+  
+  if plotattn:
+    nsubax = ninputs + 1
+  else:
+    nsubax = ninputs
   
   # get rid of blank flies
   Xkp = list(Xkps.values())[0]
   T = Xkp.shape[-2]
   isreal = mabe.get_real_flies(Xkp)
   nflies = Xkp.shape[-1]
+  isfocusfly = np.zeros(nflies,dtype=bool)
+  isfocusfly[focusflies] = True
   for Xkp in Xkps.values():
     assert(nflies == Xkp.shape[-1])
     isreal = isreal | mabe.get_real_flies(Xkp)
 
   for k,v in Xkps.items():
     Xkps[k] = v[...,isreal]
+  focusflies = np.nonzero(isfocusfly[isreal])[0]
+    
   nflies = np.count_nonzero(isreal)
 
   minv = -mabe.ARENA_RADIUS_MM*1.01
@@ -2007,16 +2378,42 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
   trel = 0
   t = t0+trel
+  createdax = False
   if ax is None:
     if fig is None:
-      fig,ax = plt.subplots(naxr,naxc)
-      fig.set_figheight(figsizebase*naxr)
+      fig = plt.figure()
+      if plotinput or plotattn:
+        fig.set_figheight(figsizebase*1.5)
+      else:
+        fig.set_figheight(figsizebase*naxr)
       fig.set_figwidth(figsizebase*naxc)
+
+    if plotinput or plotattn:
+      gs = matplotlib.gridspec.GridSpec(3,len(Xkps)*nsubax, figure=fig)
+      ax = np.array([fig.add_subplot(gs[:2,nsubax*i:nsubax*(i+1)]) for i in range(len(Xkps))])
     else:
       ax = fig.subplots(naxr,naxc)
+
+    for axcurr in ax:
+      axcurr.set_xticks([])      
+      axcurr.set_yticks([])
+    createdax = True
   else:
     assert(ax.size>=nax)
   ax = ax.flatten()
+  if (plotinput or plotattn) and (axinput is None):
+    gs = matplotlib.gridspec.GridSpec(3,len(Xkps)*nsubax, figure=fig)
+    axinput = {}
+    for i,k in enumerate(Xkps):
+      if k in inputs:
+        axinput[k] = np.array([fig.add_subplot(gs[-1,i*nsubax+j]) for j in range(nsubax)])
+        for axcurr in axinput[k][1:]:
+          axcurr.set_yticks([])
+
+    createdax = True
+
+  if createdax:
+    fig.tight_layout()
 
   h['kpt'] = []
   h['edge'] = []
@@ -2047,7 +2444,36 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
     ax[i].set_xlim(minv,maxv)
     ax[i].set_ylim(minv,maxv)
 
-  fig.tight_layout()
+  if plotinput or plotattn:
+    h['input'] = {}
+    t0input = np.maximum(0,trel0-contextl)
+    contextlcurr = trel0-t0input+1
+
+    if plotinput:
+      for k in inputs.keys():
+        h['input'][k] = []
+        for i,inputname in enumerate(inputnames):
+          inputcurr = inputs[k][inputname][trel0+1:t0input:-1,:]
+          if contextlcurr < contextl:
+            pad = np.zeros([contextl-contextlcurr,]+list(inputcurr.shape)[1:])
+            pad[:] = np.nan
+            inputcurr = np.r_[inputcurr,pad]
+          hin = axinput[k][i].imshow(inputcurr,vmin=-nstd_input,vmax=nstd_input,cmap='coolwarm')
+          axinput[k][i].set_title(inputname)
+          axinput[k][i].axis('auto')
+          h['input'][k].append(hin)
+    if plotattn:
+      for k in attn_weights.keys():
+        if k not in h['input']:
+          h['input'][k] = []
+        # currently only support one focus fly
+        hattn = axinput[k][-1].plot(attn_weights[k][trel0,-contextl:,0],np.arange(contextl,0,-1))[0]
+        #axinput[k][-1].set_xscale('log')
+        axinput[k][-1].set_ylim([-.5,contextl-.5])
+        axinput[k][-1].set_xlim([0,1])
+        axinput[k][-1].invert_yaxis()
+        axinput[k][-1].set_title('attention')
+        h['input'][k].append(hattn)
 
   hlist = []
   for hcurr in h.values():
@@ -2058,23 +2484,44 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
   def update(trel):
 
-    t = t0+trel
-    if np.any(titletext_ts<=trel):
-      titletext_t = np.max(titletext_ts[titletext_ts<=trel])
-      titletext_str = titletexts[titletext_t]
-    else:
-      titletext_str = ''
-
-    for i,k in enumerate(Xkps):
-      mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[0],hkpts=h['kpt'][i],hedges=h['edge'][i])
-      if i == 0:
-        h['ti'][i].set_text(f'{titletext_str} {k}, t = {t}')
+      t = t0+trel
+      if np.any(titletext_ts<=trel):
+        titletext_t = np.max(titletext_ts[titletext_ts<=trel])
+        titletext_str = titletexts[titletext_t]
       else:
-        h['ti'][i].set_text(k)
-    
-    return hlist
+        titletext_str = ''
 
-  ani = animation.FuncAnimation(fig, update, frames=range(T))
+      for i,k in enumerate(Xkps):
+        mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[0],hkpts=h['kpt'][i],hedges=h['edge'][i])
+        if i == 0:
+          h['ti'][i].set_text(f'{titletext_str} {k}, t = {t}')
+        else:
+          h['ti'][i].set_text(k)
+
+      if plotinput or plotattn:
+        t0input = np.maximum(0,trel-contextl)
+        contextlcurr = trel-t0input+1
+      
+      if plotinput:
+        for k in inputs.keys():
+          for i,inputname in enumerate(inputnames):
+            
+            inputcurr = inputs[k][inputname][trel+1:t0input:-1,:]
+            if contextlcurr < contextl:
+              pad = np.zeros([contextl-contextlcurr,]+list(inputcurr.shape)[1:])
+              pad[:] = np.nan
+              inputcurr = np.r_[inputcurr,pad]
+            h['input'][k][i].set_data(inputcurr)
+            
+      if plotattn:
+        for k in attn_weights.keys():
+          attn_curr = attn_weights[k][trel,-contextl:,0]
+          h['input'][k][-1].set_xdata(attn_curr)
+          # if any(np.isnan(attn_curr)==False):
+          #   axinput[k][-1].set_xlim([0,np.nanmax(attn_curr)])
+      return hlist
+    
+  ani = animation.FuncAnimation(fig, update, frames=range(trel0,T))
 
   if savevidfile is not None:
     print('Saving animation to file %s...'%savevidfile)
@@ -2095,6 +2542,7 @@ inchunkfile = None
 #savechunkfile = os.path.join(datadir,f'chunk_usertrain_{"_".join(categories)}.npz')
 savechunkfile = None
 savedir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/llmnets'
+loadmodelfile = None
 # MLM - no sensory
 #loadmodelfile = os.path.join(savedir,'flymlm_71G01_male_epoch100_202301215712.pth')
 # MLM with sensory
@@ -2107,8 +2555,17 @@ savedir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/llmnets'
 # CLM, predicting forward, sideways vel
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_202302060458.pth')
 # CLM, trained with dropout = 0.8 on movement
-#loadmodelfile = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/llmnets/flyclm_71G01_male_epoch100_20230228T193725.pth'
-loadmodelfile = None
+#loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230228T193725.pth')
+# CLM, trained with dropout = 0.8 on movement, more wall touch keypoints
+#loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230302T221828.pth')
+# CLM, trained with dropout = 0.8 on movement, other fly touch features
+#loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230303T230750.pth')
+# CLM, trained with dropout = 1.0 on movement, other fly touch features, 10 layers, 512 context
+loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230305T135655.pth')
+
+
+restartmodelfile = None
+#restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch15_20230303T214306.pth')
 
 # parameters
 
@@ -2116,8 +2573,8 @@ narena = 2**10
 theta_arena = np.linspace(-np.pi,np.pi,narena+1)[:-1]
 
 # sequence length per training example
-#CONTEXTL = 512
-CONTEXTL = 65
+CONTEXTL = 513
+#CONTEXTL = 65
 # type of model to train
 #modeltype = 'mlm'
 MODELTYPE = 'clm'
@@ -2140,7 +2597,7 @@ NUM_TRAIN_EPOCHS = 100
 OPTIMIZER_ARGS = {'lr': 5e-5, 'betas': (.9,.999), 'eps': 1e-8}
 MAX_GRAD_NORM = 1.
 # architecture arguments
-MODEL_ARGS = {'d_model': 2048, 'nhead': 8, 'd_hid': 512, 'nlayers': 6, 'dropout': .3}
+MODEL_ARGS = {'d_model': 2048, 'nhead': 8, 'd_hid': 512, 'nlayers': 10, 'dropout': .3}
 if MODELSTATETYPE == 'prob':
   MODEL_ARGS['nstates'] = 32
   MODEL_ARGS['minstateprob'] = 1/MODEL_ARGS['nstates']
@@ -2158,7 +2615,7 @@ SIMPLIFY_IN = None
 NPLOT = 32*512*100 // (BATCH_SIZE*CONTEXTL)
 SAVE_EPOCH = 5
 
-PDROPOUT_PAST = .8
+PDROPOUT_PAST = 1
 
 NUMPY_SEED = 123
 TORCH_SEED = 456
@@ -2181,6 +2638,9 @@ if categories is not None and len(categories) > 0:
 # compute scale parameters
 scale_perfly = compute_scale_allflies(data)
 val_scale_perfly = compute_scale_allflies(valdata)
+
+if np.isnan(SENSORY_PARAMS['otherflies_touch_mult']):
+  SENSORY_PARAMS['otherflies_touch_mult'] = compute_otherflies_touch_mult(data)
 
 # throw out data that is missing scale information - not so many frames
 idsremove = np.nonzero(np.any(np.isnan(scale_perfly),axis=0))[0]
@@ -2223,7 +2683,7 @@ mu_labels = train_dataset.mu_labels.copy()
 sig_labels = train_dataset.sig_labels.copy()
 
 val_dataset = FlyMLMDataset(valX,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,
-                            masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,maskflag=PDROPOUT_PAST>0)
+                            masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,pdropout_past=PDROPOUT_PAST)
 val_dataset.zscore(train_dataset.mu_input,train_dataset.sig_input,
                    train_dataset.mu_labels,train_dataset.sig_labels)
 
@@ -2323,10 +2783,18 @@ else:
 
 if loadmodelfile is None:
   
+  if restartmodelfile is not None:
+    train_loss_epoch,val_loss_epoch = load_model(restartmodelfile,model,lr_optimizer=optimizer,scheduler=lr_scheduler)
+    train_loss_epoch = train_loss_epoch.cpu()
+    val_loss_epoch = val_loss_epoch.cpu()
+    epoch = np.nonzero(np.isnan(train_loss_epoch.cpu().numpy()))[0][0]
+  else:
+    epoch = 0
+  
   lossfig = plt.figure()
   lossax = plt.gca()
-  htrainloss, = lossax.plot(train_loss_epoch,'.-',label='Train')
-  hvalloss, = lossax.plot(val_loss_epoch,'.-',label='Val')
+  htrainloss, = lossax.plot(train_loss_epoch.cpu(),'.-',label='Train')
+  hvalloss, = lossax.plot(val_loss_epoch.cpu(),'.-',label='Val')
   lossax.set_xlabel('Epoch')
   lossax.set_ylabel('Loss')
   lossax.legend()
@@ -2336,7 +2804,7 @@ if loadmodelfile is None:
   
   pteacherforce = 1.
 
-  for epoch in range(NUM_TRAIN_EPOCHS):
+  for epoch in range(epoch,NUM_TRAIN_EPOCHS):
     
     model.train()
     tr_loss = torch.tensor(0.0).to(device)
@@ -2499,15 +2967,16 @@ fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx)
 DEBUG = False
 burnin = CONTEXTL-1
 contextlpad = burnin + 1
-# all frames for the main fly must have real data
+TPRED = 2000+CONTEXTL
+# all frames must have real data
 allisdata = interval_all(valdata['isdata'],contextlpad)
-isnotsplit = interval_all(valdata['isstart']==False,contextlpad-1)[1:,...]
-canstart = np.logical_and(allisdata,isnotsplit)
-#flynum = 0
-#t0 = np.nonzero(canstart[:,flynum])[0][360-CONTEXTL]
-TPRED = 1000
+isnotsplit = interval_all(valdata['isstart']==False,TPRED)[1:,...]
+canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
+flynum = 0
+t0 = np.nonzero(canstart[:,flynum])[0][360]
 flynum = 2
-t0 = np.nonzero(canstart[:,flynum])[0][1500-CONTEXTL]
+t0 = np.nonzero(canstart[:,flynum])[0][0]
+
 fliespred = np.array([flynum,])
 
 Xkp_true = valdata['X'][...,t0:t0+TPRED,:].copy()
@@ -2519,14 +2988,54 @@ scales = val_scale_perfly[:,ids]
 
 model.eval()
 
-Xkp_pred = predict_open_loop(Xkp,fliespred,scales,burnin,val_dataset,model,maxcontextl=np.inf,debug=DEBUG)
+Xkp_pred,zinputs,attn_weights0 = predict_open_loop(Xkp,fliespred,scales,burnin,val_dataset,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=True)
 
 Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
+#Xkps = {'Pred': Xkp_pred.copy()}
+if len(fliespred) == 1:
+  inputs = {'Pred': split_features(zinputs,axis=1)}
+else:
+  inputs = None
+
+attn_weights_rollout = None
+firstframe = None
+attn_context = None
+for t,w0 in enumerate(attn_weights0):
+  if w0 is None:
+    continue
+  w = compute_attention_weight_rollout(w0)
+  w = w[-1,-1,...]
+  if attn_weights_rollout is None:
+    attn_weights_rollout = np.zeros((TPRED,)+w.shape)
+    attn_weights_rollout[:] = np.nan
+    firstframe = t
+    attn_context = w.shape[0]
+  if attn_context < w.shape[0]:
+    pad = np.zeros([TPRED,w.shape[0]-attn_context,]+list(w.shape)[1:])
+    pad[:firstframe,...] = np.nan
+    attn_context = w.shape[0]
+    attn_weights_rollout = np.concatenate((attn_weights_rollout,pad),axis=1)
+  attn_weights_rollout[t,:] = 0.
+  attn_weights_rollout[t,:w.shape[0]] = w
+attn_weights = {'Pred': attn_weights_rollout}
+
 focusflies = fliespred
 titletexts = {0: 'Initialize', burnin: ''}
 
 vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
 savevidfile = os.path.join(savedir,f'samplevideo_{"_".join(categories)}_{vidtime}.gif')
 
-ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts)
+ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,CONTEXTL-64),
+                   inputs=inputs,contextl=CONTEXTL-1,attn_weights=attn_weights)
 
+print('Saving animation to file %s...'%savevidfile)
+writer = animation.PillowWriter(fps=30)
+ani.save(savevidfile,writer=writer)
+print('Finished writing.')
+
+
+savevidfile = os.path.join(savedir,f'samplevideo_{"_".join(categories)}_{vidtime}.mp4')
+print('Saving animation to file %s...'%savevidfile)
+writer = animation.FFMpegWriter(fps=30)
+ani.save(savevidfile,writer=writer)
+print('Finished writing.')
