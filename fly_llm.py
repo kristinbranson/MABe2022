@@ -1237,10 +1237,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     
     self.dtype = np.float32
     
-  def discretize_labels(self,discrete_idx,nbins=50,bin_edges=None,bin_samples=None,**kwargs):
-    
-    assert self.mu_labels is None,'Must discretize before z-scoring'
-    
+  def discretize_labels(self,discrete_idx,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs):
+        
     if not isinstance(discrete_idx,np.ndarray):
       discrete_idx = np.array(discrete_idx)
     self.discrete_idx = discrete_idx
@@ -1255,7 +1253,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     assert((bin_edges is None) == (bin_samples is None))
 
     if bin_edges is None:
-      self.discretize_bin_edges,self.discretize_bin_samples = fit_discretize_labels(self,discrete_idx,nbins=nbins,**kwargs)
+      if self.sig_labels is not None:
+        bin_epsilon = np.array(bin_epsilon) / self.sig_labels[self.discrete_idx]
+      self.discretize_bin_edges,self.discretize_bin_samples = fit_discretize_labels(self,discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
     else:
       self.discretize_bin_samples = bin_samples
       self.discretize_bin_edges = bin_edges
@@ -1313,6 +1313,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         
     No value returned. 
     """
+    
+    # must happen before discretizing
+    assert self.discretize == False, 'z-scoring should happen before discretizing'
     
     def zscore_helper(f):
       mu = 0.
@@ -1395,22 +1398,22 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.mu_labels is None:
       labels = rawlabels.copy()
     else:
-      if rawlabels.shape[-1] > self.d_output_continuous:
-        labels = rawlabels.copy()
-        labels[...,self.continuous_idx] = (rawlabels[...,self.continuous_idx]-self.mu_labels)/self.sig_labels
-      else:
-        labels = (rawlabels-self.mu_labels)/self.sig_labels
+      # if rawlabels.shape[-1] > self.d_output_continuous:
+      #   labels = rawlabels.copy()
+      #   labels[...,self.continuous_idx] = (rawlabels[...,self.continuous_idx]-self.mu_labels)/self.sig_labels
+      # else:
+      labels = (rawlabels-self.mu_labels)/self.sig_labels
     return labels.astype(self.dtype)
 
   def unzscore_labels(self,zlabels):
     if self.mu_labels is None:
       rawlabels = zlabels.copy()
     else:
-      if zlabels.shape[-1] > self.d_output_continuous:
-        rawlabels = zlabels.copy()
-        rawlabels[...,self.continuous_idx] = unzscore(zlabels[...,self.continuous_idx],self.mu_labels,self.sig_labels)
-      else:
-        rawlabels = unzscore(zlabels,self.mu_labels,self.sig_labels)
+      # if zlabels.shape[-1] > self.d_output_continuous:
+      #   rawlabels = zlabels.copy()
+      #   rawlabels[...,self.continuous_idx] = unzscore(zlabels[...,self.continuous_idx],self.mu_labels,self.sig_labels)
+      # else:
+      rawlabels = unzscore(zlabels,self.mu_labels,self.sig_labels)
     return rawlabels.astype(self.dtype)
 
   
@@ -1630,7 +1633,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
 
     if self.mu_input is not None:
       input0 = unzscore(input0,self.mu_input,self.sig_input)
-      movements[...,self.continuous_idx] = unzscore(movements[...,self.continuous_idx],self.mu_labels,self.sig_labels)
+      movements = unzscore(movements,self.mu_labels,self.sig_labels)
       
     input0 = split_features(input0,simplify=self.simplify_in)
     Xorigin0 = global0[...,:2]
@@ -3005,6 +3008,7 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
   return ani
 
+# def main():
   
 # location of data
 datadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022'
@@ -3037,7 +3041,7 @@ loadmodelfile = None
 # CLM, trained with dropout = 1.0 on movement, other fly touch features, 10 layers, 512 context
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230305T135655.pth')
 # CLM with mixed continuous and discrete state
-loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230419T175759.pth')
+#loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230419T175759.pth')
 
 restartmodelfile = None
 #restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch15_20230303T214306.pth')
@@ -3161,27 +3165,25 @@ print('Done.')
 
 train_dataset = FlyMLMDataset(X,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,
                               pdropout_past=PDROPOUT_PAST,input_labels=INPUT_LABELS)
-if DISCRETEIDX is not None:
-  train_dataset.discretize_labels(DISCRETEIDX,nbins=DISCRETIZE_NBINS,bin_epsilon=DISCRETIZE_EPSILON)
-  discretize_bin_edges = train_dataset.discretize_bin_edges
-  discretize_bin_samples = train_dataset.discretize_bin_samples
-
 train_dataset.zscore()
-
 mu_input = train_dataset.mu_input.copy()
 sig_input = train_dataset.sig_input.copy()
 mu_labels = train_dataset.mu_labels.copy()
 sig_labels = train_dataset.sig_labels.copy()
 
+if DISCRETEIDX is not None:
+  train_dataset.discretize_labels(DISCRETEIDX,nbins=DISCRETIZE_NBINS,bin_epsilon=DISCRETIZE_EPSILON)
+  discretize_bin_edges = train_dataset.discretize_bin_edges
+  discretize_bin_samples = train_dataset.discretize_bin_samples
+
 val_dataset = FlyMLMDataset(valX,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,
                             masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,pdropout_past=PDROPOUT_PAST,
                             input_labels=INPUT_LABELS)
-
+val_dataset.zscore(mu_input,sig_input,mu_labels,sig_labels)
 if DISCRETEIDX is not None:
   val_dataset.discretize_labels(DISCRETEIDX,nbins=DISCRETIZE_NBINS,bin_edges=train_dataset.discretize_bin_edges,
                                 bin_samples=train_dataset.discretize_bin_samples)
 
-val_dataset.zscore(mu_input,sig_input,mu_labels,sig_labels)
 
 d_feat = train_dataset[0]['input'].shape[-1]
 d_output = train_dataset.d_output
@@ -3516,12 +3518,11 @@ if loadmodelfile is None:
     X = chunk_data(data,CONTEXTL,reparamfun)
 
     train_dataset = FlyMLMDataset(X,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,
-                                  pdropout_past=PDROPOUT_PAST,input_labels=INPUT_LABELS)
+                                  pdropout_past=PDROPOUT_PAST,input_labels=INPUT_LABELS)      
+    train_dataset.zscore(mu_input=mu_input,sig_input=sig_input,mu_labels=mu_labels,sig_labels=sig_labels)
     if DISCRETEIDX is not None:
       train_dataset.discretize_labels(DISCRETEIDX,nbins=DISCRETIZE_NBINS,bin_edges=discretize_bin_edges,
-                                bin_samples=discretize_bin_samples)
-      
-    train_dataset.zscore(mu_input=mu_input,sig_input=sig_input,mu_labels=mu_labels,sig_labels=sig_labels)
+                                      bin_samples=discretize_bin_samples)
     print('New training data set created')
 
     if (epoch+1)%SAVE_EPOCH == 0:
@@ -3608,7 +3609,10 @@ scales = val_scale_perfly[:,ids]
 
 model.eval()
 
-Xkp_pred,zinputs,attn_weights0 = val_dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=PLOTATTNWEIGHTS)
+if PLOTATTNWEIGHTS:
+  Xkp_pred,zinputs,attn_weights0 = val_dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=PLOTATTNWEIGHTS)
+else:
+  Xkp_pred,zinputs = val_dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=PLOTATTNWEIGHTS)
 
 Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
 #Xkps = {'Pred': Xkp_pred.copy()}
@@ -3639,6 +3643,8 @@ if PLOTATTNWEIGHTS:
     attn_weights_rollout[t,:] = 0.
     attn_weights_rollout[t,:w.shape[0]] = w
   attn_weights = {'Pred': attn_weights_rollout}
+else:
+  attn_weights = None
 
 focusflies = fliespred
 titletexts = {0: 'Initialize', burnin: ''}
@@ -3651,12 +3657,5 @@ ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=
 
 print('Saving animation to file %s...'%savevidfile)
 writer = animation.PillowWriter(fps=30)
-ani.save(savevidfile,writer=writer)
-print('Finished writing.')
-
-
-savevidfile = os.path.join(savedir,f'samplevideo_{"_".join(categories)}_{vidtime}.mp4')
-print('Saving animation to file %s...'%savevidfile)
-writer = animation.FFMpegWriter(fps=30)
 ani.save(savevidfile,writer=writer)
 print('Finished writing.')
