@@ -1518,21 +1518,28 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.discretize:
       labels_discrete = torch.as_tensor(self.data[idx]['labels_discrete'].copy())
       labels_todiscretize = torch.as_tensor(self.data[idx]['labels_todiscretize'].copy())
+      labels_full = torch.zeros((labels.shape[0],self.d_output),dtype=labels.dtype)
+      labels_full[:,self.continuous_idx] = labels
+      labels_full[:,self.discrete_idx] = labels_todiscretize
     else:
       labels_discrete = None
       labels_todiscretize = None
+      labels_full = labels
       
     nin = input.shape[-1]
     contextl = input.shape[0]
     if self.ismasked():
-      input = torch.cat((labels,input),dim=-1)
+      input = torch.cat((labels_full,input),dim=-1)
       init = torch.as_tensor(self.data[idx]['init'][:,0].copy())
     else:
       # input: motion to frame t, pose, sensory frame t
       if self.input_labels:
-        input = torch.cat((labels[:-1,:],input[1:,:]),dim=-1)
+        input = torch.cat((labels_full[:-1,:],input[1:,:]),dim=-1)
         # output: motion from t to t+1
         labels = labels[1:,:]
+        if self.discretize:
+          labels_discrete = labels_discrete[1:,:,:]
+          labels_todiscretize = labels_todiscretize[1:,:]
         init = torch.as_tensor(self.data[idx]['init'][:,1].copy())
       else:
         init = torch.as_tensor(self.data[idx]['init'][:,0].copy())
@@ -1544,6 +1551,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
            'labels_todiscretize': labels_todiscretize,
            'init': init, 'scale': scale, 'categories': categories,
            'metadata': self.data[idx]['metadata'].copy()}
+    if self.input_labels:
+      res['metadata']['t0'] += 1
+      res['metadata']['frame0'] += 1
     if self.masktype is not None:
       res['mask'] = mask
     if dropout_mask is not None:
@@ -1824,10 +1834,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       for t in tqdm.trange(burnin,tpred):
         t0 = int(np.maximum(t-maxcontextl,0))
         
+        masksize = t-t0
+        if self.input_labels:
+          masksize -= 1
+        
         if self.ismasked():
-          net_mask = generate_square_full_mask(t-t0).to(device)
+          net_mask = generate_square_full_mask(masksize).to(device)
         else:
-          net_mask = generate_square_subsequent_mask(t-t0).to(device)
+          net_mask = generate_square_subsequent_mask(masksize).to(device)
               
         for i in range(nfliespred):
           flynum = fliespred[i]
@@ -3042,10 +3056,13 @@ loadmodelfile = None
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230305T135655.pth')
 # CLM with mixed continuous and discrete state
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230419T175759.pth')
+# CLM with mixed continuous and discrete state, movement input
+loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230421T223920.pth')
 
 restartmodelfile = None
 #restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch15_20230303T214306.pth')
 #restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch35_20230419T160425.pth')
+restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch5_20230421T215945.pth')
 # parameters
 
 narena = 2**10
@@ -3097,7 +3114,7 @@ SAVE_EPOCH = 5
 
 #PDROPOUT_PAST = 1
 PDROPOUT_PAST = 0.
-INPUT_LABELS = False
+INPUT_LABELS = True
 
 #DISCRETEIDX = None
 DISCRETEIDX = featglobal.copy()
