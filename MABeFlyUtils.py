@@ -24,6 +24,8 @@ datadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/seqdata2
 FPS = 150.
 # size of the arena the flies are enclosed in
 ARENA_RADIUS_MM = 26.689
+ARENA_RADIUS_PX = 507.611429 # median over all videos
+PXPERMM = ARENA_RADIUS_PX/ARENA_RADIUS_MM
 
 # names of our keypoint features
 keypointnames = [
