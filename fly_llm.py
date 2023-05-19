@@ -18,8 +18,15 @@ import datetime
 import collections
 # import sklearn.preprocessing
 import sklearn.cluster
+import json
+import argparse
+import pathlib
 
 print('fly_llm...')
+
+codedir = pathlib.Path(__file__).parent.resolve()
+DEFAULTCONFIGFILE = os.path.join(codedir,'config_fly_llm_default.json')
+assert os.path.exists(DEFAULTCONFIGFILE)
 
 legtipnames = [
   'right_front_leg_tip',
@@ -553,7 +560,6 @@ def compute_sensory(xeye_main,yeye_main,theta_main,
   # t = 0
   # debug_plot_wall_touch(t,xlegtip_main,ylegtip_main,distleg,wall_touch,params)
 
-  # to do: add something related to whether the fly is touching another fly
   # xtouch_main: npts_touch x T, xtouch_other: npts_touch_other x nflies x T
   if SENSORY_PARAMS['compute_otherflies_touch']:
     dx = xtouch_main.reshape((npts_touch,1,1,T)) - xtouch_other.reshape((1,npts_touch_other,nflies,T)) 
@@ -745,6 +751,9 @@ kptouch = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['touch_kpnames']]
 nkptouch = len(kptouch)
 kptouch_other = [mabe.keypointnames.index(x) for x in SENSORY_PARAMS['touch_other_kpnames']]
 nkptouch_other = len(kptouch_other)
+
+narena = 2**10
+theta_arena = np.linspace(-np.pi,np.pi,narena+1)[:-1]
 
 def get_sensory_feature_idx(simplify=None):
   idx = collections.OrderedDict()
@@ -1343,7 +1352,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                discretize_epsilon=None,
                discretize_params={},
                flatten_labels=False,
-               flatten_obs_idx=None):
+               flatten_obs_idx=None,
+               flatten_do_separate_inputs=False):
 
     self.data = data
     self.dtype = data[0]['input'].dtype
@@ -1404,7 +1414,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if discreteidx is not None:
       self.discretize_labels(discreteidx,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)    
     
-    self.set_flatten_params(flatten_labels=flatten_labels,flatten_obs_idx=flatten_obs_idx)
+    self.set_flatten_params(flatten_labels=flatten_labels,flatten_obs_idx=flatten_obs_idx,flatten_do_separate_inputs=flatten_do_separate_inputs)
     
   @property
   def ntimepoints(self):
@@ -1444,7 +1454,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     else:
       return 1
           
-  def set_flatten_params(self,flatten_labels=False,flatten_obs_idx=None):
+  def set_flatten_params(self,flatten_labels=False,flatten_obs_idx=None,flatten_do_separate_inputs=False):
     
     self.flatten_labels = flatten_labels
     self.flatten_obs_idx = flatten_obs_idx
@@ -1457,6 +1467,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.flatten_dinput_pertype = None
     self.flatten_max_dinput = None
     self.flatten_max_doutput = None
+    self.flatten_do_separate_inputs = flatten_do_separate_inputs
     
     if self.flatten_obs:
       self.flatten_nobs_types = len(self.flatten_obs_idx)
@@ -1479,14 +1490,25 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       if self.d_output_continuous > 0:
         self.flatten_dinput_pertype[-1] = self.d_output_continuous
       self.flatten_max_dinput = np.max(self.flatten_dinput_pertype)
+      if self.flatten_do_separate_inputs:
+        self.flatten_dinput = np.sum(self.flatten_dinput_pertype)        
+      else:
+        self.flatten_dinput = self.flatten_max_dinput
+
+      self.flatten_input_type_to_range = np.zeros((self.flatten_dinput_pertype.size,2),dtype=int)
       
       if self.discretize:
         self.flatten_max_doutput = np.maximum(self.discretize_nbins,self.d_output_continuous)
       else:
         self.flatten_max_doutput = self.d_output_continuous
-      
-      if self.input_labels:
-        self.flatten_max_dinput = np.maximum(self.flatten_max_dinput,self.flatten_max_doutput)
+
+      if self.flatten_do_separate_inputs:
+        cs = np.cumsum(self.flatten_dinput_pertype)
+        self.flatten_input_type_to_range[1:,0] = cs[:-1]
+        self.flatten_input_type_to_range[:,1] = cs
+      else:
+        self.flatten_input_type_to_range[:,1] = self.flatten_dinput_pertype
+
       
       # label tokens should be:
       # observations (flatten_nobs_types)
@@ -1816,6 +1838,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.discretize:
       labels_discrete = torch.as_tensor(self.data[idx]['labels_discrete'].copy())
       labels_todiscretize = torch.as_tensor(self.data[idx]['labels_todiscretize'].copy())
+      # full continuous labels
       labels_full = torch.zeros((labels.shape[0],self.d_output),dtype=labels.dtype)
       labels_full[:,self.continuous_idx] = labels
       labels_full[:,self.discrete_idx] = labels_todiscretize
@@ -1831,35 +1854,42 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     contextl = input.shape[0]
     input,mask,dropout_mask = self.mask_input(input)
     
-    if self.flatten_labels or self.flatten_obs:
+    if self.flatten:
       ntypes = self.ntokens_per_timepoint
-      newl = contextl*ntypes
-      newinput = torch.zeros((newl,self.flatten_max_dinput),dtype=input.dtype)
-      newmask = torch.zeros(newl,dtype=bool)
-      offidx = np.arange(contextl)*ntypes
+      #newl = contextl*ntypes
+      newlabels = torch.zeros((contextl,ntypes,self.flatten_max_doutput),dtype=input.dtype)
+      newinput = torch.zeros((contextl,ntypes,self.flatten_dinput),dtype=input.dtype)
+      newmask = torch.zeros((contextl,ntypes),dtype=bool)
+      #offidx = np.arange(contextl)*ntypes
       if self.flatten_obs:
         for i,v in enumerate(self.flatten_obs_idx.values()):
-          newinput[i+offidx,:self.flatten_dinput_pertype[i]] = input[:,v[0]:v[1]]
-          newmask[i+offidx] = False
+          newinput[:,i,self.flatten_input_type_to_range[i,0]:self.flatten_input_type_to_range[i,1]] = input[:,v[0]:v[1]]
+          newmask[:,i] = False
       else:
-        newinput[offidx,:self.flatten_dinput_pertype[0]] = input
+        newinput[:,0,:self.flatten_dinput_pertype[0]] = input
       if self.discretize:
         if self.flatten_labels:
           for i in range(self.d_output_discrete):
-            newinput[self.flatten_nobs_types+i+offidx,:self.discretize_nbins] = labels_discrete[:,i,:]
+            inputnum = self.flatten_nobs_types+i
+            newlabels[:,inputnum,:self.discretize_nbins] = labels_discrete[:,i,:]
+            newinput[:,inputnum,self.flatten_input_type_to_range[inputnum,0]:self.flatten_input_type_to_range[inputnum,1]] = labels_discrete[:,i,:]
             if mask is None:
-              newmask[self.flatten_nobs_types+i+offidx] = True
+              newmask[:,self.flatten_nobs_types+i] = True
             else:
-              newmask[self.flatten_nobs_types+i+offidx] = mask.clone()
-          if self.d_output_continuous > 0:
-            newinput[ntypes-1+offidx,:self.d_output_continuous] = labels
+              newmask[:,self.flatten_nobs_types+i] = mask.clone()
+          if self.continuous:
+            inputnum = -1
+            newlabels[:,-1,:labels.shape[-1]] = labels
+            newinput[:,-1,self.flatten_input_type_to_range[inputnum,0]:self.flatten_input_type_to_range[inputnum,1]] = labels
             if mask is None:
-              newmask[ntypes-1+offidx] = True
+              newmask[:,-1] = True
             else:
-              newmask[ntypes-1+offidx] = mask.clone()
+              newmask[:,-1] = mask.clone()
         else:
-          newinput[ntypes-1+offidx,:self.d_output] = labels
-      newlabels = newinput[:,:self.flatten_max_doutput].clone()
+          newinput[:,-1,:self.d_output] = labels
+      newlabels = newlabels.reshape((contextl*ntypes,self.flatten_max_doutput))
+      newinput = newinput.reshape((contextl*ntypes,self.flatten_dinput))
+      newmask = newmask.reshape(contextl*ntypes)
       if not self.ismasked():
         newlabels = newlabels[1:,:]
         newinput = newinput[:-1,:]
@@ -1867,6 +1897,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         
       res['input'] = newinput
       res['input_stacked'] = input
+      res['mask_flattened'] = newmask
       res['labels'] = newlabels
       res['labels_stacked'] = labels
     else:
@@ -2178,8 +2209,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         
         if self.ismasked():
           net_mask = generate_square_full_mask(masksize).to(device)
+          is_causal = False
         else:
           net_mask = torch.nn.Transformer.generate_square_subsequent_mask(masksize).to(device)
+          is_causal = True
               
         for i in range(nfliespred):
           flynum = fliespred[i]
@@ -2221,10 +2254,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                 masksize = lastidx+token
                 if self.ismasked():
                   net_mask = generate_square_full_mask(masksize).to(device)
-                else:
-                  net_mask = torch.nn.Transformer.generate_square_subsequent_mask(masksize).to(device)
                 with torch.no_grad():
-                  predtoken = model(xcurr[None,:lastidx+token,...].to(device),net_mask)
+                  predtoken = model(xcurr[None,:lastidx+token,...].to(device),mask=net_mask,is_causal=is_causal)
                 if token < len(self.discrete_idx):
                   # sample
                   sampleprob = torch.softmax(predtoken[0,-1,:self.discretize_nbins],dim=-1)
@@ -2263,7 +2294,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                   # masked: movement from 0->1, ..., t->t+1
                   # causal: movement from 1->2, ..., t->t+1
                   # last prediction: t->t+1
-                  pred = model(xcurr[None,...].to(device),net_mask)
+                  pred = model(xcurr[None,...].to(device),mask=net_mask,is_causal=is_causal)
               if model.model_type == 'TransformerBestState' or model.model_type == 'TransformerState':
                 pred = model.randpred(pred)
               # z-scored movement from t to t+1
@@ -2403,14 +2434,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     assert self.flatten_obs
     sz = input_flattened.shape
     if not self.ismasked():
-      pad = torch.zeros(sz[:-2]+(1,self.flatten_max_dinput),dtype=input_flattened.dtype,device=input_flattened.device)
+      pad = torch.zeros(sz[:-2]+(1,self.flatten_dinput),dtype=input_flattened.dtype,device=input_flattened.device)
       input_flattened = torch.cat((input_flattened,pad),dim=-2)      
-    resz = sz[:-2]+(self.ntimepoints,self.ntokens_per_timepoint,self.flatten_max_dinput)
+    resz = sz[:-2]+(self.ntimepoints,self.ntokens_per_timepoint,self.flatten_dinput)
     input_flattened = input_flattened.reshape(resz)
     newsz = sz[:-2]+(self.ntimepoints,self.dfeat)
     newinput = torch.zeros(newsz,dtype=input_flattened.dtype)
     for i,v in enumerate(self.flatten_obs_idx.values()):
-      newinput[...,:,v[0]:v[1]] = input_flattened[...,i,:self.flatten_dinput_pertype[i]]
+      newinput[...,:,v[0]:v[1]] = input_flattened[...,i,self.flatten_input_type_to_range[i,0]:self.flatten_input_type_to_range[i,1]]
     return newinput
   
   def get_full_inputs(self,example=None,idx=None,use_stacked=False):
@@ -2680,7 +2711,7 @@ class TransformerBestStateModel(torch.nn.Module):
   def init_weights(self) -> None:
     pass
 
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
+  def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None, is_causal: bool = False) -> torch.Tensor:
     """
     Args:
       src: Tensor, shape [batch_size,seq_len,dinput]
@@ -2698,7 +2729,7 @@ class TransformerBestStateModel(torch.nn.Module):
     src = self.pos_encoder(src)
 
     # main transformer layers
-    transformer_output = self.transformer_encoder(src,src_mask)
+    transformer_output = self.transformer_encoder(src,mask=src_mask,is_causal=is_causal)
 
     # output given each hidden state  
     # batch_size x seq_len x d_output x nstates
@@ -2761,7 +2792,7 @@ class TransformerStateModel(torch.nn.Module):
   def init_weights(self) -> None:
     pass
 
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
+  def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None, is_causal: bool = False) -> torch.Tensor:
     """
     Args:
       src: Tensor, shape [batch_size,seq_len,dinput]
@@ -2783,7 +2814,7 @@ class TransformerStateModel(torch.nn.Module):
     src = self.pos_encoder(src)
 
     # main transformer layers
-    transformer_output = self.transformer_encoder(src,src_mask)
+    transformer_output = self.transformer_encoder(src,mask=src_mask,is_causal=is_causal)
 
     output = {}
     # probability of each of the hidden states
@@ -2819,11 +2850,14 @@ class myTransformerEncoderLayer(torch.nn.TransformerEncoderLayer):
     self.need_weights = need_weights
   
   def _sa_block(self, x: torch.Tensor,
-                attn_mask: typing.Optional[torch.Tensor], key_padding_mask: typing.Optional[torch.Tensor]) -> torch.Tensor:
+                attn_mask: typing.Optional[torch.Tensor], 
+                key_padding_mask: typing.Optional[torch.Tensor],
+                is_causal: bool = False) -> torch.Tensor:
     x = self.self_attn(x, x, x,
                        attn_mask=attn_mask,
                        key_padding_mask=key_padding_mask,
-                       need_weights=self.need_weights)[0]
+                       need_weights=self.need_weights,
+                       is_causal=is_causal)[0]
     return self.dropout1(x)
   def set_need_weights(self,need_weights):
     self.need_weights = need_weights
@@ -2866,7 +2900,7 @@ class TransformerModel(torch.nn.Module):
   def init_weights(self) -> None:
     pass
 
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
+  def forward(self, src: torch.Tensor, mask: torch.Tensor = None, is_causal: bool = False) -> torch.Tensor:
     """
     Args:
       src: Tensor, shape [seq_len,batch_size,dinput]
@@ -2884,7 +2918,7 @@ class TransformerModel(torch.nn.Module):
     src = self.pos_encoder(src)
 
     # main transformer layers
-    output = self.transformer_encoder(src,src_mask)
+    output = self.transformer_encoder(src,mask=mask,is_causal=is_causal)
 
     # project back to d_input space
     output = self.decoder(output)
@@ -2907,61 +2941,19 @@ class TransformerMixedModel(TransformerModel):
     d_output = d_output_continuous + d_output_discrete*nbins
     super().__init__(d_input,d_output,**kwargs)
     
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> dict:
-    output_all = super().forward(src,src_mask)
+  def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None, is_causal: bool = False) -> dict:
+    output_all = super().forward(src,mask=src_mask,is_causal=is_causal)
     output_continuous = output_all[...,:self.d_output_continuous]
     output_discrete = output_all[...,self.d_output_continuous:].reshape(output_all.shape[:-1]+(self.d_output_discrete,self.nbins))
     return {'continuous': output_continuous, 'discrete': output_discrete}
   
-class TransformerFlattenedModel(TransformerModel):
-  
-  def __init__(self, d_input: int, d_output: int, 
-               ntokens_per_timepoint: int,
-               idx_output_token_discrete: torch.TensorType,
-               idx_output_token_continuous: torch.TensorType,
-               ismasked: bool,
-               d_output_discrete: int,
-               d_output_continuous: int,
-               **kwargs):
-    self.d_input = d_input
-    self.d_output = d_output
-    self.ismasked = ismasked
-    self.ntokens_per_timepoint = ntokens_per_timepoint
-    self.idx_output_token_discrete = idx_output_token_discrete
-    self.idx_output_token_continuous = idx_output_token_continuous
-    self.d_output_discrete = d_output_discrete
-    self.d_output_continuous = d_output_continuous
-    super().__init__(d_input,d_output,**kwargs)
-    
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> dict:
-    output_all = super().forward(src,src_mask)
-    contextl = src.shape[-2]
-    if self.ismasked:
-      contextl += 1
-    ntimepoints = contextl // self.ntokens_per_timepoint
-    offidx = torch.arange(ntimepoints,dtype=int)*self.ntokens_per_timepoint
-    idx_continuous = (offidx[:,None] + self.idx_output_token_continuous[None,:]).flatten()
-    idx_discrete = (offidx[:,None] + self.idx_output_token_discrete[None,:]).flatten()
-
-    output_continuous = output_all[...,idx_continuous,:self.d_output_continuous]
-    output_discrete = output_all[...,idx_discrete,:self.d_output_discrete]
-    return {'continuous': output_continuous, 'discrete': output_discrete}
-  
-# def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
-#   """
-#   Generates an upper-triangular matrix of -inf, with zeros on and below the diagonal.
-#   This is used to restrict attention to the past when predicting future words. Only
-#   used for causal models, not masked models.
-#   """
-#   return torch.triu(torch.ones(sz,sz) * float('-inf'), diagonal=1)
-
 def generate_square_full_mask(sz: int) -> torch.Tensor:
   """
   Generates an zero matrix. All words allowed.
   """
   return torch.zeros(sz,sz)
 
-def get_output_and_attention_weights(model, inputs, src_mask):  
+def get_output_and_attention_weights(model, inputs, mask=None, is_causal=False):  
 
   # set need_weights to True for this function call
   model.set_need_weights(True)
@@ -2982,7 +2974,7 @@ def get_output_and_attention_weights(model, inputs, src_mask):
 
   # call the model
   with torch.no_grad():
-    output = model(inputs, src_mask)
+    output = model(inputs, mask=mask, is_causal=is_causal)
   
   # remove the hooks    
   for hook in hooks:
@@ -3009,7 +3001,7 @@ def compute_attention_weight_rollout(w0):
     w[i,...]  = wcurr
   return w
 
-def save_model(savefile,model,lr_optimizer=None,scheduler=None,loss=None):
+def save_model(savefile,model,lr_optimizer=None,scheduler=None,loss=None,config=None):
   tosave = {'model':model.state_dict()}
   if lr_optimizer is not None:
     tosave['lr_optimizer'] = lr_optimizer.state_dict()
@@ -3017,10 +3009,12 @@ def save_model(savefile,model,lr_optimizer=None,scheduler=None,loss=None):
     tosave['scheduler'] = scheduler.state_dict()
   if loss is not None:
     tosave['loss'] = loss
+  if config is not None:
+    tosave['config'] = config
   torch.save(tosave,savefile)
   return
 
-def load_model(loadfile,model,lr_optimizer=None,scheduler=None):
+def load_model(loadfile,model,device,lr_optimizer=None,scheduler=None,config=None):
   print(f'Loading model from file {loadfile}...')
   state = torch.load(loadfile, map_location=device)
   if model is not None:
@@ -3029,6 +3023,9 @@ def load_model(loadfile,model,lr_optimizer=None,scheduler=None):
     lr_optimizer.load_state_dict(state['lr_optimizer'])
   if scheduler is not None and ('scheduler' in state):
     scheduler.load_state_dict(state['scheduler'])
+  if config is not None and 'config' in state:
+    overwrite_config(config,state['config'])
+      
   loss = {}
   if 'loss' in state:
     if isinstance(loss,dict):
@@ -3039,6 +3036,16 @@ def load_model(loadfile,model,lr_optimizer=None,scheduler=None):
       if 'val_loss' in state:
         loss['val'] = state['val_loss']
   return loss
+
+def load_config_from_model_file(loadmodelfile,config):
+  print(f'Loading config from file {loadmodelfile}...')
+  state = torch.load(loadmodelfile)
+  if 'config' in state:
+    overwrite_config(config,state['config'])
+  else:
+    print(f'config not stored in model file {loadmodelfile}')
+  return
+
 
 def debug_plot_batch_state(stateprob,nsamplesplot=3,
                           h=None,ax=None,fig=None):
@@ -3062,7 +3069,8 @@ def debug_plot_batch_state(stateprob,nsamplesplot=3,
   fig.tight_layout(h_pad=0)
   return h,ax,fig
 
-def debug_plot_batch_traj(example,train_dataset,pred=None,data=None,nsamplesplot=3,
+def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
+                          pred=None,data=None,nsamplesplot=3,
                           true_discrete_mode='to_discretize',
                           pred_discrete_mode='sample',
                           h=None,ax=None,fig=None,label_true='True',label_pred='Pred'):
@@ -3073,7 +3081,7 @@ def debug_plot_batch_traj(example,train_dataset,pred=None,data=None,nsamplesplot
   true_color_y = [.5,.5,.5]
   pred_cmap = lambda x: plt.get_cmap("tab10")(x%10)
   
-  if 'mask' in example:
+  if train_dataset.ismasked():
     mask = example['mask']
   else:
     mask = None
@@ -3120,7 +3128,8 @@ def debug_plot_batch_traj(example,train_dataset,pred=None,data=None,nsamplesplot
       #   nmask = np.count_nonzero(maskcurr)
       # else:
       #   nmask = np.prod(zmovement_continuous_pred.shape[:-1])
-      err_total,err_discrete,err_continuous = criterion_wrapper(examplecurr,predcurr)
+      if criterion is not None:
+        err_total,err_discrete,err_continuous = criterion_wrapper(examplecurr,predcurr,criterion,train_dataset,config)
       zmovement_discrete_pred = torch.softmax(zmovement_discrete_pred,dim=-1)
       # err_movement = torch.abs(zmovement_true[maskidx,:]-zmovement_pred[maskidx,:])/nmask
       # err_total = torch.sum(err_movement).item()/d
@@ -3164,7 +3173,7 @@ def debug_plot_batch_traj(example,train_dataset,pred=None,data=None,nsamplesplot
       labelcurr = outnames[feati]
       ax[i].text(0,mult*(feati+.5),labelcurr,horizontalalignment='left',verticalalignment='top')
 
-    if pred is not None:
+    if (err_total is not None):
       if train_dataset.discretize:
         ax[i].set_title(f'Err: {err_total.item(): .2f}, disc: {err_discrete.item(): .2f}, cont: {err_continuous.item(): .2f}')
       else:
@@ -3231,6 +3240,7 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
   
   batch_size = example['input'].shape[0]
   contextl = train_dataset.ntimepoints
+  nsamplesplot = np.minimum(nsamplesplot,batch_size)
   
   if ax is None:
     fig,ax = plt.subplots(nsamplesplot,ntsplot)
@@ -3290,9 +3300,11 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
 
   return h,ax,fig
 
-def debug_plot_sample_inputs(dataset,example):
+def debug_plot_sample_inputs(dataset,example,nplot=3):
 
-  fig,ax = plt.subplots(3,2)
+  nplot = np.minimum(nplot,example['input'].shape[0])
+
+  fig,ax = plt.subplots(nplot,2)
   idx = get_sensory_feature_idx(dataset.simplify_in)
   labels = dataset.get_full_labels(example=example,use_todiscretize=True)
   nlabels = labels.shape[-1]
@@ -3301,7 +3313,7 @@ def debug_plot_sample_inputs(dataset,example):
   inputidxstart = [x[0] - .5 for x in idx.values()]
   inputidxtype = list(idx.keys())
     
-  for iplot in range(3):
+  for iplot in range(nplot):
     ax[iplot,0].cla()
     ax[iplot,1].cla()
     ax[iplot,0].imshow(inputs[iplot,...],vmin=-3,vmax=3,cmap='coolwarm',aspect='auto')
@@ -3583,19 +3595,108 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
   return ani
 
-# def main():
+def read_config(jsonfile):
   
-# location of data
-datadir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022'
-intrainfile = os.path.join(datadir,'usertrain.npz')
-invalfile = os.path.join(datadir,'testtrain.npz')
-categories = ['71G01','male',]
-#inchunkfile = os.path.join(datadir,'chunk_usertrain.npz')
-inchunkfile = None
-#savechunkfile = os.path.join(datadir,f'chunk_usertrain_{"_".join(categories)}.npz')
-savechunkfile = None
-savedir = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/llmnets'
-loadmodelfile = None
+  with open(DEFAULTCONFIGFILE,'r') as f:
+    config = json.load(f)
+  
+  with open(jsonfile,'r') as f:
+    config1 = json.load(f)
+
+  # destructive to config
+  overwrite_config(config,config1)
+  
+  config['intrainfile'] = os.path.join(config['datadir'],config['intrainfilestr'])
+  config['invalfile'] = os.path.join(config['datadir'],config['invalfilestr'])
+  
+  if type(config['flatten_obs_idx']) == str:
+    if config['flatten_obs_idx'] == 'sensory':
+      config['flatten_obs_idx'] = get_sensory_feature_idx()
+    else:
+      raise ValueError(f"Unknown type {config['flatten_obs_idx']} for flatten_obs_idx")
+
+  if type(config['discreteidx']) == str:
+    if config['discreteidx'] == 'global':
+      config['discreteidx'] = featglobal.copy()
+    else:
+      raise ValueError(f"Unknown type {config['discreteidx']} for discreteidx")
+    if type(config['discreteidx']) == list:
+     config['discreteidx'] = np.array(config['discreteidx'])
+    
+  if config['modelstatetype'] == 'prob' and config['minstateprob'] is None:
+    config['minstateprob'] = 1/config['nstates']
+    
+  if 'all_discretize_epsilon' in config:
+    config['all_discretize_epsilon'] = np.array(config['all_discretize_epsilon'])
+    
+  assert config['modeltype'] in ['mlm','clm']
+  assert config['modelstatetype'] in ['prob','best',None]
+  assert config['masktype'] in ['ind','block',None]
+  
+  return config
+    
+def overwrite_config(config0,config1):
+  for k,v in config1.items():
+    if k in config0 and type(v) == dict:
+      overwrite_config(config0[k],config1[k])
+    else:
+      config0[k] = v
+  return
+
+def load_and_filter_data(infile,config):
+  
+  print(f"loading raw data from {infile}...")
+  data = load_raw_npz_data(infile)
+
+  if (len(config['discreteidx']) > 0) and config['discretize_epsilon'] is None:
+    if (config['all_discretize_epsilon'] is None):
+      scale_perfly = compute_scale_allflies(data)
+      config['all_discretize_epsilon'] = compute_noise_params(data,scale_perfly,simplify_out=config['simplify_out'])
+    config['discretize_epsilon'] = config['all_discretize_epsilon'][config['discreteidx']]
+
+  # filter out data
+  print('filtering data...')
+  if config['categories'] is not None and len(config['categories']) > 0:
+    filter_data_by_categories(data,config['categories'])
+
+  # compute scale parameters
+  print('computing scale parameters...')
+  scale_perfly = compute_scale_allflies(data)
+
+  if np.isnan(SENSORY_PARAMS['otherflies_touch_mult']):
+    print('computing touch parameters...')
+    SENSORY_PARAMS['otherflies_touch_mult'] = compute_otherflies_touch_mult(data)
+
+  # throw out data that is missing scale information - not so many frames
+  idsremove = np.nonzero(np.any(np.isnan(scale_perfly),axis=0))[0]
+  data['isdata'][np.isin(data['ids'],idsremove)] = False
+
+  return data,scale_perfly
+
+def criterion_wrapper(example,pred,criterion,dataset,config):
+  tgt_continuous,tgt_discrete = dataset.get_continuous_discrete_labels(example)
+  pred_continuous,pred_discrete = dataset.get_continuous_discrete_labels(pred)
+  tgt = {'labels': tgt_continuous, 'labels_discrete': tgt_discrete}
+  pred1 = {'continuous': pred_continuous, 'discrete': pred_discrete}
+  if config['modeltype'] == 'mlm':
+    if dataset.discretize:
+      loss,loss_discrete,loss_continuous = criterion(tgt,pred1,mask=example['mask'].to(pred.device),
+                                                     weight_discrete=config['weight_discrete'],extraout=True)
+    else:
+      loss = criterion(tgt_continuous.to(device=pred.device),pred_continuous,
+                      example['mask'].to(pred.device))
+      loss_continuous = loss
+      loss_discrete = 0.
+  else:
+    if dataset.discretize:
+      loss,loss_discrete,loss_continuous = criterion(tgt,pred1,weight_discrete=config['weight_discrete'],extraout=True)
+    else:
+      loss = criterion(tgt_continuous.to(device=pred.device),pred_continuous)
+      loss_continuous = loss
+      loss_discrete = 0.
+  return loss,loss_discrete,loss_continuous
+
+
 # MLM - no sensory
 #loadmodelfile = os.path.join(savedir,'flymlm_71G01_male_epoch100_202301215712.pth')
 # MLM with sensory
@@ -3621,666 +3722,619 @@ loadmodelfile = None
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230421T223920.pth')
 # flattened CLM, forward, sideways, orientation are binned outputs
 #loadmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch100_20230512T202000.pth')
+# flattened CLM, forward, sideways, orientation are binned outputs, do_separate_inputs = True
+# loadmodelfile = '/groups/branson/home/bransonk/behavioranalysis/code/MABe2022/llmnets/flyclm_flattened_mixed_71G01_male_epoch54_20230517T153613.pth'
 
-restartmodelfile = None
-#restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch15_20230303T214306.pth')
-#restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch35_20230419T160425.pth')
-#restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch5_20230421T215945.pth')
-#restartmodelfile = os.path.join(savedir,'flyclm_71G01_male_epoch10_20230511T140452.pth')
-
-# parameters
-
-narena = 2**10
-theta_arena = np.linspace(-np.pi,np.pi,narena+1)[:-1]
-
-# sequence length per training example
-#CONTEXTL = 513
-CONTEXTL = 65
-# type of model to train
-#modeltype = 'mlm'
-MODELTYPE = 'clm'
-#MODELSTATETYPE = 'prob'
-#MODELSTATETYPE = 'best'
-MODELSTATETYPE = None
-# masking method
-MASKTYPE = 'ind'
-if MODELTYPE == 'clm':
-  MASKTYPE = None
-# how long to mask out at a time (maximum), masktype = 'block'
-MAX_MASK_LENGTH = 4
-# probability of masking, masktype = 'ind'
-PMASK = .15
-# batch size
-BATCH_SIZE = 8
-print(f'batch size = {BATCH_SIZE}')
-#BATCH_SIZE = 96
-# number of training epochs
-NUM_TRAIN_EPOCHS = 100
-# gradient descent parameters
-OPTIMIZER_ARGS = {'lr': 5e-4, 'betas': (.9,.999), 'eps': 1e-8}
-MAX_GRAD_NORM = 1.
-# architecture arguments
-MODEL_ARGS = {'d_model': 2048, 'nhead': 8, 'd_hid': 512, 'nlayers': 10, 'dropout': .3}
-if MODELSTATETYPE == 'prob':
-  MODEL_ARGS['nstates'] = 32
-  MODEL_ARGS['minstateprob'] = 1/MODEL_ARGS['nstates']
-elif MODELSTATETYPE == 'best':
-  MODEL_ARGS['nstates'] = 8
-  
-LAST_PTEACHER_FORCE = .001
-GAMMA_TEACHER_FORCE = LAST_PTEACHER_FORCE**(1./(NUM_TRAIN_EPOCHS-1))
-  
-# whether to try to simplify the task, and how
-SIMPLIFY_OUT = None #'global'
-SIMPLIFY_IN = None
-#SIMPLIFY_IN = 'no_sensory'
-
-NPLOT = 32*512*30 // (BATCH_SIZE*CONTEXTL)
-NPLOT = 64
-SAVE_EPOCH = 2
-
-#PDROPOUT_PAST = 1
-PDROPOUT_PAST = 0.
-INPUT_LABELS = True
-FLATTEN_LABELS = INPUT_LABELS and True
-FLATTEN_OBS_IDX = get_sensory_feature_idx()
-
-#DISCRETEIDX = None
-DISCRETEIDX = featglobal.copy()
-DISCRETEIDX = np.arange(nfeatures,dtype=int)
-DISCRETEIDX = np.r_[np.array([0,1,2,6,8,10]),np.arange(11,29)]
-DISCRETIZE_NBINS = 25
-ALL_DISCRETIZE_EPSILON = \
-  np.array([0.01322199, 0.01349601, 0.02598117, 0.02033068, 0.01859137,
-            0.05900833, 0.05741996, 0.02196621, 0.0558432 , 0.02196207,
-            0.05579313, 0.02626397, 0.12436298, 0.02276208, 0.04065661,
-            0.02275847, 0.04038093, 0.02625952, 0.12736998, 0.02628111,
-            0.13280959, 0.02628102, 0.13049692, 0.02439783, 0.0367505 ,
-            0.02445746, 0.03742915, 0.02930942, 0.02496748])
-#DISCRETIZE_EPSILON = [.02,.02,.02] # forward, sideway, dorientation
-
-NUMPY_SEED = 123
-TORCH_SEED = 456
-
-np.random.seed(NUMPY_SEED)
-torch.manual_seed(TORCH_SEED)
-device = torch.device('cuda')
-
-plt.ion()
-
-# load in data
-print(f'loading raw data from {intrainfile} and {invalfile}...')
-data = load_raw_npz_data(intrainfile)
-valdata = load_raw_npz_data(invalfile)
-
-if (len(DISCRETEIDX) > 0):
-  if (ALL_DISCRETIZE_EPSILON is None):
-    scale_perfly = compute_scale_allflies(data)
-    ALL_DISCRETIZE_EPSILON = compute_noise_params(data,scale_perfly,simplify_out=SIMPLIFY_OUT)
-  DISCRETIZE_EPSILON = ALL_DISCRETIZE_EPSILON[DISCRETEIDX]
-
-# filter out data
-print('filtering data...')
-if categories is not None and len(categories) > 0:
-  filter_data_by_categories(data,categories)
-  filter_data_by_categories(valdata,categories)
-
-# compute scale parameters
-print('computing scale parameters...')
-scale_perfly = compute_scale_allflies(data)
-val_scale_perfly = compute_scale_allflies(valdata)
-
-if np.isnan(SENSORY_PARAMS['otherflies_touch_mult']):
-  print('computing touch parameters...')
-  SENSORY_PARAMS['otherflies_touch_mult'] = compute_otherflies_touch_mult(data)
-
-# throw out data that is missing scale information - not so many frames
-idsremove = np.nonzero(np.any(np.isnan(scale_perfly),axis=0))[0]
-data['isdata'][np.isin(data['ids'],idsremove)] = False
-idsremove = np.nonzero(np.any(np.isnan(val_scale_perfly),axis=0))[0]
-valdata['isdata'][np.isin(valdata['ids'],idsremove)] = False
-
-# function for computing features
-reparamfun = lambda x,id,flynum: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
-                                                  simplify_out=SIMPLIFY_OUT,simplify_in=SIMPLIFY_IN)
-
-val_reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,val_scale_perfly,
-                                                               outtype=np.float32,
-                                                               simplify_out=SIMPLIFY_OUT,simplify_in=SIMPLIFY_IN,**kwargs)
-# group data and compute features
-if inchunkfile is None or not os.path.exists(inchunkfile):
-  print('Chunking data...')
-  X = chunk_data(data,CONTEXTL,reparamfun)
-  print('Done.')
-  if savechunkfile is not None:
-    np.savez(savechunkfile,X=X)
-else:
-  print('Loading chunked data')
-  res = np.load(inchunkfile,allow_pickle=True)
-  X = list(res['X'])
-  print('Done.')
-
-print('Chunking val data...')
-valX = chunk_data(valdata,CONTEXTL,val_reparamfun)
-print('Done.')
-
-train_dataset = FlyMLMDataset(X,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,
-                              pdropout_past=PDROPOUT_PAST,input_labels=INPUT_LABELS,
-                              dozscore=True,
-                              discreteidx=DISCRETEIDX,discretize_nbins=DISCRETIZE_NBINS,
-                              discretize_epsilon=DISCRETIZE_EPSILON,
-                              flatten_labels=FLATTEN_LABELS,flatten_obs_idx=FLATTEN_OBS_IDX)
-
-zscore_params = train_dataset.get_zscore_params()
-discretize_params = train_dataset.get_discretize_params()
-
-val_dataset = FlyMLMDataset(valX,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,
-                            masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,pdropout_past=PDROPOUT_PAST,
-                            input_labels=INPUT_LABELS,
-                            dozscore=True,zscore_params=zscore_params,
-                            discreteidx=DISCRETEIDX,discretize_nbins=DISCRETIZE_NBINS,
-                            discretize_epsilon=DISCRETIZE_EPSILON,
-                            discretize_params=discretize_params,
-                            flatten_labels=FLATTEN_LABELS,flatten_obs_idx=FLATTEN_OBS_IDX)
-
-example = train_dataset[0]
-d_input = example['input'].shape[-1]
-d_output = train_dataset.d_output
-
-train_dataloader = torch.utils.data.DataLoader(train_dataset,
-                                               batch_size=BATCH_SIZE,
-                                               shuffle=True,
-                                               pin_memory=True,
-                                              )
-ntrain = len(train_dataloader)
-
-val_dataloader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=BATCH_SIZE,
-                                             shuffle=True,
-                                             pin_memory=True,
-                                             )
-nval = len(val_dataloader)
-
-example = next(iter(train_dataloader))
-sz = example['input'].shape
-print(f'batch input shape = {sz}')
-
-# debug plots
-
-# plot to visualize input features
-fig,ax = debug_plot_sample_inputs(train_dataset,example)
-
-# plot to check that we can get poses from examples
-h,ax,fig = debug_plot_batch_pose(example,train_dataset,data=data)
-ax[-1,0].set_xlabel('Train')
-
-# plot to visualize motion outputs
-axtraj,figtraj = debug_plot_batch_traj(example,train_dataset,data=data,
-                                       label_true='Label',
-                                       label_pred='Raw')
-figtraj.set_figheight(18)
-figtraj.set_figwidth(12)
-axtraj[0].set_title('Train')
-figtraj.tight_layout()
-
-# debug plots for validation data set
-example = next(iter(val_dataloader))
-valh,valax,valfig = debug_plot_batch_pose(example,val_dataset,data=valdata)
-valax[-1,0].set_xlabel('Val')
-valaxtraj,valfigtraj = debug_plot_batch_traj(example,val_dataset,data=valdata,
-                                       label_true='Label',
-                                       label_pred='Raw')
-valfigtraj.set_figheight(18)
-valfigtraj.set_figwidth(12)
-valaxtraj[0].set_title('Val')
-valfigtraj.tight_layout()
-
-hstate = None
-axstate = None
-figstate = None
-valhstate = None
-valaxstate = None
-valfigstate = None
-
-plt.show()
-plt.pause(.001)
-
-if MODELSTATETYPE == 'prob':
-  model = TransformerStateModel(d_input,d_output,**MODEL_ARGS).to(device)
-  criterion = prob_causal_criterion
-elif MODELSTATETYPE == 'min':
-  model = TransformerBestStateModel(d_input,d_output,**MODEL_ARGS).to(device)  
-  criterion = min_causal_criterion
-else:
-  
-  if train_dataset.flatten:
-    model = TransformerModel(train_dataset.flatten_max_dinput,
-                             train_dataset.flatten_max_doutput,
-                             ntokens_per_timepoint=train_dataset.ntokens_per_timepoint,
-                             **MODEL_ARGS,
-                             ).to(device)
-    # model = TransformerFlattenedModel(train_dataset.flatten_max_dinput,
-    #                                   train_dataset.flatten_max_doutput,
-    #                                   train_dataset.ntokens_per_timepoint,
-    #                                   train_dataset.idx_output_token_discrete,
-    #                                   train_dataset.idx_output_token_continuous,
-    #                                   train_dataset.ismasked(),
-    #                                   train_dataset.discretize_nbins,
-    #                                   train_dataset.d_output_continuous,
-    #                                   **MODEL_ARGS,
-    #                                   ).to(device)
-  elif train_dataset.discretize:
-    model = TransformerMixedModel(d_input,train_dataset.d_output_continuous,
-                                  train_dataset.d_output_discrete,
-                                  train_dataset.discretize_nbins,**MODEL_ARGS).to(device)
+def get_modeltype_str(config,dataset):
+  if config['modelstatetype'] is not None:
+    modeltype_str = f"{config['modelstatetype']}_{config['modeltype']}"
   else:
-    model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
-  
-  if train_dataset.discretize:
-    WEIGHT_DISCRETE = len(DISCRETEIDX) / nfeatures
-    if MODELTYPE == 'mlm':
-      criterion = mixed_masked_criterion
-    else:
-      criterion = mixed_causal_criterion
+    modeltype_str = config['modeltype']
+  if dataset.flatten:
+    modeltype_str += '_flattened'
+  if dataset.continuous and dataset.discretize:
+    reptype = 'mixed'  
+  elif dataset.continuous:
+    reptype = 'continuous'
+  elif dataset.discretize:
+    reptype = 'discrete'
+  modeltype_str += f'_{reptype}'
+  if config['categories'] is None or len(config['categories']) == 0:
+    category_str = 'all'
   else:
-    if MODELTYPE == 'mlm':
-      criterion = masked_criterion
-    else:
-      criterion = causal_criterion
-      
-def criterion_wrapper(example,pred):
-  tgt_continuous,tgt_discrete = train_dataset.get_continuous_discrete_labels(example)
-  pred_continuous,pred_discrete = train_dataset.get_continuous_discrete_labels(pred)
-  tgt = {'labels': tgt_continuous, 'labels_discrete': tgt_discrete}
-  pred1 = {'continuous': pred_continuous, 'discrete': pred_discrete}
-  if MODELTYPE == 'mlm':
-    if train_dataset.discretize:
-      loss,loss_discrete,loss_continuous = criterion(tgt,pred1,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-    else:
-      loss = criterion(tgt_continuous.to(device=pred.device),pred_continuous,
-                      example['mask'].to(pred.device))
-      loss_continuous = loss
-      loss_discrete = 0.
+    category_str = '_'.join(config['categories'])
+  modeltype_str += f'_{category_str}'
+
+  return modeltype_str
+
+def initialize_debug_plots(dataset,dataloader,data,name=''):
+
+  example = next(iter(dataloader))
+
+  # plot to visualize input features
+  fig,ax = debug_plot_sample_inputs(dataset,example)
+
+  # plot to check that we can get poses from examples
+  hpose,ax,fig = debug_plot_batch_pose(example,dataset,data=data)
+  ax[-1,0].set_xlabel('Train')
+
+  # plot to visualize motion outputs
+  axtraj,figtraj = debug_plot_batch_traj(example,dataset,data=data,
+                                         label_true='Label',
+                                         label_pred='Raw')
+  figtraj.set_figheight(18)
+  figtraj.set_figwidth(12)
+  axtraj[0].set_title(name)
+  figtraj.tight_layout()
+  
+  hdebug = {
+    'figpose': fig,
+    'axpose': ax,
+    'hpose': hpose,
+    'figtraj': figtraj,
+    'axtraj': axtraj,
+    'hstate': None,
+    'axstate': None,
+    'figstate': None,
+  }
+
+  plt.show()
+  plt.pause(.001)
+  
+  return hdebug
+  
+def update_debug_plots(hdebug,config,model,dataset,example,pred,criterion=None,name=''):
+  
+  if config['modelstatetype'] == 'prob':
+    pred1 = model.maxpred({k: v.detach() for k,v in pred.items()})
+  elif config['modelstatetype'] == 'best':
+    pred1 = model.randpred(pred.detach())
   else:
-    if train_dataset.discretize:
-      loss,loss_discrete,loss_continuous = criterion(tgt,pred1,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-    else:
-      loss = criterion(tgt_continuous.to(device=pred.device),pred_continuous)
-      loss_continuous = loss
-      loss_discrete = 0.
-  return loss,loss_discrete,loss_continuous
-    
-    
-
-num_training_steps = NUM_TRAIN_EPOCHS * ntrain
-optimizer = transformers.optimization.AdamW(model.parameters(),**OPTIMIZER_ARGS)
-lr_scheduler = transformers.get_scheduler('linear',optimizer,num_warmup_steps=0,
-                                          num_training_steps=num_training_steps)
-
-loss_epoch = {}
-loss_epoch['train'] = torch.zeros(NUM_TRAIN_EPOCHS)
-loss_epoch['train'][:] = torch.nan
-loss_epoch['val'] = torch.zeros(NUM_TRAIN_EPOCHS)
-loss_epoch['val'][:] = torch.nan
-if train_dataset.discretize:
-  loss_epoch['train_discrete'] = torch.zeros(NUM_TRAIN_EPOCHS)
-  loss_epoch['train_discrete'][:] = torch.nan
-  loss_epoch['train_continuous'] = torch.zeros(NUM_TRAIN_EPOCHS)
-  loss_epoch['train_continuous'][:] = torch.nan
-  loss_epoch['val_discrete'] = torch.zeros(NUM_TRAIN_EPOCHS)
-  loss_epoch['val_discrete'][:] = torch.nan
-  loss_epoch['val_continuous'] = torch.zeros(NUM_TRAIN_EPOCHS)
-  loss_epoch['val_continuous'][:] = torch.nan
-
-last_val_loss = None
-
-progress_bar = tqdm.tqdm(range(num_training_steps))
-
-contextl = example['input'].shape[1]
-if MODELTYPE == 'mlm':
-  train_src_mask = generate_square_full_mask(contextl).to(device)
-elif MODELTYPE == 'clm':
-  train_src_mask = torch.nn.Transformer.generate_square_subsequent_mask(contextl,device=device)
-  #train_src_mask = generate_square_subsequent_mask(contextl).to(device)
-else:
-  raise
-
-if MODELSTATETYPE is not None:
-  modeltype_str = f'{MODELSTATETYPE}_{MODELTYPE}'
-else:
-  modeltype_str = MODELTYPE
-
-if loadmodelfile is None:
-  
-  if restartmodelfile is not None:
-    loss_epoch = load_model(restartmodelfile,model,lr_optimizer=optimizer,scheduler=lr_scheduler)
-    #loss_epoch = {k: v.cpu() for k,v in loss_epoch.items()}
-    epoch = np.nonzero(np.isnan(loss_epoch['train'].cpu().numpy()))[0][0]
-  else:
-    epoch = 0
-  
-  if train_dataset.discretize:
-    lossfig,lossax = plt.subplots(3,1)
-  else:
-    lossfig,lossax = plt.subplots(1,1)
-    lossax = [lossax,]
-    
-  htrainloss, = lossax[0].plot(loss_epoch['train'].cpu(),'.-',label='Train')
-  hvalloss, = lossax[0].plot(loss_epoch['val'].cpu(),'.-',label='Val')
-    
-  if train_dataset.discretize:
-    htrainloss_continuous, = lossax[1].plot(loss_epoch['train_continuous'].cpu(),'.-',label='Train continuous')
-    htrainloss_discrete, = lossax[2].plot(loss_epoch['train_discrete'].cpu(),'.-',label='Train discrete')
-    
-    hvalloss_continuous, = lossax[1].plot(loss_epoch['val_continuous'].cpu(),'.-',label='Val continuous')
-    hvalloss_discrete, = lossax[2].plot(loss_epoch['val_discrete'].cpu(),'.-',label='Val discrete')
-        
-  lossax[-1].set_xlabel('Epoch')
-  lossax[-1].set_ylabel('Loss')
-  for l in lossax:
-    l.legend()
-  
-  savetime = datetime.datetime.now()
-  savetime = savetime.strftime('%Y%m%dT%H%M%S')
-  
-  pteacherforce = 1.
-
-  for epoch in range(epoch,NUM_TRAIN_EPOCHS):
-    
-    model.train()
-    tr_loss = torch.tensor(0.0).to(device)
-    if train_dataset.discretize:
-      tr_loss_discrete = torch.tensor(0.0).to(device)
-      tr_loss_continuous = torch.tensor(0.0).to(device)
-
-    nmask_train = 0
-    for step, example in enumerate(train_dataloader):
-      
-      if pteacherforce < 1:
-        pass
-      
-      pred = model(example['input'].to(device=device),train_src_mask)
-      loss,loss_discrete,loss_continuous = criterion_wrapper(example,pred)
-      # if MODELTYPE == 'mlm':
-      #   if train_dataset.discretize:
-      #     loss,loss_discrete,loss_continuous = criterion(example,pred,device,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-      #   else:
-      #     loss = criterion(example['labels'].to(device=device),pred,
-      #                     example['mask'].to(device))
-      # else:
-      #   if train_dataset.discretize:
-      #     loss,loss_discrete,loss_continuous = criterion(example,pred,device,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-      #   else:
-      #     loss = criterion(example['labels'].to(device=device),pred)
-        
-      loss.backward()
-      if MODELTYPE == 'mlm':
-        nmask_train += torch.count_nonzero(example['mask'])
-      else:
-        nmask_train += BATCH_SIZE*contextl
-
-      if step % NPLOT == 0:
-        if MODELSTATETYPE == 'prob':
-          pred1 = model.maxpred({k: v.detach() for k,v in pred.items()})
-        elif MODELSTATETYPE == 'best':
-          pred1 = model.randpred(pred.detach())
-        else:
-          if isinstance(pred,dict):
-            pred1 = {k: v.detach().cpu() for k,v in pred.items()}
-          else:
-            pred1 = pred.detach().cpu()
-        debug_plot_batch_pose(example,train_dataset,pred=pred1,h=h,ax=ax,fig=fig)
-        debug_plot_batch_traj(example,train_dataset,pred=pred1,ax=axtraj,fig=figtraj)
-        if MODELSTATETYPE == 'prob':
-          hstate,axstate,figstate = debug_plot_batch_state(pred['stateprob'].detach().cpu(),nsamplesplot=3,
-                                                            h=hstate,ax=axstate,fig=figstate)
-          axstate[0].set_title('Train')
-
-        axtraj[0].set_title('Train')
-        valexample = next(iter(val_dataloader))
-        with torch.no_grad():
-          valpred = model(valexample['input'].to(device=device),train_src_mask)
-          if MODELSTATETYPE == 'prob':
-            valpred1 = model.maxpred(valpred)
-          elif MODELSTATETYPE == 'best':
-            valpred1 = model.randpred(valpred)
-          elif isinstance(valpred,dict):
-            valpred1 = {k: v.detach().cpu() for k,v in valpred.items()}
-          else:
-            valpred1 = valpred.detach().cpu()
-          debug_plot_batch_pose(valexample,val_dataset,pred=valpred1,h=valh,ax=valax,fig=valfig)
-          debug_plot_batch_traj(valexample,val_dataset,pred=valpred1,ax=valaxtraj,fig=valfigtraj)
-          valaxtraj[0].set_title('Val')
-          if MODELSTATETYPE == 'prob':
-            valhstate,valaxstate,valfigstate = debug_plot_batch_state(valpred['stateprob'].cpu(),nsamplesplot=3,
-                                                                      h=valhstate,ax=valaxstate,fig=valfigstate)
-            valaxstate[0].set_title('Val')
-
-        plt.pause(.01)
-
-      tr_loss_step = loss.detach()
-      tr_loss += tr_loss_step
-      if train_dataset.discretize:
-        tr_loss_discrete += loss_discrete.detach()
-        tr_loss_continuous += loss_continuous.detach()
-
-      # gradient clipping
-      torch.nn.utils.clip_grad_norm_(model.parameters(),MAX_GRAD_NORM)
-      optimizer.step()
-      lr_scheduler.step()
-      model.zero_grad()
-      stat = {'train loss': tr_loss.item()/nmask_train,'last val loss': last_val_loss,'epoch': epoch}
-      if train_dataset.discretize:
-        stat['train loss discrete'] = tr_loss_discrete.item()/nmask_train
-        stat['train loss continuous'] = tr_loss_continuous.item()/nmask_train
-      progress_bar.set_postfix(stat)
-      progress_bar.update(1)
-
-    loss_epoch['train'][epoch] = tr_loss.item() / nmask_train
-    if train_dataset.discretize:
-      loss_epoch['train_discrete'][epoch] = tr_loss_discrete.item() / nmask_train
-      loss_epoch['train_continuous'][epoch] = tr_loss_continuous.item() / nmask_train
-
-    model.eval()
-    with torch.no_grad():
-      val_loss = torch.tensor(0.0).to(device)
-      if train_dataset.discretize:  
-        val_loss_discrete = torch.tensor(0.0).to(device)
-        val_loss_continuous = torch.tensor(0.0).to(device)
-      nmask_val = 0
-      for example in val_dataloader:
-        pred = model(example['input'].to(device=device),train_src_mask)
-        loss,loss_discrete,loss_continuous = criterion_wrapper(example,pred)
-        
-        # if MODELTYPE == 'mlm':
-        #   if train_dataset.discretize:
-        #     loss,loss_discrete,loss_continuous = criterion(example,pred,device,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-        #   else:
-        #     loss = criterion(example['labels'].to(device=device),pred,
-        #                     example['mask'].to(device))
-        # else:
-        #   if train_dataset.discretize:
-        #     loss,loss_discrete,loss_continuous = criterion(example,pred,device,weight_discrete=WEIGHT_DISCRETE,extraout=True)
-        #   else:
-        #     loss = criterion(example['labels'].to(device=device),pred)
-
-        if MODELTYPE == 'mlm':
-          nmask_val += torch.count_nonzero(example['mask'])
-        else:
-          nmask_val += BATCH_SIZE*contextl
-
-        val_loss+=loss
-        if train_dataset.discretize:
-          val_loss_discrete+=loss_discrete
-          val_loss_continuous+=loss_continuous
-        
-      loss_epoch['val'][epoch] = val_loss.item() / nmask_val
-
-      if train_dataset.discretize:
-        loss_epoch['val_discrete'][epoch] = val_loss_discrete.item() / nmask_val
-        loss_epoch['val_continuous'][epoch] = val_loss_continuous.item() / nmask_val
-
-      last_val_loss = loss_epoch['val'][epoch]
-
-    htrainloss.set_data(np.arange(epoch+1),loss_epoch['train'][:epoch+1].cpu().numpy())
-    hvalloss.set_data(np.arange(epoch+1),loss_epoch['val'][:epoch+1].cpu().numpy())
-    if train_dataset.discretize:
-      htrainloss_discrete.set_data(np.arange(epoch+1),loss_epoch['train_discrete'][:epoch+1].cpu().numpy())
-      htrainloss_continuous.set_data(np.arange(epoch+1),loss_epoch['train_continuous'][:epoch+1].cpu().numpy())
-      hvalloss_discrete.set_data(np.arange(epoch+1),loss_epoch['val_discrete'][:epoch+1].cpu().numpy())
-      hvalloss_continuous.set_data(np.arange(epoch+1),loss_epoch['val_continuous'][:epoch+1].cpu().numpy())
-    
-    for l in lossax:
-      l.relim()
-      l.autoscale()
-      
-    plt.pause(.01)
-
-    # rechunk the training data
-    print(f'Rechunking data after epoch {epoch}')
-    X = chunk_data(data,CONTEXTL,reparamfun)
-    
-    train_dataset = FlyMLMDataset(X,max_mask_length=MAX_MASK_LENGTH,pmask=PMASK,
-                                  masktype=MASKTYPE,simplify_out=SIMPLIFY_OUT,pdropout_past=PDROPOUT_PAST,
-                                  input_labels=INPUT_LABELS,
-                                  dozscore=True,zscore_params=zscore_params,
-                                  discreteidx=DISCRETEIDX,discretize_nbins=DISCRETIZE_NBINS,
-                                  discretize_epsilon=DISCRETIZE_EPSILON,
-                                  discretize_params=discretize_params,
-                                  flatten_labels=FLATTEN_LABELS,flatten_obs_idx=FLATTEN_OBS_IDX)
-    print('New training data set created')
-
-    if (epoch+1)%SAVE_EPOCH == 0:
-      savefile = os.path.join(savedir,f'fly{modeltype_str}_{"_".join(categories)}_epoch{epoch+1}_{savetime}.pth')
-      print(f'Saving to file {savefile}')
-      save_model(savefile,model,lr_optimizer=optimizer,scheduler=lr_scheduler,loss=loss_epoch)
-
-    pteacherforce *= GAMMA_TEACHER_FORCE
-
-  savefile = os.path.join(savedir,f'fly{modeltype_str}_{"_".join(categories)}_epoch{epoch+1}_{savetime}.pth')
-  save_model(savefile,model,lr_optimizer=optimizer,scheduler=lr_scheduler,loss=loss_epoch)
-
-  print('Done training')
-else:
-  loss_epoch = load_model(loadmodelfile,model,lr_optimizer=optimizer,scheduler=lr_scheduler)
-
-  lossfig = plt.figure()
-  lossax = plt.gca()
-  htrainloss = lossax.plot(loss_epoch['train'].cpu(),label='Train')
-  hvalloss = lossax.plot(loss_epoch['val'].cpu(),label='Val')
-  lossax.set_xlabel('Epoch')
-  lossax.set_ylabel('Loss')
-  lossax.legend()
-
-model.eval()
-
-# compute predictions and labels for all validation data using default masking
-all_pred = []
-all_mask = []
-all_labels = []
-with torch.no_grad():
-  val_loss = torch.tensor(0.0).to(device)
-  for example in val_dataloader:
-    pred = model(example['input'].to(device=device),train_src_mask)
-    if MODELSTATETYPE == 'prob':
-      pred = model.maxpred(pred)
-    elif MODELSTATETYPE == 'best':
-      pred = model.randpred(pred)
     if isinstance(pred,dict):
-      pred = {k: v.cpu() for k,v in pred.items()}
+      pred1 = {k: v.detach().cpu() for k,v in pred.items()}
     else:
-      pred = pred.cpu()
-    pred1 = val_dataset.get_full_pred(pred)
-    labels1 = val_dataset.get_full_labels(example=example,use_todiscretize=True)
-    all_pred.append(pred1)
-    all_labels.append(labels1)
-    if 'mask' in example:
-      all_mask.append(example['mask'])
+      pred1 = pred.detach().cpu()
+  debug_plot_batch_pose(example,dataset,pred=pred1,h=hdebug['hpose'],ax=hdebug['axpose'],fig=hdebug['figpose'])
+  debug_plot_batch_traj(example,dataset,criterion=criterion,config=config,pred=pred1,ax=hdebug['axtraj'],fig=hdebug['figtraj'])
+  if config['modelstatetype'] == 'prob':
+    hstate,axstate,figstate = debug_plot_batch_state(pred['stateprob'].detach().cpu(),nsamplesplot=3,
+                                                      h=hdebug['hstate'],ax=hdebug['axstate'],fig=hdebug['figstate'])
+    hdebug['axstate'][0].set_title(name)
 
-# plot comparison between predictions and labels on validation data
-nplot = min(len(all_labels),8000//BATCH_SIZE//CONTEXTL+1)
+  hdebug['axtraj'][0].set_title(name)
+  
+def initialize_loss_plots(loss_epoch):
 
-predv,labelsv,maskv = stackhelper(all_pred,all_labels,all_mask,nplot)
-if maskv is not None and len(maskv) > 0:
-  maskidx = torch.nonzero(maskv)[:,0]
-else:
-  maskidx = None
+  nax = len(loss_epoch)//2
+  assert (nax >= 1) and (nax <= 3)
+  hloss = {}
+    
+  hloss['fig'],hloss['ax'] = plt.subplots(nax,1)
+  if nax == 1:
+    hloss['ax'] = [hloss['ax'],]
+    
+  hloss['train'], = hloss['ax'][0].plot(loss_epoch['train'].cpu(),'.-',label='Train')
+  hloss['val'], = hloss['ax'][0].plot(loss_epoch['val'].cpu(),'.-',label='Val')
+  
+  if 'train_continuous' in loss_epoch:
+    hloss['train_continuous'], = hloss['ax'][1].plot(loss_epoch['train_continuous'].cpu(),'.-',label='Train continuous')
+  if 'train_discrete' in loss_epoch:
+    hloss['train_discrete'], = hloss['ax'][2].plot(loss_epoch['train_discrete'].cpu(),'.-',label='Train discrete')
+  if 'val_continuous' in loss_epoch:
+    hloss['val_continuous'], = hloss['ax'][1].plot(loss_epoch['val_continuous'].cpu(),'.-',label='Val continuous')
+  if 'val_discrete' in loss_epoch:
+    hloss['val_discrete'], = hloss['ax'][2].plot(loss_epoch['val_discrete'].cpu(),'.-',label='Val discrete')
+        
+  hloss['ax'][-1].set_xlabel('Epoch')
+  hloss['ax'][-1].set_ylabel('Loss')
+  for l in hloss['ax']:
+    l.legend()
+  return hloss
 
-outnames = val_dataset.get_outnames()
-fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx)
+def update_loss_plots(hloss,loss_epoch):
 
-DEBUG = False
-burnin = CONTEXTL-1
-contextlpad = burnin + 1
-TPRED = 2000+CONTEXTL
-PLOTATTNWEIGHTS = False
-# all frames must have real data
-allisdata = interval_all(valdata['isdata'],contextlpad)
-isnotsplit = interval_all(valdata['isstart']==False,TPRED)[1:,...]
-canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
-flynum = 0
-t0 = np.nonzero(canstart[:,flynum])[0][360]
-# flynum = 2
-# t0 = np.nonzero(canstart[:,flynum])[0][0]
+  hloss['train'].set_ydata(loss_epoch['train'].cpu())
+  hloss['val'].set_ydata(loss_epoch['val'].cpu())
+  if 'train_continuous' in loss_epoch:
+    hloss['train_continuous'].set_ydata(loss_epoch['train_continuous'].cpu())
+  if 'train_discrete' in loss_epoch:
+    hloss['train_discrete'].set_ydata(loss_epoch['train_discrete'].cpu())
+  if 'val_continuous' in loss_epoch:
+    hloss['val_continuous'].set_ydata(loss_epoch['val_continuous'].cpu())
+  if 'val_discrete' in loss_epoch:
+    hloss['val_discrete'].set_ydata(loss_epoch['val_discrete'].cpu())
+  for l in hloss['ax']:
+    l.relim()
+    l.autoscale()
 
-fliespred = np.array([flynum,])
+def initialize_loss(train_dataset,config):
+  loss_epoch = {}
+  keys = ['train','val']
+  if train_dataset.discretize:
+    keys = keys + ['train_continuous','train_discrete','val_continuous','val_discrete']
+  for key in keys:
+    loss_epoch[key] = torch.zeros(config['num_train_epochs'])
+    loss_epoch[key][:] = torch.nan
+  return loss_epoch
 
-Xkp_true = valdata['X'][...,t0:t0+TPRED,:].copy()
-Xkp = Xkp_true.copy()
+def initialize_model(d_input,d_output,config,train_dataset,device):
 
-#fliespred = np.nonzero(mabe.get_real_flies(Xkp))[0]
-ids = valdata['ids'][t0,fliespred]
-scales = val_scale_perfly[:,ids]
+  # architecture arguments
+  MODEL_ARGS = {
+    'd_model': config['d_model'], 
+    'nhead': config['nhead'], 
+    'd_hid': config['d_hid'], 
+    'nlayers': config['nlayers'],
+    'dropout': config['dropout']
+    }
+  if config['modelstatetype'] is not None:
+    MODEL_ARGS['nstates'] = config['nstates']
+  if config['modelstatetype'] == 'prob':
+    MODEL_ARGS['minstateprob'] = config['minstateprob']
 
-model.eval()
+  if config['modelstatetype'] == 'prob':
+    model = TransformerStateModel(d_input,d_output,**MODEL_ARGS).to(device)
+    criterion = prob_causal_criterion
+  elif config['modelstatetype'] == 'min':
+    model = TransformerBestStateModel(d_input,d_output,**MODEL_ARGS).to(device)  
+    criterion = min_causal_criterion
+  else:
+    if train_dataset.flatten:
+      model = TransformerModel(train_dataset.flatten_dinput,
+                              train_dataset.flatten_max_doutput,
+                              ntokens_per_timepoint=train_dataset.ntokens_per_timepoint,
+                              **MODEL_ARGS,
+                              ).to(device)
+    elif train_dataset.discretize:
+      model = TransformerMixedModel(d_input,train_dataset.d_output_continuous,
+                                    train_dataset.d_output_discrete,
+                                    train_dataset.discretize_nbins,**MODEL_ARGS).to(device)
+    else:
+      model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
+    
+    if train_dataset.discretize:
+      config['weight_discrete'] = len(config['discreteidx']) / nfeatures
+      if config['modeltype'] == 'mlm':
+        criterion = mixed_masked_criterion
+      else:
+        criterion = mixed_causal_criterion
+    else:
+      if config['modeltype'] == 'mlm':
+        criterion = masked_criterion
+      else:
+        criterion = causal_criterion
+          
+  return model,criterion
 
-if PLOTATTNWEIGHTS:
-  Xkp_pred,zinputs,attn_weights0 = val_dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=PLOTATTNWEIGHTS)
-else:
-  Xkp_pred,zinputs = val_dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=CONTEXTL,debug=DEBUG,need_weights=PLOTATTNWEIGHTS)
+def compute_loss(model,dataloader,dataset,device,mask,criterion,config):
+  
+  is_causal = dataset.ismasked() == False
+  if is_causal:
+    mask = None
+    
+  model.eval()
+  with torch.no_grad():
+    all_loss = torch.zeros(len(dataloader),device=device)
+    loss = torch.tensor(0.0).to(device)
+    if dataset.discretize:  
+      loss_discrete = torch.tensor(0.0).to(device)
+      loss_continuous = torch.tensor(0.0).to(device)
+    nmask = 0
+    for i,example in enumerate(dataloader):
+      pred = model(example['input'].to(device=device),mask=mask,is_causal=is_causal)
+      loss_curr,loss_discrete_curr,loss_continuous_curr = criterion_wrapper(example,pred,criterion,dataset,config)
 
-Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
-#Xkps = {'Pred': Xkp_pred.copy()}
-if len(fliespred) == 1:
-  inputs = {'Pred': split_features(zinputs,axis=1)}
-else:
-  inputs = None
+      if config['modeltype'] == 'mlm':
+        nmask += torch.count_nonzero(example['mask'])
+      else:
+        nmask += example['input'].shape[0]*dataset.ntimepoints
+      all_loss[i] = loss_curr
+      loss+=loss_curr
+      if dataset.discretize:
+        loss_discrete+=loss_discrete_curr
+        loss_continuous+=loss_continuous_curr
+      
+    loss = loss.item() / nmask
 
-if PLOTATTNWEIGHTS:
+    if dataset.discretize:
+      loss_discrete = loss_discrete.item() / nmask
+      loss_continuous = loss_continuous.item() / nmask
+      return loss,loss_discrete,loss_continuous
+    else:
+      return loss
+    
+def predict_all(dataloader,dataset,model,config,mask):
+  
+  is_causal = dataset.ismasked() == False
+  if is_causal:
+    mask = None
+  
+  # compute predictions and labels for all validation data using default masking
+  all_pred = []
+  all_mask = []
+  all_labels = []
+  with torch.no_grad():
+    loss = torch.tensor(0.0).to(model.device)
+    for example in dataloader:
+      pred = model(example['input'].to(device=model.device),mask=mask,is_causal=is_causal)
+      if config['modelstatetype'] == 'prob':
+        pred = model.maxpred(pred)
+      elif config['modelstatetype'] == 'best':
+        pred = model.randpred(pred)
+      if isinstance(pred,dict):
+        pred = {k: v.cpu() for k,v in pred.items()}
+      else:
+        pred = pred.cpu()
+      pred1 = dataset.get_full_pred(pred)
+      labels1 = dataset.get_full_labels(example=example,use_todiscretize=True)
+      all_pred.append(pred1)
+      all_labels.append(labels1)
+      if 'mask' in example:
+        all_mask.append(example['mask'])
+
+  return all_pred,all_labels,all_mask
+
+def parse_modelfile(modelfile):
+  _,filestr = os.path.split(modelfile)
+  filestr,_ = os.path.splitext(filestr)
+  m = re.match('fly(.*)_epoch\d+_(\d{8}T\d{6})',filestr)
+  if m is None:
+    modeltype_str = ''
+    savetime = ''
+  else:
+    modeltype_str = m.groups(1)[0]
+    savetime = m.groups(1)[1]
+  return modeltype_str,savetime
+
+def compute_all_attention_weight_rollouts(attn_weights0):
   attn_weights_rollout = None
   firstframe = None
   attn_context = None
+  tpred = attn_weights0[0].size #to do check
   for t,w0 in enumerate(attn_weights0):
     if w0 is None:
       continue
     w = compute_attention_weight_rollout(w0)
     w = w[-1,-1,...]
     if attn_weights_rollout is None:
-      attn_weights_rollout = np.zeros((TPRED,)+w.shape)
+      attn_weights_rollout = np.zeros((tpred,)+w.shape)
       attn_weights_rollout[:] = np.nan
       firstframe = t
       attn_context = w.shape[0]
     if attn_context < w.shape[0]:
-      pad = np.zeros([TPRED,w.shape[0]-attn_context,]+list(w.shape)[1:])
+      pad = np.zeros([tpred,w.shape[0]-attn_context,]+list(w.shape)[1:])
       pad[:firstframe,...] = np.nan
       attn_context = w.shape[0]
       attn_weights_rollout = np.concatenate((attn_weights_rollout,pad),axis=1)
     attn_weights_rollout[t,:] = 0.
     attn_weights_rollout[t,:w.shape[0]] = w
-  attn_weights = {'Pred': attn_weights_rollout}
-else:
-  attn_weights = None
+  return attn_weights_rollout
 
-focusflies = fliespred
-titletexts = {0: 'Initialize', burnin: ''}
 
-vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
-savevidfile = os.path.join(savedir,f'samplevideo_{"_".join(categories)}_{vidtime}.gif')
+def animate_predict_open_loop(model,dataset,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False):
+  if burnin is None:
+    burnin = config['contextl']-1
+  contextlpad = burnin + 1
 
-ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,CONTEXTL-64),
-                   inputs=inputs,contextl=CONTEXTL-1,attn_weights=attn_weights)
+  Xkp_true = dataset.data['X'][...,t0:t0+tpred,:].copy()
+  Xkp = Xkp_true.copy()
 
-print('Saving animation to file %s...'%savevidfile)
-writer = animation.PillowWriter(fps=30)
-ani.save(savevidfile,writer=writer)
-print('Finished writing.')
+  #fliespred = np.nonzero(mabe.get_real_flies(Xkp))[0]
+  ids = dataset.data['ids'][t0,fliespred]
+  scales = scale_perfly[:,ids]
+
+  model.eval()
+
+  if plotattnweights:
+    Xkp_pred,zinputs,attn_weights0 = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+  else:
+    Xkp_pred,zinputs = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+
+  Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
+  #Xkps = {'Pred': Xkp_pred.copy()}
+  if len(fliespred) == 1:
+    inputs = {'Pred': split_features(zinputs,axis=1)}
+  else:
+    inputs = None
+
+  if plotattnweights:
+    attn_weights = {'Pred': compute_all_attention_weight_rollouts(attn_weights0)}
+  else:
+    attn_weights = None
+
+  focusflies = fliespred
+  titletexts = {0: 'Initialize', burnin: ''}
+
+  ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,config['contextl']-64),
+                    inputs=inputs,contextl=config['training']['contextl']-1,attn_weights=attn_weights)
+  
+  return ani
+
+
+def main(configfile,loadmodelfile=None,restartmodelfile=None):
+
+  config = read_config(configfile)
+  if loadmodelfile is None and 'loadmodelfile' in config:
+    loadmodelfile = config['loadmodelfile']
+  if restartmodelfile is None and 'restartmodelfile' in config:
+    loadmodelfile = config['restartmodelfile']
+  
+  if loadmodelfile is not None:
+    load_config_from_model_file(loadmodelfile,config)
+  elif restartmodelfile is not None:
+    load_config_from_model_file(restartmodelfile,config)
+  
+  print(f"batch size = {config['batch_size']}")
+
+  np.random.seed(config['numpy_seed'])
+  torch.manual_seed(config['torch_seed'])
+  device = torch.device(config['device'])
+
+  plt.ion()
+  
+  data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
+  valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
+
+  # function for computing features
+  reparamfun = lambda x,id,flynum: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
+                                                    simplify_out=config['simplify_out'],
+                                                    simplify_in=config['simplify_in'])
+
+  val_reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,val_scale_perfly,
+                                                                outtype=np.float32,
+                                                                simplify_out=config['simplify_out'],
+                                                                simplify_in=config['simplify_in'],**kwargs)
+  print('Chunking training data...')
+  X = chunk_data(data,config['contextl'],reparamfun)
+  print('Chunking val data...')
+  valX = chunk_data(valdata,config['contextl'],val_reparamfun)
+
+  print('Done.')
+
+  dataset_params = {
+    'max_mask_length': config['max_mask_length'],
+    'pmask': config['pmask'],
+    'masktype': config['masktype'],
+    'simplify_out': config['simplify_out'],
+    'pdropout_past': config['pdropout_past'],
+    'input_labels': config['input_labels'],
+    'dozscore': True,
+    'discreteidx': config['discreteidx'],
+    'discretize_nbins': config['discretize_nbins'],
+    'discretize_epsilon': config['discretize_epsilon'],
+    'flatten_labels': config['flatten_labels'],
+    'flatten_obs_idx': config['flatten_obs_idx'],
+    'flatten_do_separate_inputs': config['flatten_do_separate_inputs'],
+  }
+
+  print('Creating training data set...')
+  train_dataset = FlyMLMDataset(X,**dataset_params)
+
+  dataset_params['zscore_params'] = train_dataset.get_zscore_params()
+  dataset_params['discretize_params'] = train_dataset.get_discretize_params()
+
+  print('Creating validation data set...')
+  val_dataset = FlyMLMDataset(valX,**dataset_params)
+
+  example = train_dataset[0]
+  d_input = example['input'].shape[-1]
+  d_output = train_dataset.d_output
+  outnames = train_dataset.get_outnames()
+
+
+  train_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                batch_size=config['batch_size'],
+                                                shuffle=True,
+                                                pin_memory=True,
+                                                )
+  ntrain = len(train_dataloader)
+
+  val_dataloader = torch.utils.data.DataLoader(val_dataset,
+                                              batch_size=config['batch_size'],
+                                              shuffle=False,
+                                              pin_memory=True,
+                                              )
+  nval = len(val_dataloader)
+
+  example = next(iter(train_dataloader))
+  sz = example['input'].shape
+  print(f'batch input shape = {sz}')
+
+  # debug plots
+  hdebug = {}
+  hdebug['train'] = initialize_debug_plots(train_dataset,train_dataloader,data,name='Train')
+  hdebug['val'] = initialize_debug_plots(val_dataset,val_dataloader,valdata,name='Val')
+
+  # create the model
+  model,criterion = initialize_model(d_input,d_output,config,train_dataset,device)
+
+  # optimizer
+  num_training_steps = config['num_train_epochs'] * ntrain
+  optimizer = transformers.optimization.AdamW(model.parameters(),**config['optimizer_args'])
+  lr_scheduler = transformers.get_scheduler('linear',optimizer,num_warmup_steps=0,
+                                            num_training_steps=num_training_steps)
+
+  # initialize structure to keep track of loss
+  loss_epoch = initialize_loss(train_dataset,config)
+  last_val_loss = None
+
+  progress_bar = tqdm.tqdm(range(num_training_steps))
+
+  # create attention mask
+  contextl = example['input'].shape[1]
+  if config['modeltype'] == 'mlm':
+    train_src_mask = generate_square_full_mask(contextl).to(device)
+    is_causal = False
+  elif config['modeltype'] == 'clm':
+    train_src_mask = torch.nn.Transformer.generate_square_subsequent_mask(contextl,device=device)
+    is_causal = True
+    #train_src_mask = generate_square_subsequent_mask(contextl).to(device)
+  else:
+    raise
+
+  modeltype_str = get_modeltype_str(config,train_dataset)
+
+  hloss = initialize_loss_plots(loss_epoch)
+  
+  
+  # epoch = 40
+  # restartmodelfile = f'llmnets/flyclm_flattened_mixed_71G01_male_epoch{epoch}_20230517T153613.pth'
+  # loss_epoch = load_model(restartmodelfile,model,device,lr_optimizer=optimizer,scheduler=lr_scheduler)
+  # with torch.no_grad():
+  #   pred = model(example['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+  # update_debug_plots(hdebug['train'],config,model,train_dataset,example,pred,name='Train',criterion=criterion)
+
+  # train
+  if loadmodelfile is None:
+    
+    # restart training
+    if restartmodelfile is not None:
+      loss_epoch = load_model(restartmodelfile,model,device,lr_optimizer=optimizer,scheduler=lr_scheduler)
+      #loss_epoch = {k: v.cpu() for k,v in loss_epoch.items()}
+      epoch = np.nonzero(np.isnan(loss_epoch['train'].cpu().numpy()))[0][0]
+    else:
+      epoch = 0
+    
+    savetime = datetime.datetime.now()
+    savetime = savetime.strftime('%Y%m%dT%H%M%S')
+    ntimepoints_per_batch = train_dataset.ntimepoints
+    
+    for epoch in range(epoch,config['num_train_epochs']):
+      
+      model.train()
+      tr_loss = torch.tensor(0.0).to(device)
+      if train_dataset.discretize:
+        tr_loss_discrete = torch.tensor(0.0).to(device)
+        tr_loss_continuous = torch.tensor(0.0).to(device)
+
+      nmask_train = 0
+      for step, example in enumerate(train_dataloader):
+        
+        pred = model(example['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+        loss,loss_discrete,loss_continuous = criterion_wrapper(example,pred,criterion,train_dataset,config)
+          
+        loss.backward()
+        
+        # how many timepoints are in this batch for normalization
+        if config['modeltype'] == 'mlm':
+          nmask_train += torch.count_nonzero(example['mask'])
+        else:
+          nmask_train += example['input'].shape[0]*ntimepoints_per_batch 
+
+        if step % config['niterplot'] == 0:
+          
+          update_debug_plots(hdebug['train'],config,model,train_dataset,example,pred,name='Train',criterion=criterion)
+          valexample = next(iter(val_dataloader))
+          with torch.no_grad():
+            valpred = model(valexample['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+          update_debug_plots(hdebug['val'],config,model,val_dataset,valexample,valpred,name='Val',criterion=criterion)
+          plt.pause(.01)
+
+        tr_loss_step = loss.detach()
+        tr_loss += tr_loss_step
+        if train_dataset.discretize:
+          tr_loss_discrete += loss_discrete.detach()
+          tr_loss_continuous += loss_continuous.detach()
+
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(),config['max_grad_norm'])
+        optimizer.step()
+        lr_scheduler.step()
+        model.zero_grad()
+        
+        # update progress bar
+        stat = {'train loss': tr_loss.item()/nmask_train,'last val loss': last_val_loss,'epoch': epoch}
+        if train_dataset.discretize:
+          stat['train loss discrete'] = tr_loss_discrete.item()/nmask_train
+          stat['train loss continuous'] = tr_loss_continuous.item()/nmask_train
+        progress_bar.set_postfix(stat)
+        progress_bar.update(1)
+        
+        # end of iteration loop
+
+      # training epoch complete
+      loss_epoch['train'][epoch] = tr_loss.item() / nmask_train
+      if train_dataset.discretize:
+        loss_epoch['train_discrete'][epoch] = tr_loss_discrete.item() / nmask_train
+        loss_epoch['train_continuous'][epoch] = tr_loss_continuous.item() / nmask_train
+      
+      # compute validation loss after this epoch
+      if val_dataset.discretize:
+         loss_epoch['val'][epoch],loss_epoch['val_discrete'][epoch],loss_epoch['val_continuous'][epoch] = \
+           compute_loss(model,val_dataloader,val_dataset,device,train_src_mask,criterion,config)
+      else:
+        loss_epoch['val'][epoch] = \
+          compute_loss(model,val_dataloader,val_dataset,device,train_src_mask,criterion,config)
+      last_val_loss = loss_epoch['val'][epoch]
+    
+      update_loss_plots(hloss,loss_epoch)
+      plt.pause(.01)
+
+      # rechunk the training data
+      print(f'Rechunking data after epoch {epoch}')
+      X = chunk_data(data,config['contextl'],reparamfun)
+      
+      train_dataset = FlyMLMDataset(X,**dataset_params)
+      print('New training data set created')
+
+      if (epoch+1)%config['save_epoch'] == 0:
+        savefile = os.path.join(config['savedir'],f"fly{modeltype_str}_epoch{epoch+1}_{savetime}.pth")
+        print(f'Saving to file {savefile}')
+        save_model(savefile,model,lr_optimizer=optimizer,scheduler=lr_scheduler,loss=loss_epoch,config=config)
+
+    savefile = os.path.join(config['savedir'],f'fly{modeltype_str}_epoch{epoch+1}_{savetime}.pth')
+    save_model(savefile,model,lr_optimizer=optimizer,scheduler=lr_scheduler,loss=loss_epoch,config=config)
+
+    print('Done training')
+  else:
+    modeltype_str,savetime = parse_modelfile(loadmodelfile)
+    loss_epoch = load_model(loadmodelfile,model,device,lr_optimizer=optimizer,scheduler=lr_scheduler)
+    update_loss_plots(hloss,loss_epoch)
+    
+  model.eval()
+
+  # compute predictions and labels for all validation data using default masking
+  all_pred,all_labels,all_mask = predict_all(val_dataloader,val_dataset,model,config,train_src_mask)
+
+  # plot comparison between predictions and labels on validation data
+  nplot = min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
+  predv,labelsv,maskv = stackhelper(all_pred,all_labels,all_mask,nplot)
+  if maskv is not None and len(maskv) > 0:
+    maskidx = torch.nonzero(maskv)[:,0]
+  else:
+    maskidx = None
+  fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx)
+
+  # generate an animation of open loop prediction
+  tpred = 2000 + config['contextl']
+
+  # all frames must have real data
+  allisdata = interval_all(valdata['isdata'],contextlpad)
+  isnotsplit = interval_all(valdata['isstart']==False,TPRED)[1:,...]
+  canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
+  flynum = 0
+  t0 = np.nonzero(canstart[:,flynum])[0][360]    
+  # flynum = 2
+  # t0 = np.nonzero(canstart[:,flynum])[0][0]
+  fliespred = np.array([flynum,])
+
+  ani = animate_predict_open_loop(model,val_dataset,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False)
+
+  vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
+  savevidfile = os.path.join(config['savedir'],f"samplevideo_{modeltype_str}_{savetime}_{vidtime}.gif")
+
+  print('Saving animation to file %s...'%savevidfile)
+  writer = animation.PillowWriter(fps=30)
+  ani.save(savevidfile,writer=writer)
+  print('Finished writing.')
+
+if __name__ == "__main__":
+
+  # parse arguments
+  parser = argparse.ArgumentParser()
+  parser.add_argument('-c',type=str,required=True,help='Path to config file',metavar='configfile',dest='configfile')
+  parser.add_argument('-l',type=str,required=False,help='Path to model file to load',metavar='loadmodelfile',dest='loadmodelfile')
+  parser.add_argument('-r',type=str,required=False,help='Path to model file to restart training from',metavar='restartmodelfile',dest='restartmodelfile')
+  args = parser.parse_args()
+
+  main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
