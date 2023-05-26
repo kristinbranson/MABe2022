@@ -18,6 +18,7 @@ import datetime
 import collections
 # import sklearn.preprocessing
 import sklearn.cluster
+import sklearn.decomposition
 import json
 import argparse
 import pathlib
@@ -2096,6 +2097,47 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     Xkp = mabe.feat2kp(Xfeat.T[...,None],scale[...,None])
     return Xkp
   
+  def construct_input(self,obs,movement=None):    
+    
+    # to do: merge this code with getitem so that we don't have to duplicate
+    dtype = obs.dtype
+    
+    if self.input_labels:
+      assert (movement is not None)
+    
+    if self.flatten:
+      xcurr = np.zeros((obs.shape[0],self.ntokens_per_timepoint,self.flatten_dinput),dtype=dtype)
+
+      if self.flatten_obs:
+        for i,v in enumerate(self.flatten_obs_idx.values()):
+          xcurr[:,i,self.flatten_input_type_to_range[i,0]:self.flatten_input_type_to_range[i,1]] = obs[:,v[0]:v[1]]
+      else:
+        xcurr[:,0,:self.flatten_dinput_pertype[0]] = obs
+  
+      if self.input_labels:
+         # movement not set for last time points, will be 0s
+        if self.flatten_labels:
+          for i in range(movement.shape[1]):
+            if i < len(self.discrete_idx):
+              dmovement = self.discretize_nbins
+            else:
+              dmovement = len(self.continuous_idx)
+            inputnum = self.flatten_nobs_types+i
+            xcurr[:-1,inputnum,self.flatten_input_type_to_range[inputnum,0]:self.flatten_input_type_to_range[inputnum,1]] = movement[:,i,:dmovement]
+        else:
+          inputnum = self.flatten_nobs_types
+          xcurr[:-1,inputnum,self.flatten_input_type_to_range[inputnum,0]:self.flatten_input_type_to_range[inputnum,1]] = movement
+      xcurr = np.reshape(xcurr,(xcurr.shape[0]*xcurr.shape[1],xcurr.shape[2]))
+
+    else:
+      if self.input_labels:      
+        xcurr = np.concatenate((movement,obs[1:,...]),axis=-1)
+      else:
+        xcurr = obs
+    
+    
+    return xcurr
+  
   def predict_open_loop(self,Xkp,fliespred,scales,burnin,model,maxcontextl=np.inf,debug=False,need_weights=False):
       """
       Xkp = predict_open_loop(self,Xkp,fliespred,scales,burnin,model,sensory_params,maxcontextl=np.inf,debug=False)
@@ -2181,10 +2223,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           
         zinputscurr = self.zscore_input(rawinputscurr)
         
-        if self.flatten_obs:
-          zinputscurr = self.apply_flatten_input(zinputscurr)
-        elif self.flatten:
-          zinputscurr = zinputscurr[:,None,:]
+        # if self.flatten_obs:
+        #   zinputscurr = self.apply_flatten_input(zinputscurr)
+        # elif self.flatten:
+        #   zinputscurr = zinputscurr[:,None,:]
         if zinputs is None:
           zinputs = np.zeros((tpred,)+zinputscurr.shape[1:]+(nfliespred,),dtype=dtype)
         zinputs[:burnin,...,i] = zinputscurr
@@ -2192,7 +2234,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       if self.ismasked():
         # to do: figure this out for flattened models
         masktype = 'last'
-        dummy = np.zeros((1,example['labels'].shape[-1]))
+        dummy = np.zeros((1,self.d_output))
         dummy[:] = np.nan
       else:
         masktype = None
@@ -2226,17 +2268,24 @@ class FlyMLMDataset(torch.utils.data.Dataset):
             if self.ismasked():
               # to do: figure this out for flattened model
               zmovementin = np.r_[zmovementin,dummy]
-            if self.flatten:
-              xcurr = np.zeros((zinputcurr.shape[0],self.ntokens_per_timepoint,self.flatten_max_dinput),dtype=dtype)
-              xcurr[:,:self.flatten_nobs_types,:] = zinputcurr
-              # movement not set for last time points, will be 0s
-              xcurr[:-1,self.flatten_nobs_types:,:self.flatten_max_doutput] = zmovementin
-              xcurr = np.reshape(xcurr,(xcurr.shape[0]*xcurr.shape[1],xcurr.shape[2]))
-              lastidx = xcurr.shape[0]-self.noutput_tokens_per_timepoint
-            else:
-              xcurr = np.concatenate((zmovementin,zinputcurr[1:,...]),axis=-1)
           else:
-            xcurr = zinputcurr
+            zmovementin = None
+          xcurr = self.construct_input(zinputcurr,movement=zmovementin)
+          
+          # if self.flatten:
+          #     xcurr = np.zeros((zinputcurr.shape[0],self.ntokens_per_timepoint,self.flatten_max_dinput),dtype=dtype)
+          #     xcurr[:,:self.flatten_nobs_types,:] = zinputcurr
+          #     # movement not set for last time points, will be 0s
+          #     xcurr[:-1,self.flatten_nobs_types:,:self.flatten_max_doutput] = zmovementin
+          #     xcurr = np.reshape(xcurr,(xcurr.shape[0]*xcurr.shape[1],xcurr.shape[2]))
+          #     lastidx = xcurr.shape[0]-self.noutput_tokens_per_timepoint
+          #   else:
+          #     xcurr = np.concatenate((zmovementin,zinputcurr[1:,...]),axis=-1)
+          # else:
+          #   xcurr = zinputcurr
+
+          
+            
           xcurr = torch.tensor(xcurr)
           xcurr,_,_ = self.mask_input(xcurr,masktype)
           
@@ -2250,10 +2299,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
               zmovementout_flattened = np.zeros((self.noutput_tokens_per_timepoint,self.flatten_max_doutput),dtype=dtype)
               
               for token in range(self.noutput_tokens_per_timepoint):
-                
+
+                lastidx = xcurr.shape[0]-self.noutput_tokens_per_timepoint
                 masksize = lastidx+token
                 if self.ismasked():
                   net_mask = generate_square_full_mask(masksize).to(device)
+                else:
+                  net_mask = torch.nn.Transformer.generate_square_subsequent_mask(masksize,device=device)
+
                 with torch.no_grad():
                   predtoken = model(xcurr[None,:lastidx+token,...].to(device),mask=net_mask,is_causal=is_causal)
                 if token < len(self.discrete_idx):
@@ -2326,23 +2379,17 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                                           sensory=sensory[[t,],:,i],dim=1)
           else:
             rawinputsnext = relpose[[t,],:,i]
-          zinputsnext = self.zscore_input(rawinputsnext)
-          
-          if self.flatten_obs:
-            zinputsnext = self.apply_flatten_input(zinputsnext)
-          elif self.flatten:
-            zinputsnext = zinputsnext[:,None,:]
-          
+          zinputsnext = self.zscore_input(rawinputsnext)         
           zinputs[t,...,i] = zinputsnext
 
-      if self.flatten:
-        if self.flatten_obs:
-          zinputs_unflattened = np.zeros((zinputs.shape[0],self.dfeat,nfliespred))
-          for i,v in enumerate(self.flatten_obs_idx.values()):
-            zinputs_unflattened[:,v[0]:v[1],:] = zinputs[:,i,:self.flatten_dinput_pertype[i],:]
-          zinputs = zinputs_unflattened
-        else:
-          zinputs = zinputs[:,0,...]
+      # if self.flatten:
+      #   if self.flatten_obs:
+      #     zinputs_unflattened = np.zeros((zinputs.shape[0],self.dfeat,nfliespred))
+      #     for i,v in enumerate(self.flatten_obs_idx.values()):
+      #       zinputs_unflattened[:,v[0]:v[1],:] = zinputs[:,i,:self.flatten_dinput_pertype[i],:]
+      #     zinputs = zinputs_unflattened
+      #   else:
+      #     zinputs = zinputs[:,0,...]
 
       if need_weights:
         return Xkp,zinputs,attn_weights
@@ -3946,17 +3993,19 @@ def compute_loss(model,dataloader,dataset,device,mask,criterion,config):
 def predict_all(dataloader,dataset,model,config,mask):
   
   is_causal = dataset.ismasked() == False
-  if is_causal:
-    mask = None
+  
+  with torch.no_grad():
+    w = next(iter(model.parameters()))
+    device = w.device
+
   
   # compute predictions and labels for all validation data using default masking
   all_pred = []
   all_mask = []
   all_labels = []
   with torch.no_grad():
-    loss = torch.tensor(0.0).to(model.device)
     for example in dataloader:
-      pred = model(example['input'].to(device=model.device),mask=mask,is_causal=is_causal)
+      pred = model(example['input'].to(device=device),mask=mask,is_causal=is_causal)
       if config['modelstatetype'] == 'prob':
         pred = model.maxpred(pred)
       elif config['modelstatetype'] == 'best':
@@ -3992,7 +4041,7 @@ def compute_all_attention_weight_rollouts(attn_weights0):
   attn_context = None
   tpred = attn_weights0[0].size #to do check
   for t,w0 in enumerate(attn_weights0):
-    if w0 is None:
+    if w0 is None: 
       continue
     w = compute_attention_weight_rollout(w0)
     w = w[-1,-1,...]
@@ -4011,16 +4060,15 @@ def compute_all_attention_weight_rollouts(attn_weights0):
   return attn_weights_rollout
 
 
-def animate_predict_open_loop(model,dataset,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False):
+def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False):
   if burnin is None:
     burnin = config['contextl']-1
-  contextlpad = burnin + 1
 
-  Xkp_true = dataset.data['X'][...,t0:t0+tpred,:].copy()
+  Xkp_true = data['X'][...,t0:t0+tpred,:].copy()
   Xkp = Xkp_true.copy()
 
   #fliespred = np.nonzero(mabe.get_real_flies(Xkp))[0]
-  ids = dataset.data['ids'][t0,fliespred]
+  ids = data['ids'][t0,fliespred]
   scales = scale_perfly[:,ids]
 
   model.eval()
@@ -4046,9 +4094,157 @@ def animate_predict_open_loop(model,dataset,scale_perfly,config,fliespred,t0,tpr
   titletexts = {0: 'Initialize', burnin: ''}
 
   ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,config['contextl']-64),
-                    inputs=inputs,contextl=config['training']['contextl']-1,attn_weights=attn_weights)
+                    inputs=inputs,contextl=config['contextl']-1,attn_weights=attn_weights)
   
   return ani
+
+def get_interval_ends(tf):
+  tf = np.r_[False,tf,False]
+  idxstart = np.nonzero((tf[:-1]==False) & (tf[1:] == True))[0]
+  idxend = np.nonzero((tf[:-1]==True) & (tf[1:] == False))[0]
+  return idxstart,idxend
+  
+def split_data_by_id(data):
+  splitdata = []
+  nflies = data['X'].shape[-1]
+  for flynum in range(nflies):
+    isdata = data['isdata'][:,flynum] & (data['isstart'][:,flynum]==False)
+    idxstart,idxend = get_interval_ends(isdata)
+    for i in range(len(idxstart)):
+      i0 = idxstart[i]
+      i1 = idxend[i]
+      id = data['ids'][i0,flynum]
+      if data['isdata'][i0-1,flynum] and data['ids'][i0-1,flynum] == id:
+        i0 -= 1
+      splitdata.append({
+        'flynum': flynum,
+        'id': id,
+        'i0': i0,
+        'i1': i1,
+      })
+  return splitdata
+  
+def explore_representation(configfile):
+
+  config = read_config(configfile)
+
+  np.random.seed(config['numpy_seed'])
+  torch.manual_seed(config['torch_seed'])
+  device = torch.device(config['device'])
+
+  plt.ion()
+  
+  data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
+  splitdata = split_data_by_id(data)
+  
+  
+  for i in range(len(splitdata)):
+    scurr = splitdata[i]
+    fcurr = compute_features(data['X'][...,scurr['i0']:scurr['i1'],:],
+                             scurr['id'],scurr['flynum'],scale_perfly,smush=False,simplify_in='no_sensory')
+    movecurr = fcurr['labels']
+    if i == 0:
+      move = movecurr
+    else:
+      move = np.r_[move,movecurr]
+
+  outnames_global = ['forward','sideways','orientation']
+  outnames = outnames_global + [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+
+  mu = np.nanmean(move,axis=0)
+  sig = np.nanstd(move,axis=0)
+  zmove = (move-mu)/sig
+  
+  # pca = sklearn.decomposition.PCA()
+  # pca.fit(zmove)
+  
+  # fig,ax = plt.subplots(1,1)
+  # fig.set_figheight(12)
+  # fig.set_figwidth(20)
+  # clim = np.max(np.abs(pca.components_))*np.array([-1,1])
+  # him = ax.imshow(pca.components_,aspect='auto',clim=clim,cmap='RdBu')
+  # fig.colorbar(him,ax=ax)
+  # ax.set_xlabel('Movement feature')
+  # ax.set_ylabel('PC')
+  # ax.set_xticks(np.arange(move.shape[1]))
+  # ax.set_xticklabels(outnames)
+  # ax.set_yticks(np.arange(pca.components_.shape[0]))
+  # ax.tick_params(axis='x', labelrotation = 90)
+  # ax.invert_yaxis()
+  # ax.set_title('PCA weights')
+  # fig.tight_layout()
+  
+  # ica = sklearn.decomposition.FastICA(whiten='unit-variance')
+  # ica.fit(zmove)
+  
+  # fig,ax = plt.subplots(1,1)
+  # fig.set_figheight(12)
+  # fig.set_figwidth(20)
+  # clim = np.mean(np.max(ica.components_,axis=1),axis=0)*np.array([-1,1])
+  # him = ax.imshow(ica.components_,aspect='auto',clim=clim,cmap='RdBu')
+  # fig.colorbar(him,ax=ax)
+  # ax.set_xlabel('Movement feature')
+  # ax.set_ylabel('PC')
+  # ax.set_xticks(np.arange(move.shape[1]))
+  # ax.set_xticklabels(outnames)
+  # ax.set_yticks(np.arange(ica.components_.shape[0]))
+  # ax.tick_params(axis='x', labelrotation = 90)
+  # ax.invert_yaxis()
+  # ax.set_title('ICA weights')
+  # fig.tight_layout()
+  
+  
+  # spca = sklearn.decomposition.SparsePCA()
+  # spca.fit(zmove)
+  
+  # fig,ax = plt.subplots(1,1)
+  # fig.set_figheight(12)
+  # fig.set_figwidth(20)
+  # clim = np.max(np.abs(spca.components_))*np.array([-1,1])
+  # him = ax.imshow(spca.components_,aspect='auto',clim=clim,cmap='RdBu')
+  # fig.colorbar(him,ax=ax)
+  # ax.set_xlabel('Movement feature')
+  # ax.set_ylabel('PC')
+  # ax.set_xticks(np.arange(move.shape[1]))
+  # ax.set_xticklabels(outnames)
+  # ax.set_yticks(np.arange(spca.components_.shape[0]))
+  # ax.tick_params(axis='x', labelrotation = 90)
+  # ax.invert_yaxis()
+  # ax.set_title('SPCA weights')
+  # fig.tight_layout()
+
+  bin_edges = np.zeros((nfeatures,config['discretize_nbins']+1))  
+  for feati in range(nfeatures):
+    bin_edges[feati,:] = select_bin_edges(move[:,feati],config['discretize_nbins'],config['all_discretize_epsilon'][feati],feati=feati)
+  
+  featpairs = [
+    ['left_front_leg_tip_angle','left_front_leg_tip_dist'],
+    ['left_middle_femur_base_angle','left_middle_femur_tibia_joint_angle'],
+    ['left_middle_femur_tibia_joint_angle','left_middle_leg_tip_angle'],
+    ]
+  nax = len(featpairs)
+  nc = int(np.ceil(np.sqrt(nax)))
+  nr = int(np.ceil(nax/nc))
+  fig,ax = plt.subplots(nr,nc,squeeze=False)
+  ax = ax.flatten()
+
+  for i in range(len(featpairs)):
+    feati = [outnames.index(x) for x in featpairs[i]]
+    density,_,_ = np.histogram2d(zmove[:,feati[0]],zmove[:,feati[1]],bins=[bin_edges[feati[0],:],bin_edges[feati[1],:]],density=True)
+    ax[i].cla()
+    X, Y = np.meshgrid(bin_edges[feati[0],1:-1],bin_edges[feati[1],1:-1])
+    density = density[1:-1,1:-1]
+    him = ax[i].pcolormesh(X,Y,density, norm=matplotlib.colors.LogNorm(vmin=np.min(density[density>0]), vmax=np.max(density)),edgecolors='k')
+    ax[i].set_xlabel(outnames[feati[0]])
+    ax[i].set_ylabel(outnames[feati[1]])
+  fig.tight_layout()
+
+  # ax[i].plot(move[:,feati[0]],move[:,feati[1]],'.',alpha=.02,markersize=1)
+  
+  
+  valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
+
+
 
 
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
@@ -4198,6 +4394,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     savetime = datetime.datetime.now()
     savetime = savetime.strftime('%Y%m%dT%H%M%S')
     ntimepoints_per_batch = train_dataset.ntimepoints
+    valexample = next(iter(val_dataloader))
     
     for epoch in range(epoch,config['num_train_epochs']):
       
@@ -4224,7 +4421,6 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
         if step % config['niterplot'] == 0:
           
           update_debug_plots(hdebug['train'],config,model,train_dataset,example,pred,name='Train',criterion=criterion)
-          valexample = next(iter(val_dataloader))
           with torch.no_grad():
             valpred = model(valexample['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
           update_debug_plots(hdebug['val'],config,model,val_dataset,valexample,valpred,name='Val',criterion=criterion)
@@ -4309,8 +4505,11 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   tpred = 2000 + config['contextl']
 
   # all frames must have real data
+  
+  burnin = config['contextl']-1
+  contextlpad = burnin + 1
   allisdata = interval_all(valdata['isdata'],contextlpad)
-  isnotsplit = interval_all(valdata['isstart']==False,TPRED)[1:,...]
+  isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
   flynum = 0
   t0 = np.nonzero(canstart[:,flynum])[0][360]    
@@ -4318,7 +4517,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   # t0 = np.nonzero(canstart[:,flynum])[0][0]
   fliespred = np.array([flynum,])
 
-  ani = animate_predict_open_loop(model,val_dataset,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False)
+  ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False)
 
   vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
   savevidfile = os.path.join(config['savedir'],f"samplevideo_{modeltype_str}_{savetime}_{vidtime}.gif")
@@ -4338,3 +4537,4 @@ if __name__ == "__main__":
   args = parser.parse_args()
 
   main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
+  #explore_representation(args.configfile)
