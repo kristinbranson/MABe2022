@@ -550,13 +550,13 @@ def compute_sensory(xeye_main,yeye_main,theta_main,
 
   # distance from center of arena
   # center of arena is assumed to be [0,0]
-  distleg = np.sqrt( xtouch_main**2. + ytouch_main**2 )
+  distarena = np.sqrt( xtouch_main**2. + ytouch_main**2 )
 
   # height of chamber 
-  wall_touch = np.zeros(distleg.shape)
+  wall_touch = np.zeros(distarena.shape)
   wall_touch[:] = SENSORY_PARAMS['arena_height']
-  wall_touch = np.minimum(SENSORY_PARAMS['arena_height'],np.maximum(0.,SENSORY_PARAMS['arena_height'] - (distleg-SENSORY_PARAMS['inner_arena_radius'])*SENSORY_PARAMS['arena_height']/(SENSORY_PARAMS['outer_arena_radius']-SENSORY_PARAMS['inner_arena_radius'])))
-  wall_touch[distleg >= SENSORY_PARAMS['outer_arena_radius']] = 0.
+  wall_touch = np.minimum(SENSORY_PARAMS['arena_height'],np.maximum(0.,SENSORY_PARAMS['arena_height'] - (distarena-SENSORY_PARAMS['inner_arena_radius'])*SENSORY_PARAMS['arena_height']/(SENSORY_PARAMS['outer_arena_radius']-SENSORY_PARAMS['inner_arena_radius'])))
+  wall_touch[distarena >= SENSORY_PARAMS['outer_arena_radius']] = 0.
   
   # t = 0
   # debug_plot_wall_touch(t,xlegtip_main,ylegtip_main,distleg,wall_touch,params)
@@ -1045,7 +1045,7 @@ def compute_otherflies_touch_mult(data,prct=99):
   # X will be nkpts x 2 x N
   X = data['X'].reshape([nkpts,2,T*nflies])[:,:,data['isdata'].flatten()]
   # maximum distance from some keypoint to any keypoint included in kpother
-  d = np.sqrt(np.max(np.min(np.sum((X[None,:,:,:] - X[kpvision_other,None,:,:])**2.,axis=2),axis=0),axis=0))
+  d = np.sqrt(np.nanmax(np.nanmin(np.sum((X[None,kptouch,:,:] - X[kptouch_other,None,:,:])**2.,axis=2),axis=0),axis=0))
   maxd = np.percentile(d,prct)
 
   otherflies_touch_mult = 1./((maxd)**SENSORY_PARAMS['otherflies_touch_exp'])
@@ -1184,10 +1184,14 @@ def to_size(sz):
   return sz
 
 def weighted_sample(w):
+  SMALLNUM = 1e-6
+  assert(torch.all(w>=0.))
   nbins = w.shape[-1]
   szrest = w.shape[:-1]
   n = int(np.prod(szrest))
   p = torch.cumsum(w.reshape((n,nbins)),dim=-1)
+  assert(torch.all(torch.abs(p[:,-1]-1)<=SMALLNUM))
+  p[p>1.] = 1.
   p[:,-1] = 1.
   r = torch.rand(n,device=w.device)
   s = torch.zeros(p.shape,dtype=w.dtype,device=w.device)
@@ -1421,8 +1425,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def ntimepoints(self):
     # number of time points
     n = self.data[0]['input'].shape[-2]
-    if not (self.flatten_labels or self.flatten_obs) and not self.ismasked():
-      n -= 1
+    #if not (self.flatten_labels or self.flatten_obs) and not self.ismasked():
+    #  n -= 1
     return n
 
   @property
@@ -2347,7 +2351,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                   # masked: movement from 0->1, ..., t->t+1
                   # causal: movement from 1->2, ..., t->t+1
                   # last prediction: t->t+1
-                  pred = model(xcurr[None,...].to(device),mask=net_mask,is_causal=is_causal)
+                  pred = model.output(xcurr[None,...].to(device),mask=net_mask,is_causal=is_causal)
               if model.model_type == 'TransformerBestState' or model.model_type == 'TransformerState':
                 pred = model.randpred(pred)
               # z-scored movement from t to t+1
@@ -2540,8 +2544,6 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           
     if self.discretize:
       # should be ... x d_output_discrete x discretize_nbins
-      if ispred:
-        labels_discrete = torch.softmax(labels_discrete,dim=-1)
       sz = labels_discrete.shape
       newsz = sz[:-2]+(self.d_output,)
       labels = torch.zeros(newsz,dtype=labels_discrete.dtype)
@@ -2976,6 +2978,8 @@ class TransformerModel(torch.nn.Module):
     for layer in self.transformer_encoder.layers:
       layer.set_need_weights(need_weights)
 
+  def output(self,*args,**kwargs):
+    return self.forward(*args,**kwargs)
 
 class TransformerMixedModel(TransformerModel):
   
@@ -2988,11 +2992,16 @@ class TransformerMixedModel(TransformerModel):
     d_output = d_output_continuous + d_output_discrete*nbins
     super().__init__(d_input,d_output,**kwargs)
     
-  def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None, is_causal: bool = False) -> dict:
-    output_all = super().forward(src,mask=src_mask,is_causal=is_causal)
+  def forward(self, src: torch.Tensor, mask: torch.Tensor = None, is_causal: bool = False) -> dict:
+    output_all = super().forward(src,mask=mask,is_causal=is_causal)
     output_continuous = output_all[...,:self.d_output_continuous]
     output_discrete = output_all[...,self.d_output_continuous:].reshape(output_all.shape[:-1]+(self.d_output_discrete,self.nbins))
     return {'continuous': output_continuous, 'discrete': output_discrete}
+  
+  def output(self,*args,**kwargs):
+    output = self.forward(*args,**kwargs)
+    output['discrete'] = torch.softmax(output['discrete'],dim=-1)
+    return output
   
 def generate_square_full_mask(sz: int) -> torch.Tensor:
   """
@@ -3021,7 +3030,7 @@ def get_output_and_attention_weights(model, inputs, mask=None, is_causal=False):
 
   # call the model
   with torch.no_grad():
-    output = model(inputs, mask=mask, is_causal=is_causal)
+    output = model.output(inputs, mask=mask, is_causal=is_causal)
   
   # remove the hooks    
   for hook in hooks:
@@ -3433,7 +3442,7 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
                  figsizebase=11,ms=6,lw=1,focus_ms=12,focus_lw=3,
                  titletexts={},savevidfile=None,fps=30,trel0=0,
                  inputs=None,nstd_input=3,contextl=10,axinput=None,
-                 attn_weights=None):
+                 attn_weights=None,skeledgecolors=None):
 
   plotinput = inputs is not None and len(inputs) > 0
 
@@ -3538,7 +3547,7 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
     titletext_str = ''
 
   for i,k in enumerate(Xkps):
-    hkpt,hedge,_,_,_ = mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[i],kpt_ms=ms,skel_lw=lw)
+    hkpt,hedge,_,_,_ = mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[i],kpt_ms=ms,skel_lw=lw,skeledgecolors='tab20')
     for j in focusflies:
       hkpt[j].set_markersize(focus_ms)
       hedge[j].set_linewidth(focus_lw)
@@ -3667,8 +3676,11 @@ def read_config(jsonfile):
       config['discreteidx'] = featglobal.copy()
     else:
       raise ValueError(f"Unknown type {config['discreteidx']} for discreteidx")
-    if type(config['discreteidx']) == list:
-     config['discreteidx'] = np.array(config['discreteidx'])
+  if type(config['discreteidx']) == list:
+    for i,v in enumerate(config['discreteidx']):
+      if type(v) == str:
+        config['discreteidx'][i] = mabe.posenames.index(v)
+    config['discreteidx'] = np.array(config['discreteidx'])
     
   if config['modelstatetype'] == 'prob' and config['minstateprob'] is None:
     config['minstateprob'] = 1/config['nstates']
@@ -4005,7 +4017,7 @@ def predict_all(dataloader,dataset,model,config,mask):
   all_labels = []
   with torch.no_grad():
     for example in dataloader:
-      pred = model(example['input'].to(device=device),mask=mask,is_causal=is_causal)
+      pred = model.output(example['input'].to(device=device),mask=mask,is_causal=is_causal)
       if config['modelstatetype'] == 'prob':
         pred = model.maxpred(pred)
       elif config['modelstatetype'] == 'best':
@@ -4244,8 +4256,40 @@ def explore_representation(configfile):
   
   valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
 
-
-
+def clean_intermediate_results(savedir):
+  modelfiles = list(pathlib.Path(savedir).glob('*.pth'))
+  modelfilenames = [p.name for p in modelfiles]
+  p = re.compile('^(?P<prefix>.+)_epoch(?P<epoch>\d+)_(?P<suffix>.*).pth$')
+  m = [p.match(n) for n in modelfilenames]
+  ids = np.array([x.group('prefix')+'___'+x.group('suffix') for x in m])
+  epochs = np.array([int(x.group('epoch')) for x in m])
+  uniqueids,idx = np.unique(ids,return_inverse=True)
+  removed = []
+  nremoved = 0
+  for i,id in enumerate(uniqueids):
+    idxcurr = np.nonzero(ids==id)[0]
+    if len(idxcurr) <= 1:
+      continue
+    j = idxcurr[np.argmax(epochs[idxcurr])]
+    idxremove = idxcurr[epochs[idxcurr]<epochs[j]]
+    while True:
+      print(f'Keep {modelfilenames[j]} and remove the following files:')
+      for k in idxremove:
+        print(f'Remove {modelfilenames[k]}')
+      r = input('(y/n) ?  ')
+      if r == 'y':
+        for k in idxremove:
+          print(f'Removing {modelfiles[k]}')
+          os.remove(modelfiles[k])
+          removed.append(modelfiles[k])
+          nremoved += 1
+        break
+      elif r == 'n':
+        break
+      else:
+        print('Bad input, response must be y or n')
+  print(f'Removed {nremoved} files')
+  return removed
 
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
@@ -4461,7 +4505,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
       else:
         loss_epoch['val'][epoch] = \
           compute_loss(model,val_dataloader,val_dataset,device,train_src_mask,criterion,config)
-      last_val_loss = loss_epoch['val'][epoch]
+      last_val_loss = loss_epoch['val'][epoch].item()
     
       update_loss_plots(hloss,loss_epoch)
       plt.pause(.01)
@@ -4512,7 +4556,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
   flynum = 0
-  t0 = np.nonzero(canstart[:,flynum])[0][360]    
+  t0 = np.nonzero(canstart[:,flynum])[0][450]    
   # flynum = 2
   # t0 = np.nonzero(canstart[:,flynum])[0][0]
   fliespred = np.array([flynum,])
@@ -4534,7 +4578,12 @@ if __name__ == "__main__":
   parser.add_argument('-c',type=str,required=True,help='Path to config file',metavar='configfile',dest='configfile')
   parser.add_argument('-l',type=str,required=False,help='Path to model file to load',metavar='loadmodelfile',dest='loadmodelfile')
   parser.add_argument('-r',type=str,required=False,help='Path to model file to restart training from',metavar='restartmodelfile',dest='restartmodelfile')
+  parser.add_argument('--clean',type=str,required=False,help='Delete intermediate networks saved in input directory.',metavar='cleandir',dest='cleandir')
   args = parser.parse_args()
 
-  main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
+  if args.cleandir is not None:
+    assert os.path.isdir(args.cleandir)      
+    removedfiles = clean_intermediate_results(args.cleandir)
+  else:
+    main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
   #explore_representation(args.configfile)

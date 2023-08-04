@@ -11,7 +11,7 @@ import os
 from torch.utils.data import Dataset, DataLoader
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib import cm,animation,colors
+from matplotlib import cm,animation,colors,collections
 import copy
 import tqdm
 from itertools import compress
@@ -1171,6 +1171,18 @@ def set_fig_ax(fig=None,ax=None):
     isnewaxis = False
   return fig, ax, isnewaxis
 
+def get_n_colors_from_colormap(colormapname,n):
+  # Get the colormap from matplotlib
+  colormap = plt.cm.get_cmap(colormapname)
+
+  # Generate a range of values from 0 to 1
+  values = np.linspace(0, 1, n)
+
+  # Get 'n' colors from the colormap
+  colors = colormap(values)
+
+  return colors
+
 """
 hkpt,hedge,htext,fig,ax = plot_fly(pose=None, kptidx=None, skelidx=None,
                                   fig=None, ax=None, kptcolors=None, color=None, name=None,
@@ -1195,7 +1207,7 @@ hkpt: Optional. Handle of keypoints to update instead of plot new key points. De
 """
 def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax=None, kptcolors=None, color=None, name=None,
              plotskel=True, plotkpts=True, hedge=None, hkpt=None, textlabels=None, htxt=None, kpt_ms=6, skel_lw=1,
-             kpt_alpha=1.,skel_alpha=1.):
+             kpt_alpha=1.,skel_alpha=1., skeledgecolors=None):
   # plot_fly(x,fig=None,ax=None,kptcolors=None):
   # x is nfeatures x 2
   assert(pose is not None)
@@ -1257,20 +1269,28 @@ def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax
   if plotskel:
     nedges = skelidx.shape[0]
     if isreal:
-      xc = np.concatenate((pose[skelidx,0],np.zeros((nedges,1))+np.nan),axis=1)
-      yc = np.concatenate((pose[skelidx,1],np.zeros((nedges,1))+np.nan),axis=1)
+      segments = pose[skelidx,:]
+      #xc = np.concatenate((pose[skelidx,0],np.zeros((nedges,1))+np.nan),axis=1)
+      #yc = np.concatenate((pose[skelidx,1],np.zeros((nedges,1))+np.nan),axis=1)
     else:
-      xc = np.array([])
-      yc = np.array([])
+      segments = np.zeros((nedges,2))+np.nan
+      #xc = np.array([])
+      #yc = np.array([])
     if hedge is None:
-      edgename = 'skeleton'
-      if name is not None:
-        edgename = name + ' ' + edgename
       if color is None:
         color = [.6,.6,.6]
-      hedge = ax.plot(xc.flatten(),yc.flatten(),'-',color=color,label=edgename,zorder=0,lw=skel_lw,alpha=skel_alpha)[0]
+      if type(color) == str:
+        color = get_n_colors_from_colormap(color,nedges)
+      
+      hedge = collections.LineCollection(pose[skelidx,:],colors=color,linewidths=skel_lw,alpha=skel_alpha)
+      ax.add_collection(hedge)
+      #edgename = 'skeleton'
+      #if name is not None:
+      #  edgename = name + ' ' + edgename
+      #hedge = ax.plot(xc.flatten(),yc.flatten(),'-',color=color,label=edgename,zorder=0,lw=skel_lw,alpha=skel_alpha)[0]
     else:
-      hedge.set_data(xc.flatten(),yc.flatten())
+      hedge.set_segments(segments)
+      #hedge.set_data(xc.flatten(),yc.flatten())
 
   if isnewaxis:
     ax.axis('equal')
@@ -1297,15 +1317,15 @@ hkpts: Optional. List of handles of keypoints, one per fly,  to update instead o
 Default: None.
 Extra arguments: All other arguments will be passed directly to plot_fly.
 """
-def plot_flies(poses=None,fig=None,ax=None,colors=None,kptcolors=None,hedges=None,hkpts=None,htxt=None,textlabels=None,**kwargs):
+def plot_flies(poses=None,fig=None,ax=None,colors=None,kptcolors=None,hedges=None,hkpts=None,htxt=None,textlabels=None,skeledgecolors=None,**kwargs):
 
   fig,ax,isnewaxis = set_fig_ax(fig=fig,ax=ax)
-  if colors is None:
+  if colors is None and skeledgecolors is None:
     colors = get_Dark3_cmap()
   if kptcolors is None:
     kptcolors = [0,0,0]
   nflies = poses.shape[-1]
-  if not (type(colors) == list or type(colors) == np.ndarray):
+  if colors is not None and (not (type(colors) == list or type(colors) == np.ndarray)):
     if type(colors) == str:
       cmap = cm.get_cmap(colors)
     else:
@@ -1324,7 +1344,11 @@ def plot_flies(poses=None,fig=None,ax=None,colors=None,kptcolors=None,hedges=Non
   for fly in range(nflies):
     if not (textlabels is None or (textlabels == 'keypoints')):
       textlabels1 = '%d'%fly
-    hkpts[fly],hedges[fly],htxt[fly],fig,ax = plot_fly(poses[...,fly],fig=fig,ax=ax,color=colors[fly,...],
+    if skeledgecolors is not None:
+      colorcurr = skeledgecolors
+    else:
+      colorcurr = colors[fly,...]
+    hkpts[fly],hedges[fly],htxt[fly],fig,ax = plot_fly(poses[...,fly],fig=fig,ax=ax,color=colorcurr,
                                                kptcolors=kptcolors,hedge=hedges[fly],hkpt=hkpts[fly],
                                                htxt=htxt,textlabels=textlabels1,**kwargs)
     

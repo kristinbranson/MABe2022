@@ -20,6 +20,9 @@
     "simplify_out": null,
     "simplify_in": null,
 
+    "_comment_compute_sensory_diffs": "whether to compute sensory diffs as additional inputs",
+    "compute_sensory_diffs": false,
+
     "_comment_input_labels": "whether labels are inputs",
     "input_labels": true,
 
