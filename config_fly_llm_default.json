@@ -111,6 +111,9 @@
     "minstateprob": null,
 
     "_comment_niterplot": "how often (in training iterations) to plot debugging plots",
-    "niterplot": 64
+    "niterplot": 64,
+
+    "_comment_model_nickname": "nickname used when saving files related to this model",
+    "model_nickname": null
 }
 

@@ -65,7 +65,7 @@ SENSORY_PARAMS = {
   'touch_other_kpnames': touch_other_kpnames_v1,
   'compute_otherflies_touch': True,
   'otherflies_touch_exp': 1.3,
-  'otherflies_touch_mult': np.nan,
+  'otherflies_touch_mult': 0.3110326159171111, # set 20230807 based on courtship male data
 }
 SENSORY_PARAMS['otherflies_vision_mult'] = 1./((2.*mabe.ARENA_RADIUS_MM)**SENSORY_PARAMS['otherflies_vision_exp'])
 
@@ -1425,8 +1425,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def ntimepoints(self):
     # number of time points
     n = self.data[0]['input'].shape[-2]
-    #if not (self.flatten_labels or self.flatten_obs) and not self.ismasked():
-    #  n -= 1
+    if self.input_labels and not (self.flatten_labels or self.flatten_obs) and not self.ismasked():
+      n -= 1
     return n
 
   @property
@@ -3067,6 +3067,7 @@ def save_model(savefile,model,lr_optimizer=None,scheduler=None,loss=None,config=
     tosave['loss'] = loss
   if config is not None:
     tosave['config'] = config
+  tosave['SENSORY_PARAMS'] = SENSORY_PARAMS
   torch.save(tosave,savefile)
   return
 
@@ -3079,8 +3080,8 @@ def load_model(loadfile,model,device,lr_optimizer=None,scheduler=None,config=Non
     lr_optimizer.load_state_dict(state['lr_optimizer'])
   if scheduler is not None and ('scheduler' in state):
     scheduler.load_state_dict(state['scheduler'])
-  if config is not None and 'config' in state:
-    overwrite_config(config,state['config'])
+  if config is not None:
+    load_config_from_model_file(config=config,state=state)
       
   loss = {}
   if 'loss' in state:
@@ -3093,13 +3094,27 @@ def load_model(loadfile,model,device,lr_optimizer=None,scheduler=None,config=Non
         loss['val'] = state['val_loss']
   return loss
 
-def load_config_from_model_file(loadmodelfile,config):
-  print(f'Loading config from file {loadmodelfile}...')
-  state = torch.load(loadmodelfile)
-  if 'config' in state:
-    overwrite_config(config,state['config'])
+def load_config_from_model_file(loadmodelfile=None,config=None,state=None,no_overwrite=[]):
+  if state is None:
+    assert loadmodelfile is not None
+    print(f'Loading config from file {loadmodelfile}...')
+    state = torch.load(loadmodelfile)
+  if config is not None and 'config' in state:
+    overwrite_config(config,state['config'],no_overwrite=no_overwrite)
   else:
     print(f'config not stored in model file {loadmodelfile}')
+  if 'SENSORY_PARAMS' in state:
+    for k,v in state['SENSORY_PARAMS'].items():
+      SENSORY_PARAMS[k] = v
+  else:
+    print(f'SENSORY_PARAMS not stored in model file {loadmodelfile}')
+  return
+
+def update_loss_nepochs(loss_epoch,nepochs):
+  for k,v in loss_epoch.items():
+    if v.numel() < nepochs:
+      n = torch.zeros(nepochs-v.numel(),dtype=v.dtype,device=v.device)+torch.nan
+      loss_epoch[k] = torch.cat((v,n))      
   return
 
 
@@ -3209,9 +3224,15 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
     for featii in range(len(train_dataset.discrete_idx)):
       feati = train_dataset.discrete_idx[featii]
       im = np.ones((train_dataset.discretize_nbins,contextl,3))
-      im[:,:,0] = 1.-zmovement_discrete_true[:,featii,:].cpu().T
+      ztrue = zmovement_discrete_true[:,featii,:].cpu().T
+      ztrue = ztrue - torch.min(ztrue)
+      ztrue = ztrue / torch.max(ztrue)
+      im[:,:,0] = 1.-ztrue
       if pred is not None:
-        im[:,:,1] = 1.-zmovement_discrete_pred[:,featii,:].detach().cpu().T
+        zpred = zmovement_discrete_pred[:,featii,:].detach().cpu().T
+        zpred = zpred - torch.min(zpred)
+        zpred = zpred / torch.max(zpred)
+        im[:,:,1] = 1.-zpred
       ax[i].imshow(im,extent=(0,contextl,(feati-.5)*mult,(feati+.5)*mult),origin='lower',aspect='auto')
       
     for featii in range(len(train_dataset.continuous_idx)):
@@ -3340,6 +3361,14 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
     for key in h.keys():
       if len(h[key]) <= i:
         h[key].append([None,]*ntsplot)
+        
+    minxy = np.nanmin(np.nanmin(Xkp_true[:,:,tsplot],axis=0),axis=-1)
+    maxxy = np.nanmax(np.nanmax(Xkp_true[:,:,tsplot],axis=0),axis=-1)
+    if Xkp_pred is not None:
+      minxy_pred = np.nanmin(np.nanmin(Xkp_pred[:,:,tsplot],axis=0),axis=-1)
+      maxxy_pred = np.nanmax(np.nanmax(Xkp_pred[:,:,tsplot],axis=0),axis=-1)
+      minxy = np.minimum(minxy,minxy_pred)
+      maxxy = np.maximum(maxxy,maxxy_pred)    
     for j in range(ntsplot):
       tplot = tsplot[j]
       ax[i,j].set_title(f't = {tplot}, sample = {iplot}')
@@ -3351,8 +3380,15 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
                                                               skel_lw=1,color=[0,1,1],
                                                               ax=ax[i,j],hkpt=h['kpt1'][i][j],hedge=h['edge1'][i][j])      
       ax[i,j].set_aspect('equal')
-      ax[i,j].relim()
-      ax[i,j].autoscale()
+      # minxy = np.nanmin(Xkp_true[:,:,tplot],axis=0)
+      # maxxy = np.nanmax(Xkp_true[:,:,tplot],axis=0)
+      # if Xkp_pred is not None:
+      #   minxy_pred = np.nanmin(Xkp_pred[:,:,tplot],axis=0)
+      #   maxxy_pred = np.nanmax(Xkp_pred[:,:,tplot],axis=0)
+      #   minxy = np.minimum(minxy,minxy_pred)
+      #   maxxy = np.maximum(maxxy,maxxy_pred)
+      ax[i,j].set_xlim([minxy[0],maxxy[0]])
+      ax[i,j].set_ylim([minxy[1],maxxy[1]])
 
   return h,ax,fig
 
@@ -3694,10 +3730,13 @@ def read_config(jsonfile):
   
   return config
     
-def overwrite_config(config0,config1):
+def overwrite_config(config0,config1,no_overwrite=[]):
+  # maybe fix: no_overwrite is just a list of parameter names. this may fail in recursive calls
   for k,v in config1.items():
+    if k in no_overwrite:
+      continue
     if k in config0 and type(v) == dict:
-      overwrite_config(config0[k],config1[k])
+      overwrite_config(config0[k],config1[k],no_overwrite=no_overwrite)
     else:
       config0[k] = v
   return
@@ -4302,7 +4341,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   if loadmodelfile is not None:
     load_config_from_model_file(loadmodelfile,config)
   elif restartmodelfile is not None:
-    load_config_from_model_file(restartmodelfile,config)
+    no_overwrite = ['num_train_epochs',]
+    load_config_from_model_file(restartmodelfile,config,no_overwrite=no_overwrite)
   
   print(f"batch size = {config['batch_size']}")
 
@@ -4413,9 +4453,10 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     raise
 
   modeltype_str = get_modeltype_str(config,train_dataset)
+  if ('model_nickname' in config) and (config['model_nickname'] is not None):
+    modeltype_str = config['model_nickname']
 
   hloss = initialize_loss_plots(loss_epoch)
-  
   
   # epoch = 40
   # restartmodelfile = f'llmnets/flyclm_flattened_mixed_71G01_male_epoch{epoch}_20230517T153613.pth'
@@ -4430,8 +4471,11 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     # restart training
     if restartmodelfile is not None:
       loss_epoch = load_model(restartmodelfile,model,device,lr_optimizer=optimizer,scheduler=lr_scheduler)
+      update_loss_nepochs(loss_epoch,config['num_train_epochs'])
+      update_loss_plots(hloss,loss_epoch)
       #loss_epoch = {k: v.cpu() for k,v in loss_epoch.items()}
       epoch = np.nonzero(np.isnan(loss_epoch['train'].cpu().numpy()))[0][0]
+      progress_bar.update(epoch*ntrain)
     else:
       epoch = 0
     
@@ -4464,11 +4508,13 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
         if step % config['niterplot'] == 0:
           
-          update_debug_plots(hdebug['train'],config,model,train_dataset,example,pred,name='Train',criterion=criterion)
           with torch.no_grad():
-            valpred = model(valexample['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+            trainpred = model.output(example['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+            valpred = model.output(valexample['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
+          update_debug_plots(hdebug['train'],config,model,train_dataset,example,trainpred,name='Train',criterion=criterion)
           update_debug_plots(hdebug['val'],config,model,val_dataset,valexample,valpred,name='Val',criterion=criterion)
-          plt.pause(.01)
+          plt.show()
+          plt.pause(.1)
 
         tr_loss_step = loss.detach()
         tr_loss += tr_loss_step
@@ -4508,7 +4554,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
       last_val_loss = loss_epoch['val'][epoch].item()
     
       update_loss_plots(hloss,loss_epoch)
-      plt.pause(.01)
+      plt.show()
+      plt.pause(.1)
 
       # rechunk the training data
       print(f'Rechunking data after epoch {epoch}')
@@ -4556,11 +4603,14 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
   flynum = 0
-  t0 = np.nonzero(canstart[:,flynum])[0][450]    
+  t0 = np.nonzero(canstart[:,flynum])[0][390]    
   # flynum = 2
   # t0 = np.nonzero(canstart[:,flynum])[0][0]
   fliespred = np.array([flynum,])
 
+  randstate_np = np.random.get_state()
+  randstate_torch = torch.random.get_rng_state()
+  
   ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False)
 
   vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
