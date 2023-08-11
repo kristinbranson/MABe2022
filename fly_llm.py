@@ -86,7 +86,9 @@ def load_raw_npz_data(infile):
   data = {}
   with np.load(infile) as data1:
     for key in data1:
+      print(f'loading {key}')
       data[key] = data1[key]
+  print('data loaded')
     
   maxnflies = data['ids'].shape[1]
   # ids start at 1, make them start at 0
@@ -756,21 +758,31 @@ nkptouch_other = len(kptouch_other)
 narena = 2**10
 theta_arena = np.linspace(-np.pi,np.pi,narena+1)[:-1]
 
-def get_sensory_feature_idx(simplify=None):
+def get_sensory_feature_shapes(simplify=None):
   idx = collections.OrderedDict()
+  sz = collections.OrderedDict()
   i0 = 0
   i1 = nrelative
   idx['pose'] = [i0,i1]
+  sz['pose'] = (nrelative,)
+  
   if simplify is None:
     i0 = i1
     i1 = i0+nkptouch
     idx['wall_touch'] = [i0,i1]
+    sz['wall_touch'] = (nkptouch,)
     i0 = i1
     i1 = i0 + SENSORY_PARAMS['n_oma']
     idx['otherflies_vision'] = [i0,i1]
+    sz['otherflies_vision'] = (SENSORY_PARAMS['n_oma'],)
     i0 = i1
     i1 = i0 + nkptouch*nkptouch_other
     idx['otherflies_touch'] = [i0,i1]
+    sz['otherflies_touch'] = (nkptouch*nkptouch_other,)
+  return idx,sz
+
+def get_sensory_feature_idx(simplify=None):
+  idx,_ = get_sensory_feature_shapes()
   return idx
 
 def split_features(X,simplify=None,axis=-1):
@@ -779,6 +791,20 @@ def split_features(X,simplify=None,axis=-1):
   for k,v in idx.items():
     res[k] = X.take(range(v[0],v[1]),axis=axis)
 
+  return res
+
+def unpack_input(input,featidx,sz,dim=-1):
+  
+  res = {}
+  idx = [slice(None),]*input.ndim
+  sz0 = input.shape
+  if dim < 0:
+    dim = input.ndim+dim
+  for k,v in featidx.items():
+    idx[dim] = slice(v[0],v[1])
+    newsz = sz0[:dim] + sz[k] + sz0[dim+1:]
+    res[k] = input[idx].reshape(newsz)
+  
   return res
 
 def combine_relative_global(Xrelative,Xglobal):
@@ -1752,6 +1778,22 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       input = apply_mask(input,None)
     
     return input,mask,dropout_mask
+  
+  def get_input_shapes(self):
+    idx,sz = get_sensory_feature_shapes(self.simplify_in)
+    if self.input_labels:
+      for k,v in idx.items():
+        idx[k] = [x + self.d_input_labels for x in v]
+      idx['labels'] = [0,self.d_input_labels]
+      sz['labels'] = (self.d_input_labels,)
+    return idx,sz
+
+  def unpack_input(self,input,dim=-1):
+    
+    idx,sz = self.get_input_shapes()
+    res = unpack_input(input,idx,sz,dim=dim)
+    
+    return res
     
   def input2pose(self,input):
     """
@@ -2916,9 +2958,25 @@ class TransformerModel(torch.nn.Module):
   def __init__(self, d_input: int, d_output: int,
                d_model: int = 2048, nhead: int = 8, d_hid: int = 512,
                nlayers: int = 12, dropout: float = 0.1,
-               ntokens_per_timepoint: int =1):
+               ntokens_per_timepoint: int = 1,
+               input_idx = None, input_szs = None, embedding_types = None, embedding_params = None,
+               d_output_discrete = None, nbins = None,
+               ):
     super().__init__()
     self.model_type = 'Transformer'
+
+    self.obs_embedding = (input_idx is not None)
+    if self.obs_embedding:
+      assert input_szs is not None
+      assert embedding_types is not None
+      assert embedding_params is not None
+
+    self.is_mixed = nbins is not None
+    if self.is_mixed:
+      self.d_output_continuous = d_output
+      self.d_output_discrete = d_output_discrete
+      self.nbins = nbins
+      d_output = self.d_output_continuous + self.d_output_discrete*self.nbins
 
     # frequency-based representation of word position with dropout
     self.pos_encoder = PositionalEncoding(d_model,dropout,ntokens_per_timepoint=ntokens_per_timepoint)
@@ -2936,7 +2994,30 @@ class TransformerModel(torch.nn.Module):
 
     # encoder and decoder are currently not tied together, but maybe they should be? 
     # fully-connected layer from input size to d_model
-    self.encoder = torch.nn.Linear(d_input,d_model)
+    
+    if self.obs_embedding:
+      self.input_idx = input_idx
+      self.input_szs = input_szs
+      self.encoder_dict = torch.nn.ModuleDict()
+      for k,emb in embedding_types.items():
+        szcurr = input_szs[k]
+        if emb == 'conv1d':
+          if len(szcurr) < 2:
+            input_channels = 1
+          else:
+            input_channels = szcurr[1]
+          channels = [input_channels,]+embedding_params[k]['channels']
+          params = {k1:v for k1,v in embedding_params[k].items() if k1 != 'channels'}
+          encodercurr = ResNet1d(channels,d_model,d_input=szcurr[0],**params)
+        elif emb == 'fc':
+          encodercurr = torch.nn.Linear(szcurr[0],d_model)
+        else:
+          # consider adding graph networks
+          raise ValueError(f'Unknown embedding type {emb}')
+        self.encoder_dict[k] = encodercurr
+      self.encoder = DictSum(self.encoder_dict)
+    else:
+      self.encoder = torch.nn.Linear(d_input,d_model)
 
     # fully-connected layer from d_model to input size
     self.decoder = torch.nn.Linear(d_model,d_output)
@@ -2958,6 +3039,9 @@ class TransformerModel(torch.nn.Module):
       output Tensor of shape [seq_len, batch_size, ntoken]
     """
 
+    if self.obs_embedding:
+      src = unpack_input(src,self.input_idx,self.input_szs)
+
     # project input into d_model space, multiple by sqrt(d_model) for reasons?
     src = self.encoder(src) * math.sqrt(self.d_model)
 
@@ -2971,6 +3055,11 @@ class TransformerModel(torch.nn.Module):
 
     # project back to d_input space
     output = self.decoder(output)
+    
+    if self.is_mixed:
+      output_continuous = output[...,:self.d_output_continuous]
+      output_discrete = output[...,self.d_output_continuous:].reshape(output.shape[:-1]+(self.d_output_discrete,self.nbins))
+      output = {'continuous': output_continuous, 'discrete': output_discrete}
 
     return output
   
@@ -2979,17 +3068,108 @@ class TransformerModel(torch.nn.Module):
       layer.set_need_weights(need_weights)
 
   def output(self,*args,**kwargs):
-    return self.forward(*args,**kwargs)
+    
+    output = self.forward(*args,**kwargs)
+    if self.is_mixed:
+      output['discrete'] = torch.softmax(output['discrete'],dim=-1)
+    
+    return output
+  
+class ResidualBlock1d(torch.nn.Module):
+  
+  def __init__(self, in_channels, out_channels, stride = 1, padding_mode='zeros'):
+    super().__init__()
+    
+    self.padding = 1
+    self.kernel_size = 3
+    self.stride = stride
+    self.dilation = 1
+    self.conv1 = torch.nn.Sequential(
+      torch.nn.Conv1d(in_channels, out_channels, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
+      torch.nn.BatchNorm1d(out_channels),
+      torch.nn.ReLU()
+    )
+    self.conv2 = torch.nn.Sequential(
+      torch.nn.Conv1d(out_channels, out_channels, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode=padding_mode),
+      torch.nn.BatchNorm1d(out_channels)
+    )
+    if (in_channels != out_channels) or (self.stride > 1):
+      self.downsample = torch.nn.Sequential(
+        torch.nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=False),
+        torch.nn.BatchNorm1d(out_channels)
+      )
+    else:
+      self.downsample = None
+    self.relu = torch.nn.ReLU()
+    self.out_channels = out_channels
+      
+  def forward(self, x):
+    identity = x
+    out = self.conv1(x)
+    out = self.conv2(out)
+    if self.downsample:
+      identity = self.downsample(x)
+    out += identity
+    out = self.relu(out)
+    return out
+  
+  def compute_output_shape(self,din):
+    dout = np.floor((din-1) / self.stride)+1
+    sz = (int(dout),self.out_channels)
+    return sz
+  
+class ResNet1d(torch.nn.Module):
+  def __init__(self,channels,d_output,d_input=None,**kwargs):
+    super().__init__()
+    self.channels = channels
+    self.d_output = d_output
+    nblocks = len(channels)-1
+    self.layers = torch.nn.ModuleList()
+    sz = (d_input,)
+    for i in range(nblocks):
+      self.layers.append(ResidualBlock1d(channels[i],channels[i+1],**kwargs))
+      if d_input is not None:
+        sz = self.layers[-1].compute_output_shape(sz[0])
+    if d_input is None:
+      self.avg_pool = torch.nn.AdaptiveAvgPool1d(1)
+      self.fc = torch.nn.Linear(channels[-1],d_output)
+    else:
+      self.avg_pool = None
+      self.fc = torch.nn.Linear(int(np.prod(sz)),d_output)
+  def forward(self,x):
+    sz0 = x.shape
+    sz = (np.prod(sz0[:-1]),1,sz0[-1])
+    x = x.reshape(sz)
+    for layer in self.layers:
+      x = layer(x)
+    if self.avg_pool is not None:
+      x = self.avg_pool(x)
+    x = torch.flatten(x,1)
+    x = self.fc(x)
+    x = x.reshape(sz0[:-1]+ (x.shape[-1],))
+    return x
+    
+class DictSum(torch.nn.Module):
+  def __init__(self,moduledict):
+    super().__init__()
+    self.moduledict = moduledict
+  def forward(self,x):
+    out = 0.
+    for k,v in x.items():
+      out += self.moduledict[k](v)
+    return out
 
+# deprecated, here for backward compatibility
 class TransformerMixedModel(TransformerModel):
   
-  def __init__(self, d_input: int, d_output_continuous: int,
-               d_output_discrete: int, nbins: int,
+  def __init__(self, d_input: int, d_output_continuous: int = 0,
+               d_output_discrete: int = 0, nbins: int = 0,
                **kwargs):
     self.d_output_continuous = d_output_continuous
     self.d_output_discrete = d_output_discrete
     self.nbins = nbins
     d_output = d_output_continuous + d_output_discrete*nbins
+    assert d_output > 0
     super().__init__(d_input,d_output,**kwargs)
     
   def forward(self, src: torch.Tensor, mask: torch.Tensor = None, is_causal: bool = False) -> dict:
@@ -3735,7 +3915,7 @@ def overwrite_config(config0,config1,no_overwrite=[]):
   for k,v in config1.items():
     if k in no_overwrite:
       continue
-    if k in config0 and type(v) == dict:
+    if (k in config0) and (config0[k] is not None) and (type(v) == dict):
       overwrite_config(config0[k],config1[k],no_overwrite=no_overwrite)
     else:
       config0[k] = v
@@ -3967,9 +4147,24 @@ def initialize_model(d_input,d_output,config,train_dataset,device):
     }
   if config['modelstatetype'] is not None:
     MODEL_ARGS['nstates'] = config['nstates']
+    assert config['obs_embedding'] == False, 'Not implemented'
+    assert train_dataset.flatten == False, 'Not implemented'
   if config['modelstatetype'] == 'prob':
     MODEL_ARGS['minstateprob'] = config['minstateprob']
-
+    
+  if config['obs_embedding']:
+    MODEL_ARGS['input_idx'],MODEL_ARGS['input_szs'] = get_sensory_feature_shapes(simplify=train_dataset.simplify_in)
+    MODEL_ARGS['embedding_types'] = config['obs_embedding_types']
+    MODEL_ARGS['embedding_params'] = config['obs_embedding_params']
+  if train_dataset.flatten:
+    MODEL_ARGS['ntokens_per_timepoint'] = train_dataset.ntokens_per_timepoint
+    d_input = train_dataset.flatten_dinput
+    d_output = train_dataset.flatten_max_doutput
+  elif train_dataset.discretize:
+    MODEL_ARGS['d_output_discrete'] = train_dataset.d_output_discrete
+    MODEL_ARGS['nbins'] = train_dataset.discretize_nbins
+    d_output = train_dataset.d_output_continuous
+    
   if config['modelstatetype'] == 'prob':
     model = TransformerStateModel(d_input,d_output,**MODEL_ARGS).to(device)
     criterion = prob_causal_criterion
@@ -3977,18 +4172,7 @@ def initialize_model(d_input,d_output,config,train_dataset,device):
     model = TransformerBestStateModel(d_input,d_output,**MODEL_ARGS).to(device)  
     criterion = min_causal_criterion
   else:
-    if train_dataset.flatten:
-      model = TransformerModel(train_dataset.flatten_dinput,
-                              train_dataset.flatten_max_doutput,
-                              ntokens_per_timepoint=train_dataset.ntokens_per_timepoint,
-                              **MODEL_ARGS,
-                              ).to(device)
-    elif train_dataset.discretize:
-      model = TransformerMixedModel(d_input,train_dataset.d_output_continuous,
-                                    train_dataset.d_output_discrete,
-                                    train_dataset.discretize_nbins,**MODEL_ARGS).to(device)
-    else:
-      model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
+    model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
     
     if train_dataset.discretize:
       config['weight_discrete'] = len(config['discreteidx']) / nfeatures

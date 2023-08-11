@@ -23,6 +23,10 @@
     "_comment_compute_sensory_diffs": "whether to compute sensory diffs as additional inputs",
     "compute_sensory_diffs": false,
 
+    "obs_embedding": false,
+    "obs_embedding_types": null,
+    "obs_embedding_params": null,
+    
     "_comment_input_labels": "whether labels are inputs",
     "input_labels": true,
 
