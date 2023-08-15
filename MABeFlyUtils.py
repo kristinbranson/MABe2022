@@ -2129,6 +2129,30 @@ def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
     return Xfeat,scale_perfly,flyid
   else:
     return Xfeat
+  
+def get_flip_idx():
+
+  isright = np.array([re.search('right',kpn) is not None for kpn in keypointnames])
+  flipidx = np.arange(len(keypointnames),dtype=int)
+  idxright = np.nonzero(isright)[0]
+  for ir in idxright:
+    kpnr = keypointnames[ir]
+    kpnl = kpnr.replace('right','left')
+    il = keypointnames.index(kpnl)
+    flipidx[ir] = il
+    flipidx[il] = ir
+  
+  return flipidx
+
+def flip_flies(X,arena_center=[0,0],flipdim=0):
+  flipX = X.copy()
+  flipidx = get_flip_idx()
+  for i in range(len(flipidx)):
+    flipX[i,flipdim,...] = arena_center[flipdim]-X[flipidx[i],flipdim,...]
+    if flipidx[i] != i:
+      flipX[flipidx[i],flipdim,...] = arena_center[flipdim]-X[flipidx[i],flipdim,...]
+
+  return flipX
 
 # def explore_pose(X,scale_perfly,flyid,all_dataset):
 #

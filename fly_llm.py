@@ -4272,6 +4272,21 @@ def load_and_filter_data(infile,config):
   print('filtering data...')
   if config['categories'] is not None and len(config['categories']) > 0:
     filter_data_by_categories(data,config['categories'])
+    
+  # augment by flipping
+  if 'augment_flip' in config and config['augment_flip']:
+    flipvideoidx = np.max(data['videoidx'])+1+data['videoidx']
+    data['videoidx'] = np.concatenate((data['videoidx'],flipvideoidx),axis=0)
+    firstid = np.max(data['ids'])+1
+    flipids = data['ids'].copy()
+    flipids[flipids>=0] += firstid
+    data['ids'] = np.concatenate((data['ids'],flipids),axis=0)
+    data['frames'] = np.tile(data['frames'],(2,1))
+    flipX = mabe.flip_flies(data['X'])
+    data['X'] = np.concatenate((data['X'],flipX),axis=2)
+    data['y'] = np.tile(data['y'],(1,2,1))
+    data['isdata'] = np.tile(data['isdata'],(2,1))
+    data['isstart'] = np.tile(data['isstart'],(2,1))
 
   # compute scale parameters
   print('computing scale parameters...')
