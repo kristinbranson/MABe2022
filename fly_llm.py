@@ -2965,12 +2965,6 @@ class TransformerModel(torch.nn.Module):
     super().__init__()
     self.model_type = 'Transformer'
 
-    self.obs_embedding = (input_idx is not None)
-    if self.obs_embedding:
-      assert input_szs is not None
-      assert embedding_types is not None
-      assert embedding_params is not None
-
     self.is_mixed = nbins is not None
     if self.is_mixed:
       self.d_output_continuous = d_output
@@ -2995,27 +2989,9 @@ class TransformerModel(torch.nn.Module):
     # encoder and decoder are currently not tied together, but maybe they should be? 
     # fully-connected layer from input size to d_model
     
-    if self.obs_embedding:
-      self.input_idx = input_idx
-      self.input_szs = input_szs
-      self.encoder_dict = torch.nn.ModuleDict()
-      for k,emb in embedding_types.items():
-        szcurr = input_szs[k]
-        if emb == 'conv1d':
-          if len(szcurr) < 2:
-            input_channels = 1
-          else:
-            input_channels = szcurr[1]
-          channels = [input_channels,]+embedding_params[k]['channels']
-          params = {k1:v for k1,v in embedding_params[k].items() if k1 != 'channels'}
-          encodercurr = ResNet1d(channels,d_model,d_input=szcurr[0],**params)
-        elif emb == 'fc':
-          encodercurr = torch.nn.Linear(szcurr[0],d_model)
-        else:
-          # consider adding graph networks
-          raise ValueError(f'Unknown embedding type {emb}')
-        self.encoder_dict[k] = encodercurr
-      self.encoder = DictSum(self.encoder_dict)
+    if input_idx is not None:
+      self.encoder = ObsEmbedding(d_model=d_model,input_idx=input_idx,input_szs=input_szs,
+                                  embedding_types=embedding_types,embedding_params=embedding_params)
     else:
       self.encoder = torch.nn.Linear(d_input,d_model)
 
@@ -3038,9 +3014,6 @@ class TransformerModel(torch.nn.Module):
     Returns:
       output Tensor of shape [seq_len, batch_size, ntoken]
     """
-
-    if self.obs_embedding:
-      src = unpack_input(src,self.input_idx,self.input_szs)
 
     # project input into d_model space, multiple by sqrt(d_model) for reasons?
     src = self.encoder(src) * math.sqrt(self.d_model)
@@ -3075,22 +3048,121 @@ class TransformerModel(torch.nn.Module):
     
     return output
   
+class ObsEmbedding(torch.nn.Module):
+  def __init__(self, d_model: int, input_idx, input_szs, embedding_types, embedding_params):
+
+    super().__init__()
+
+    assert input_idx is not None
+    assert input_szs is not None
+    assert embedding_types is not None
+    assert embedding_params is not None
+
+    self.input_idx = input_idx
+    self.input_szs = input_szs
+
+    self.encoder_dict = torch.nn.ModuleDict()
+    for k in input_idx.keys():
+      emb = embedding_types.get(k,'fc')
+      params = embedding_params.get(k,{})
+      szcurr = input_szs[k]
+      if emb == 'conv1d_feat':
+        if len(szcurr) < 2:
+          input_channels = 1
+        else:
+          input_channels = szcurr[1]
+        channels = [input_channels,]+params['channels']
+        params = {k1:v for k1,v in params.items() if k1 != 'channels'}
+        encodercurr = ResNet1d(channels,d_model,d_input=szcurr[0],no_input_channels=True,single_output=True,transpose=False,**params)
+      elif emb == 'fc':
+        encodercurr = torch.nn.Linear(szcurr[0],d_model)
+      elif emb == 'conv1d_time':
+        assert(len(szcurr) == 1)
+        input_channels = szcurr[0]
+        channels = [input_channels,]+params['channels']
+        params = {k1:v for k1,v in params.items() if k1 != 'channels'}
+        encodercurr = ResNet1d(channels,d_model,no_input_channels=False,single_output=False,transpose=True,**params)
+      elif emb == 'conv2d':
+        assert(len(szcurr) <= 2)
+        if len(szcurr) > 1:
+          input_channels = szcurr[1]
+          no_input_channels = False
+        else:
+          input_channels = 1
+          no_input_channels = True
+        channels = [input_channels,]+params['channels']
+        params = {k1:v for k1,v in params.items() if k1 != 'channels'}
+        encodercurr = ResNet2d(channels,d_model,no_input_channels=no_input_channels,d_input=szcurr,single_output=True,transpose=True,**params)
+      else:
+        # consider adding graph networks
+        raise ValueError(f'Unknown embedding type {emb}')
+      self.encoder_dict[k] = encodercurr
+      
+  def forward(self,src):
+    src = unpack_input(src,self.input_idx,self.input_szs)
+    out = 0.
+    for k,v in src.items():
+      out += self.encoder_dict[k](v)
+    return out
+  
+class Conv1d_asym(torch.nn.Conv1d):
+  def __init__(self, *args, padding='same', **kwargs):
+    self.padding_off = [0,0]
+    padding_sym = padding
+    if (type(padding) == tuple) or (type(padding) == list):
+      padding_sym = int(np.max(padding))
+      for j in range(2):
+        self.padding_off[j] = padding_sym - padding[j]
+    super().__init__(*args,padding=padding_sym,**kwargs)
+
+  def asymmetric_crop(self,out):
+    out = out[...,self.padding_off[0]:out.shape[-1]-self.padding_off[1]]
+    return out
+
+  def forward(self,x,*args,**kwargs):
+    out = super().forward(x,*args,**kwargs)
+    out = self.asymmetric_crop(out)
+    return out    
+  
+class Conv2d_asym(torch.nn.Conv2d):
+  def __init__(self, *args, padding='same', **kwargs):
+    self.padding_off = [[0,0],[0,0]]
+    padding_sym = padding
+    if (type(padding) == tuple) or (type(padding) == list):
+      padding_sym = list(padding_sym)
+      for i in range(2):
+        if type(padding[i]) != int:
+          padding_sym[i] = int(np.max(padding[i]))
+          for j in range(2):
+            self.padding_off[i][j] = padding_sym[i] - padding[i][j]
+      padding_sym = tuple(padding_sym)
+    super().__init__(*args,padding=padding_sym,**kwargs)
+
+  def asymmetric_crop(self,out):
+    out = out[...,self.padding_off[0][0]:out.shape[-2]-self.padding_off[0][1],self.padding_off[1][0]:out.shape[-1]-self.padding_off[1][1]]
+    return out
+
+  def forward(self,x,*args,**kwargs):
+    out = super().forward(x,*args,**kwargs)
+    out = self.asymmetric_crop(out)
+    return out
+  
 class ResidualBlock1d(torch.nn.Module):
   
-  def __init__(self, in_channels, out_channels, stride = 1, padding_mode='zeros'):
+  def __init__(self, in_channels, out_channels, kernel_size = 3, stride = 1, dilation = 1, padding = 'same', padding_mode='zeros'):
     super().__init__()
     
-    self.padding = 1
-    self.kernel_size = 3
+    self.padding = padding
+    self.kernel_size = kernel_size
     self.stride = stride
-    self.dilation = 1
+    self.dilation = dilation
     self.conv1 = torch.nn.Sequential(
-      torch.nn.Conv1d(in_channels, out_channels, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
+      Conv1d_asym(in_channels, out_channels, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
       torch.nn.BatchNorm1d(out_channels),
       torch.nn.ReLU()
     )
     self.conv2 = torch.nn.Sequential(
-      torch.nn.Conv1d(out_channels, out_channels, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode=padding_mode),
+      Conv1d_asym(out_channels, out_channels, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
       torch.nn.BatchNorm1d(out_channels)
     )
     if (in_channels != out_channels) or (self.stride > 1):
@@ -3114,39 +3186,231 @@ class ResidualBlock1d(torch.nn.Module):
     return out
   
   def compute_output_shape(self,din):
-    dout = np.floor((din-1) / self.stride)+1
-    sz = (int(dout),self.out_channels)
+    if type(self.padding) == str:
+      if self.padding == 'same':
+        return (self.out_channels,din)
+      elif self.padding == 'valid':
+        padding = 0
+      else:
+        raise ValueError(f'Unknown padding type {self.padding}')
+    if len(self.padding) == 1:
+      padding = 2*self.padding
+    else:
+      padding = np.sum(self.padding)
+    dout1 = np.floor((din + padding - self.dilation*(self.kernel_size-1)-1)/self.stride+1)
+    dout = (dout1 + padding - self.dilation*(self.kernel_size-1)-1)+1
+    sz = (self.out_channels,int(dout))
+    return sz
+  
+class ResidualBlock2d(torch.nn.Module):
+  
+  def __init__(self, in_channels, out_channels, kernel_size = (3,3), stride = (1,1), dilation = (1,1), padding = 'same', padding_mode = 'zeros'):
+    super().__init__()
+
+    self.padding = padding          
+    self.kernel_size = kernel_size
+    self.stride = stride
+    self.dilation = dilation
+    self.conv1 = torch.nn.Sequential(
+      Conv2d_asym(in_channels, out_channels, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
+      torch.nn.BatchNorm2d(out_channels),
+      torch.nn.ReLU()
+    )
+    self.conv2 = torch.nn.Sequential(
+      Conv2d_asym(out_channels, out_channels, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode=padding_mode, dilation=self.dilation),
+      torch.nn.BatchNorm2d(out_channels)
+    )
+    if (in_channels != out_channels) or (np.any(np.array(self.stride) > 1)):
+      self.downsample = torch.nn.Sequential(
+        torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=False),
+        torch.nn.BatchNorm2d(out_channels)
+      )
+    else:
+      self.downsample = None
+    self.relu = torch.nn.ReLU()
+    self.out_channels = out_channels
+    
+  def forward(self, x):
+    identity = x
+
+    out = self.conv1(x)
+    out = self.conv2(out)
+    if self.downsample:
+      identity = self.downsample(x)
+    out += identity
+    out = self.relu(out)
+    return out
+  
+  def compute_output_shape(self,din):
+    if type(self.padding) == str:
+      if self.padding == 'same':
+        return (self.out_channels,)+din
+      elif self.padding == 'valid':
+        padding = (0,0)
+      else:
+        raise ValueError(f'Unknown padding type {self.padding}')
+
+    if len(self.padding) == 1:
+      padding = [self.padding,self.padding]
+    else:
+      padding = self.padding
+    padding = np.array(padding)
+    paddingsum = np.zeros(2,dtype=int)
+    for i in range(2):
+      if len(padding[i]) == 1:
+        paddingsum[i] = 2*padding[i]
+      else:
+        paddingsum[i] = int(np.sum(padding[i]))
+    dout1 = np.floor((np.array(din) + paddingsum - np.array(self.dilation)*(np.array(self.kernel_size)-1)-1)/np.array(self.stride)+1).astype(int)
+    dout = ((dout1 + paddingsum - np.array(self.dilation)*(np.array(self.kernel_size)-1)-1)+1).astype(int)
+    sz = (self.out_channels,) + tuple(dout)
     return sz
   
 class ResNet1d(torch.nn.Module):
-  def __init__(self,channels,d_output,d_input=None,**kwargs):
+  def __init__(self,channels,d_output,d_input=None,no_input_channels=False,single_output=False,transpose=False,**kwargs):
     super().__init__()
     self.channels = channels
     self.d_output = d_output
+    self.d_input = d_input
+    self.no_input_channels = no_input_channels
+    self.transpose = transpose
+    self.single_output = single_output
+    
+    if no_input_channels:
+      assert channels[0] == 1
+    
     nblocks = len(channels)-1
     self.layers = torch.nn.ModuleList()
-    sz = (d_input,)
+    sz = (channels[0],d_input)
     for i in range(nblocks):
       self.layers.append(ResidualBlock1d(channels[i],channels[i+1],**kwargs))
       if d_input is not None:
-        sz = self.layers[-1].compute_output_shape(sz[0])
-    if d_input is None:
-      self.avg_pool = torch.nn.AdaptiveAvgPool1d(1)
-      self.fc = torch.nn.Linear(channels[-1],d_output)
+        sz = self.layers[-1].compute_output_shape(sz[-1])
+    if single_output:
+      if d_input is None:
+        self.avg_pool = torch.nn.AdaptiveAvgPool1d(1)
+        self.fc = torch.nn.Linear(channels[-1],d_output)
+      else:
+        self.avg_pool = None
+        self.fc = torch.nn.Linear(int(np.prod(sz)),d_output)
     else:
       self.avg_pool = None
-      self.fc = torch.nn.Linear(int(np.prod(sz)),d_output)
+      self.fc = torch.nn.Conv1d(channels[-1],d_output,1)
+      
   def forward(self,x):
+
+    if self.transpose and not self.no_input_channels:
+      x = x.transpose(-1,-2)
+
+    if self.no_input_channels:
+      dim = -1
+    else:
+      dim = -2
+    
     sz0 = x.shape
-    sz = (np.prod(sz0[:-1]),1,sz0[-1])
+    d_input = sz0[-1]
+
+    if self.single_output and (self.d_input is not None):
+      assert d_input == self.d_input
+    
+    sz = (int(np.prod(sz0[:dim])),self.channels[0],d_input)
     x = x.reshape(sz)
+    
     for layer in self.layers:
       x = layer(x)
     if self.avg_pool is not None:
       x = self.avg_pool(x)
-    x = torch.flatten(x,1)
+    if self.single_output:
+      x = torch.flatten(x,1)
     x = self.fc(x)
-    x = x.reshape(sz0[:-1]+ (x.shape[-1],))
+    
+    if self.single_output:
+      dimout = -1
+    else:
+      dimout = -2
+    x = x.reshape(sz0[:dim]+x.shape[dimout:])
+    
+    if self.transpose and not self.single_output:
+      x = x.transpose(-1,-2)
+
+    return x
+  
+class ResNet2d(torch.nn.Module):
+  def __init__(self,channels,d_output,d_input=None,no_input_channels=False,single_output=False,transpose=False,**kwargs):
+    super().__init__()
+    self.channels = channels
+    self.d_output = d_output
+    self.d_input = d_input
+    self.no_input_channels = no_input_channels
+    self.transpose = transpose
+    
+    if no_input_channels:
+      assert channels[0] == 1
+    
+    nblocks = len(channels)-1
+    self.layers = torch.nn.ModuleList()
+    is_d_input = [False,False]
+    if d_input is not None:
+      if type(d_input) == int:
+        d_input (0,d_input)
+      elif len(d_input) < 2:
+        d_input = (0,)*(2-len(d_input))+d_input
+      is_d_input = [d != 0 for d in d_input]
+      sz = (channels[0],) + d_input
+    for i in range(nblocks):
+      self.layers.append(ResidualBlock2d(channels[i],channels[i+1],**kwargs))
+      if d_input is not None:
+        sz = self.layers[-1].compute_output_shape(sz[1:])
+    self.collapse_dim = []
+    if single_output:
+      if d_input is None:
+        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.fc = torch.nn.Linear(channels[-1],d_output)
+        self.collapse_dim = [-2,-1]
+      else:
+        self.avg_pool = None
+        k = [1,1]
+        for i in range(2):
+          if is_d_input[i]:
+            k[i] = sz[i+1]
+            self.collapse_dim.append(-2+i)
+        self.fc = torch.nn.Conv2d(channels[-1],d_output,k,padding='valid')
+    else:
+      self.avg_pool = None
+      self.fc = torch.nn.Conv2d(channels[-1],d_output,1)
+      
+  def forward(self,x):
+
+    if self.transpose and not self.no_input_channels:
+      x = torch.movedim(x,-1,-3)
+
+    if self.no_input_channels:
+      dim = -2
+    else:
+      dim = -3
+    
+    sz0 = x.shape
+    d_input = sz0[-2:]
+    
+    sz = (int(np.prod(sz0[:dim])),self.channels[0])+d_input
+    x = x.reshape(sz)
+    
+    for layer in self.layers:
+      x = layer(x)
+    if self.avg_pool is not None:
+      x = self.avg_pool(x)
+      x = torch.flatten(x,1)
+      dimout = -1
+    else:
+      dimout = -3
+    x = self.fc(x)
+    x = x.reshape(sz0[:dim]+x.shape[dimout:])
+    dim_channel = len(sz0[:dim])
+    x = torch.squeeze(x,self.collapse_dim)
+    
+    if self.transpose:
+      x = torch.movedim(x,dim_channel,-1)
+
     return x
     
 class DictSum(torch.nn.Module):
@@ -3492,7 +3756,8 @@ def debug_plot_pose_prob(example,train_dataset,predcpu,tplot,fig=None,ax=None,h=
 def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
                           true_discrete_mode='to_discretize',
                           pred_discrete_mode='sample',
-                          ntsplot=5,nsamplesplot=3,h=None,ax=None,fig=None):
+                          ntsplot=5,nsamplesplot=3,h=None,ax=None,fig=None,
+                          tsplot=None):
  
   
   batch_size = example['input'].shape[0]
@@ -3502,7 +3767,8 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
   if ax is None:
     fig,ax = plt.subplots(nsamplesplot,ntsplot)
     
-  tsplot = np.round(np.linspace(0,contextl,ntsplot)).astype(int)
+  if tsplot is None:
+    tsplot = np.round(np.linspace(0,contextl,ntsplot)).astype(int)
   samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
   if h is None:
     h = {'kpt0': [], 'kpt1': [], 'edge0': [], 'edge1': []}
@@ -3908,6 +4174,72 @@ def read_config(jsonfile):
   assert config['modelstatetype'] in ['prob','best',None]
   assert config['masktype'] in ['ind','block',None]
   
+  if ('obs_embedding_types' in config) and (type(config['obs_embedding_types']) == dict):
+    for k,v in config['obs_embedding_types'].items():
+      if v == 'conv1d':
+        # modernize
+        config['obs_embedding_types'][k] = 'conv1d_feat'
+    if 'obs_embedding_params' not in config:
+      config['obs_embedding_params'] = {}
+    else:
+      if type(config['obs_embedding_params']) != dict:
+        assert config['obs_embedding_params'] is None
+        config['obs_embedding_params'] = {}
+
+    for k,et in config['obs_embedding_types'].items():
+      if k not in config['obs_embedding_params']:
+        config['obs_embedding_params'][k] = {}
+      params = config['obs_embedding_params'][k]
+      if et == 'conv1d_time':
+        if 'stride' not in params:
+          params['stride'] = 1
+        if 'dilation' not in params:
+          params['dilation'] = 1
+        if 'kernel_size' not in params:
+          params['kernel_size'] = 2
+        if 'padding' not in params:
+          w = (params['stride']-1)+(params['kernel_size']*params['dilation'])-1
+          params['padding'] = (w,0)
+        if 'channels' not in params:
+          params['channels'] = [64,256,512]
+      elif et == 'conv2d':
+        if 'stride' not in params:
+          params['stride'] = (1,1)
+        elif type(params['stride']) == int:
+          params['stride'] = (params['stride'],params['stride'])
+        if 'dilation' not in params:
+          params['dilation'] = (1,1)
+        elif type(params['dilation']) == int:
+          params['dilation'] = (params['dilation'],params['dilation'])
+        if 'kernel_size' not in params:
+          params['kernel_size'] = (2,3)
+        elif type(params['kernel_size']) == int:
+          params['kernel_size'] = (params['kernel_size'],params['kernel_size'])
+        if 'padding' not in params:
+          w1 = (params['stride'][0]-1)+(params['kernel_size'][0]*params['dilation'][0])-1
+          w2 = (params['stride'][1]-1)+(params['kernel_size'][1]*params['dilation'][1])-1
+          w2a = int(np.ceil(w2/2))
+          params['padding'] = ((w1,0),(w2a,w2-w2a))
+          #params['padding'] = 'same'
+        if 'channels' not in params:
+          params['channels'] = [16,64,128]
+      elif et == 'conv1d_feat':
+        if 'stride' not in params:
+          params['stride'] = 1
+        if 'dilation' not in params:
+          params['dilation'] = 1
+        if 'kernel_size' not in params:
+          params['kernel_size'] = 3
+        if 'padding' not in params:
+          params['padding'] = 'same'
+        if 'channels' not in params:
+          params['channels'] = [16,64,128]
+      elif et == 'fc':
+        pass
+      else:
+        raise ValueError(f'Unknown embedding type {et}')
+        
+  
   return config
     
 def overwrite_config(config0,config1,no_overwrite=[]):
@@ -4025,7 +4357,7 @@ def get_modeltype_str(config,dataset):
 
   return modeltype_str
 
-def initialize_debug_plots(dataset,dataloader,data,name=''):
+def initialize_debug_plots(dataset,dataloader,data,name='',tsplot=None,traj_nsamplesplot=3):
 
   example = next(iter(dataloader))
 
@@ -4033,13 +4365,14 @@ def initialize_debug_plots(dataset,dataloader,data,name=''):
   fig,ax = debug_plot_sample_inputs(dataset,example)
 
   # plot to check that we can get poses from examples
-  hpose,ax,fig = debug_plot_batch_pose(example,dataset,data=data)
+  hpose,ax,fig = debug_plot_batch_pose(example,dataset,data=data,tsplot=tsplot)
   ax[-1,0].set_xlabel('Train')
 
   # plot to visualize motion outputs
   axtraj,figtraj = debug_plot_batch_traj(example,dataset,data=data,
                                          label_true='Label',
-                                         label_pred='Raw')
+                                         label_pred='Raw',
+                                         nsamplesplot=traj_nsamplesplot)
   figtraj.set_figheight(18)
   figtraj.set_figwidth(12)
   axtraj[0].set_title(name)
@@ -4061,7 +4394,7 @@ def initialize_debug_plots(dataset,dataloader,data,name=''):
   
   return hdebug
   
-def update_debug_plots(hdebug,config,model,dataset,example,pred,criterion=None,name=''):
+def update_debug_plots(hdebug,config,model,dataset,example,pred,criterion=None,name='',tsplot=None,traj_nsamplesplot=3):
   
   if config['modelstatetype'] == 'prob':
     pred1 = model.maxpred({k: v.detach() for k,v in pred.items()})
@@ -4072,8 +4405,8 @@ def update_debug_plots(hdebug,config,model,dataset,example,pred,criterion=None,n
       pred1 = {k: v.detach().cpu() for k,v in pred.items()}
     else:
       pred1 = pred.detach().cpu()
-  debug_plot_batch_pose(example,dataset,pred=pred1,h=hdebug['hpose'],ax=hdebug['axpose'],fig=hdebug['figpose'])
-  debug_plot_batch_traj(example,dataset,criterion=criterion,config=config,pred=pred1,ax=hdebug['axtraj'],fig=hdebug['figtraj'])
+  debug_plot_batch_pose(example,dataset,pred=pred1,h=hdebug['hpose'],ax=hdebug['axpose'],fig=hdebug['figpose'],tsplot=tsplot)
+  debug_plot_batch_traj(example,dataset,criterion=criterion,config=config,pred=pred1,ax=hdebug['axtraj'],fig=hdebug['figtraj'],nsamplesplot=traj_nsamplesplot)
   if config['modelstatetype'] == 'prob':
     hstate,axstate,figstate = debug_plot_batch_state(pred['stateprob'].detach().cpu(),nsamplesplot=3,
                                                       h=hdebug['hstate'],ax=hdebug['axstate'],fig=hdebug['figstate'])
@@ -4153,7 +4486,7 @@ def initialize_model(d_input,d_output,config,train_dataset,device):
     MODEL_ARGS['minstateprob'] = config['minstateprob']
     
   if config['obs_embedding']:
-    MODEL_ARGS['input_idx'],MODEL_ARGS['input_szs'] = get_sensory_feature_shapes(simplify=train_dataset.simplify_in)
+    MODEL_ARGS['input_idx'],MODEL_ARGS['input_szs'] = train_dataset.get_input_shapes()
     MODEL_ARGS['embedding_types'] = config['obs_embedding_types']
     MODEL_ARGS['embedding_params'] = config['obs_embedding_params']
   if train_dataset.flatten:
@@ -4618,6 +4951,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   lr_scheduler = transformers.get_scheduler('linear',optimizer,num_warmup_steps=0,
                                             num_training_steps=num_training_steps)
 
+
   # initialize structure to keep track of loss
   loss_epoch = initialize_loss(train_dataset,config)
   last_val_loss = None
@@ -4636,6 +4970,24 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   else:
     raise
 
+  # sanity check on temporal dependences
+  x = next(iter(train_dataloader))
+  xin = x['input'].clone()
+  xin2 = xin.clone()
+  tmess = 300
+  xin2[:,tmess:,:] = 100.
+  model.eval()
+  with torch.no_grad():
+    pred = model(xin.to(device),mask=train_src_mask,is_causal=is_causal)
+    pred2 = model(xin2.to(device),mask=train_src_mask,is_causal=is_causal)
+  if type(pred) == dict:
+    for k in pred.keys():
+      matches = torch.all(pred2[k][:,:tmess]==pred[k][:,:tmess]).item()
+      assert matches
+  else:
+    matches = torch.all(pred2[:,:tmess]==pred[:,:tmess]).item()
+    assert matches
+  
   modeltype_str = get_modeltype_str(config,train_dataset)
   if ('model_nickname' in config) and (config['model_nickname'] is not None):
     modeltype_str = config['model_nickname']
@@ -4787,7 +5139,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
   flynum = 0
-  t0 = np.nonzero(canstart[:,flynum])[0][390]    
+  t0 = np.nonzero(canstart[:,flynum])[0][15000]    
   # flynum = 2
   # t0 = np.nonzero(canstart[:,flynum])[0][0]
   fliespred = np.array([flynum,])
