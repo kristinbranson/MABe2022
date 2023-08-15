@@ -3602,7 +3602,8 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
     mask = None
   
   if ax is None:
-    fig,ax = plt.subplots(1,nsamplesplot)
+    fig,ax = plt.subplots(1,nsamplesplot,squeeze=False)
+    ax = ax[0,:]
 
   if true_discrete_mode == 'to_discretize':
     true_args = {'use_todiscretize': True}
@@ -3763,13 +3764,16 @@ def debug_plot_batch_pose(example,train_dataset,pred=None,data=None,
   batch_size = example['input'].shape[0]
   contextl = train_dataset.ntimepoints
   nsamplesplot = np.minimum(nsamplesplot,batch_size)
-  
-  if ax is None:
-    fig,ax = plt.subplots(nsamplesplot,ntsplot)
-    
+      
   if tsplot is None:
     tsplot = np.round(np.linspace(0,contextl,ntsplot)).astype(int)
+  else:
+    ntsplot = len(tsplot)
   samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
+
+  if ax is None:
+    fig,ax = plt.subplots(nsamplesplot,ntsplot,squeeze=False)
+
   if h is None:
     h = {'kpt0': [], 'kpt1': [], 'edge0': [], 'edge1': []}
   
@@ -3842,7 +3846,7 @@ def debug_plot_sample_inputs(dataset,example,nplot=3):
 
   nplot = np.minimum(nplot,example['input'].shape[0])
 
-  fig,ax = plt.subplots(nplot,2)
+  fig,ax = plt.subplots(nplot,2,squeeze=False)
   idx = get_sensory_feature_idx(dataset.simplify_in)
   labels = dataset.get_full_labels(example=example,use_todiscretize=True)
   nlabels = labels.shape[-1]
@@ -4938,9 +4942,13 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   print(f'batch input shape = {sz}')
 
   # debug plots
+  debug_params = {}
+  if config['contextl'] > 64:
+    debug_params['tsplot'] = np.round(np.linspace(0,64,5)).astype(int)
+    debug_params['traj_nsamplesplot'] = 1
   hdebug = {}
-  hdebug['train'] = initialize_debug_plots(train_dataset,train_dataloader,data,name='Train')
-  hdebug['val'] = initialize_debug_plots(val_dataset,val_dataloader,valdata,name='Val')
+  hdebug['train'] = initialize_debug_plots(train_dataset,train_dataloader,data,name='Train',**debug_params)
+  hdebug['val'] = initialize_debug_plots(val_dataset,val_dataloader,valdata,name='Val',**debug_params)
 
   # create the model
   model,criterion = initialize_model(d_input,d_output,config,train_dataset,device)
@@ -5047,8 +5055,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
           with torch.no_grad():
             trainpred = model.output(example['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
             valpred = model.output(valexample['input'].to(device=device),mask=train_src_mask,is_causal=is_causal)
-          update_debug_plots(hdebug['train'],config,model,train_dataset,example,trainpred,name='Train',criterion=criterion)
-          update_debug_plots(hdebug['val'],config,model,val_dataset,valexample,valpred,name='Val',criterion=criterion)
+          update_debug_plots(hdebug['train'],config,model,train_dataset,example,trainpred,name='Train',criterion=criterion,**debug_params)
+          update_debug_plots(hdebug['val'],config,model,val_dataset,valexample,valpred,name='Val',criterion=criterion,**debug_params)
           plt.show()
           plt.pause(.1)
 
