@@ -154,6 +154,7 @@ def chunk_data(data,contextl,reparamfun):
   # X is a dict with chunked data
   X = []
   # loop through ids
+  nframestotal = 0
   for flynum in tqdm.trange(maxnflies,desc='Fly'):
     # choose a first frame near the beginning, but offset a bit
     # first possible start
@@ -193,6 +194,9 @@ def chunk_data(data,contextl,reparamfun):
         if t0 is None or t0.size == 0:
           break
         t0 = t0[0] + t1 + 1
+      nframestotal += contextl
+
+  print(f'In total {nframestotal} frames of data after chunking')
 
   return X
 
@@ -807,9 +811,16 @@ def unpack_input(input,featidx,sz,dim=-1):
   
   return res
 
-def combine_relative_global(Xrelative,Xglobal):
-  X = np.concatenate((Xglobal,Xrelative),axis=-1)
+def combine_relative_global(Xrelative,Xglobal,axis=-1):
+  X = np.concatenate((Xglobal,Xrelative),axis=axis)
   return X
+
+def combine_relative_global_pose(relpose,globalpos):
+  sz = (nfeatures,)+relpose.shape[1:]
+  posefeat = np.zeros(sz,dtype=relpose.dtype)
+  posefeat[featrelative,...] = relpose
+  posefeat[featglobal,...] = globalpos
+  return posefeat
 
 def compute_pose_features(X,scale):
   posefeat = mabe.kp2feat(X,scale)
@@ -818,7 +829,7 @@ def compute_pose_features(X,scale):
 
   return relpose,globalpos
 
-def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None):
+def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred=[1,]):
   """
   movement = compute_movement(X=X,scale=scale,simplify=simplify_out)
   movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out)
@@ -848,23 +859,86 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   nflies = relpose.shape[2]
 
   Xorigin = globalpos[:2,...]
-  Xtheta = globalpos[2,...]  
-  dXoriginrel = mabe.rotate_2d_points((Xorigin[:,1:,:]-Xorigin[:,:-1,:]).transpose((1,0,2)),Xtheta[:-1,:]).transpose((1,0,2))
-  forward_vel = dXoriginrel[1,...]
-  sideways_vel = dXoriginrel[0,...]
+  Xtheta = globalpos[2,...]
+  if (dct_m is not None) and simplify != 'global':
+    ntspred = dct_m.shape[0]
+    tspred = np.arange(1,ntspred+1)
+    nmovement_features = nfeatures*ntspred
+  else:
+    ntspred = len(tspred)
+    nmovement_features = nglobal*ntspred
+    if simplify != 'global':
+      nmovement_features += nrelative
+  lastT = T - tspred[-1]
+  
+  # dXoriginrel[tau,:,t,fly] is the global position for fly fly at time t+tau in the coordinate system of the fly at time t
+  dXoriginrel = np.zeros((ntspred,2,T,nflies),dtype=Xorigin.dtype)
+  dXoriginrel[:] = np.nan
+  # dtheta[tau,t,fly] is the change in orientation for fly fly at time t+tau from time t
+  dtheta = np.zeros((ntspred,T,nflies),dtype=Xtheta.dtype)
+  dtheta[:] = np.nan
+  # dtheta1[t,fly] is the change in orientation for fly from frame t to t+1
+  dtheta1 = mabe.modrange(Xtheta[1:,:]-Xtheta[:-1,:],-np.pi,np.pi)
 
-  movement = np.zeros([nfeatures,T-1,nflies],relpose.dtype)
-  movement[featrelative,...] = relpose[:,1:,:]-relpose[:,:-1,:]
-  movement[featorigin[0],...] = forward_vel
-  movement[featorigin[1],...] = sideways_vel
-  movement[feattheta,...] = Xtheta[1:,...]-Xtheta[:-1,...]
-  movement[featangle,...] = mabe.modrange(movement[featangle,...],-np.pi,np.pi)
-
-  if simplify is not None:
-    if simplify == 'global':
-      movement = movement[featglobal,...]
+  if simplify != 'global':
+    # drelpose1[f,fly] is the change in pose for fly from frame t to t+1
+    drelpose1 = relpose[:,1:,:]-relpose[:,:-1,:]
+    drelpose1[featangle[featrelative],:,:] = mabe.modrange(drelpose1[featangle[featrelative],:,:],-np.pi,np.pi)
+    # drelpose[tau,t,fly] is the change in pose for fly fly at time t+tau from time t
+    if dct_m is not None:
+      drelpose = np.zeros((ntspred,relpose.shape[0],T,nflies),dtype=relpose.dtype)
+      drelpose[:] = np.nan
     else:
-      raise
+      drelpose = drelpose1
+  
+  def boxsum(x,n):
+    if n == 1:
+      return x
+    xtorch = torch.tensor(x[:,None,...])
+    y = torch.nn.functional.conv2d(xtorch,torch.ones((1,1,n,1),dtype=xtorch.dtype),padding='valid')
+    return y[:,0,...].numpy()
+  
+  for i in range(ntspred):
+    toff = tspred[i]
+    dXoriginrel[i,:,:-toff,:] = mabe.rotate_2d_points((Xorigin[:,toff:,:]-Xorigin[:,:-toff,:]).transpose((1,0,2)),Xtheta[:-toff,:]).transpose((1,0,2))
+    dtheta[i,:-toff,:] = boxsum(dtheta1[None,...],toff)
+    if (dct_m is not None) and (simplify != 'global'):
+      drelpose[i,:,:-toff,:] = boxsum(drelpose1,toff)
+
+  # only full data up to frame lastT
+  dXoriginrel = dXoriginrel[:,:,:lastT,:]
+  dtheta = dtheta[:,:lastT,:]
+  if (simplify != 'global'):
+    drelpose = drelpose[:,:lastT,:]
+    if (dct_m is not None):
+      drelpose_dct = dct_m @ drelpose
+
+  movement_global = np.concatenate((dXoriginrel[:,[1,0]],dtheta[:,None,:,:]),axis=1)
+  if simplify == 'global':
+    movement = movement_global
+  elif dct_m is not None:
+    movement = np.concatenate((movement_global,drelpose_dct),axis=1)
+  else:
+    movement = np.concatenate((movement_global.reshape((nglobal*ntspred,lastT,nflies)),drelpose),axis=0)
+  movement = movement.reshape((nmovement_features,lastT,nflies))
+
+  # old code
+  # dXoriginrel = mabe.rotate_2d_points((Xorigin[:,1:,:]-Xorigin[:,:-1,:]).transpose((1,0,2)),Xtheta[:-1,:]).transpose((1,0,2))
+  # forward_vel = dXoriginrel[1,...]
+  # sideways_vel = dXoriginrel[0,...]
+
+  # movement = np.zeros([nfeatures,T-1,nflies],relpose.dtype)
+  # movement[featrelative,...] = relpose[:,1:,:]-relpose[:,:-1,:]
+  # movement[featorigin[0],...] = forward_vel
+  # movement[featorigin[1],...] = sideways_vel
+  # movement[feattheta,...] = Xtheta[1:,...]-Xtheta[:-1,...]
+  # movement[featangle,...] = mabe.modrange(movement[featangle,...],-np.pi,np.pi)
+
+  # if simplify is not None:
+  #   if simplify == 'global':
+  #     movement = movement[featglobal,...]
+  #   else:
+  #     raise
 
   if nd == 2:
     movement = movement[...,0]
@@ -912,9 +986,32 @@ def combine_inputs(relpose=None,sensory=None,input=None,labels=None,dim=0):
     input = np.concatenate((input,labels),axis=dim)
   return input 
 
+def get_dct_matrix(N: int) -> (np.ndarray,np.ndarray):
+  """ Get the Discrete Cosine Transform coefficient matrix
+  Copied from https://github.com/dulucas/siMLPe/blob/main/exps/baseline_h36m/train.py
+  Back to MLP: A Simple Baseline for Human Motion Prediction
+  Guo, Wen and Du, Yuming and Shen, Xi and Lepetit, Vincent and Xavier, Alameda-Pineda and Francesc, Moreno-Noguer
+  arXiv preprint arXiv:2207.01567
+  2022
+  Args:
+      N (int): number of time points
+
+  Returns:
+      dct_m: array of shape N x N with the encoding coefficients
+      idct_m: array of shape N x N with the inverse coefficients
+  """
+  dct_m = np.eye(N)
+  for k in np.arange(N):
+    for i in np.arange(N):
+      w = np.sqrt(2 / N)
+      if k == 0:
+        w = np.sqrt(1 / N)
+      dct_m[k, i] = w * np.cos(np.pi * (i + 1 / 2) * k / N)
+  idct_m = np.linalg.inv(dct_m)
+  return dct_m, idct_m
 
 def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
-                     simplify_out=None,simplify_in=None):
+                     simplify_out=None,simplify_in=None,dct_m=None):
   
   res = {}
   
@@ -939,6 +1036,12 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
       movement = movement[featglobal,...]
     else:
       raise
+
+  if dct_m is not None:
+    featpose = combine_relative_global_pose(relpose,globalpos)
+    
+  #   dct_m,_ = get_dct_matrix(posout.shape[-1])
+  #   dct_out = dct_m @ posout
 
   res['labels'] = movement.T
   res['init'] = globalpos[:,:2]
@@ -3659,7 +3762,7 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
       #Xtheta_pred = None
       zmovement_pred = None
     
-    mult = 2.
+    mult = 4.
     d = train_dataset.d_output
     outnames = train_dataset.get_outnames()
     contextl = train_dataset.ntimepoints
@@ -5161,8 +5264,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   allisdata = interval_all(valdata['isdata'],contextlpad)
   isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
-  flynum = 0
-  t0 = np.nonzero(canstart[:,flynum])[0][15000]    
+  flynum = 2
+  t0 = np.nonzero(canstart[:,flynum])[0][40000]    
   # flynum = 2
   # t0 = np.nonzero(canstart[:,flynum])[0][0]
   fliespred = np.array([flynum,])
