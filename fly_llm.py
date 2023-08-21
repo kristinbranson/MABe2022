@@ -1487,7 +1487,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                discretize_params={},
                flatten_labels=False,
                flatten_obs_idx=None,
-               flatten_do_separate_inputs=False):
+               flatten_do_separate_inputs=False,
+               input_noise_sigma=None):
 
     self.data = data
     self.dtype = data[0]['input'].dtype
@@ -1541,14 +1542,20 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.flatten_dinput_pertype = None
     self.flatten_max_dinput = None
     self.flatten_max_doutput = None
-    
+
+    self.input_noise_sigma = input_noise_sigma
+    self.set_eval_mode()
+
     if dozscore:
       self.zscore(**zscore_params)
 
     if discreteidx is not None:
-      self.discretize_labels(discreteidx,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)    
+      self.discretize_labels(discreteidx,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)
     
     self.set_flatten_params(flatten_labels=flatten_labels,flatten_obs_idx=flatten_obs_idx,flatten_do_separate_inputs=flatten_do_separate_inputs)
+    
+    self.set_train_mode()
+
     
   @property
   def ntimepoints(self):
@@ -1587,6 +1594,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       return len(self.discrete_idx) + int(self.continuous)
     else:
       return 1
+          
+  def set_train_mode(self):
+    self.do_add_noise = self.input_noise_sigma is not None
+
+  def set_eval_mode(self):
+    self.do_add_noise = False
           
   def set_flatten_params(self,flatten_labels=False,flatten_obs_idx=None,flatten_do_separate_inputs=False):
     
@@ -1685,7 +1698,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       example['labels_discrete'] = discretize_labels(example['labels_todiscretize'],self.discretize_bin_edges,soften_to_ends=True)
       example['labels'] = example['labels'][:,self.continuous_idx]
     
-    self.discretize = True
+    self.discretize = True    
+    self.discretize_fun = lambda x: discretize_labels(x,self.discretize_bin_edges,soften_to_ends=True)
   
   def get_discretize_params(self):
     discretize_params = {
@@ -1964,19 +1978,41 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         example['metadata'] is a dict of metadata about this sequence.
         
     """
-    input = torch.as_tensor(self.data[idx]['input'])
-    labels = torch.as_tensor(self.data[idx]['labels'].copy())
+    
+    datacurr = self.data[idx]
+    
+    input = torch.as_tensor(datacurr['input'].copy())
+    labels = torch.as_tensor(datacurr['labels'].copy())
+    if self.discretize:
+      labels_todiscretize = torch.as_tensor(datacurr['labels_todiscretize'].copy())
+      labels_discrete = torch.as_tensor(datacurr['labels_discrete'].copy())
+    else:
+      labels_todiscretize = None
+      labels_discrete = None
+    if self.input_labels:
+      if self.discretize:
+        input_labels = torch.zeros((labels.shape[0],self.d_output),dtype=labels.dtype)
+        input_labels[:,self.continuous_idx] = labels
+        input_labels[:,self.discrete_idx] = labels_todiscretize
+      else:
+        input_labels = labels.clone()
+    else:
+      input_labels = None
+    
+    # add_noise
+    if self.do_add_noise:
+      eta,input,input_labels,labels,labels_todiscretize,labels_discrete = self.add_noise(input,input_labels,labels,labels_todiscretize,labels_discrete)
     
     # whether we start with predicting the 0th or the 1th frame in the input sequence
     if self.ismasked() or (self.input_labels == False) or \
       self.flatten_labels or self.flatten_obs:
       starttoff = 0
     else:
-      starttoff = 1    
-    init = torch.as_tensor(self.data[idx]['init'][:,starttoff].copy())      
-    scale = torch.as_tensor(self.data[idx]['scale'].copy())
-    categories = torch.as_tensor(self.data[idx]['categories'].copy())
-    metadata = self.data[idx]['metadata'].copy()
+      starttoff = 1
+    init = torch.as_tensor(datacurr['init'][:,starttoff].copy())      
+    scale = torch.as_tensor(datacurr['scale'].copy())
+    categories = torch.as_tensor(datacurr['categories'].copy())
+    metadata = datacurr['metadata'].copy()
     metadata['t0'] += starttoff
     metadata['frame0'] += starttoff
 
@@ -1986,19 +2022,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
            'metadata': metadata}
 
     if self.discretize:
-      labels_discrete = torch.as_tensor(self.data[idx]['labels_discrete'].copy())
-      labels_todiscretize = torch.as_tensor(self.data[idx]['labels_todiscretize'].copy())
-      # full continuous labels
-      labels_full = torch.zeros((labels.shape[0],self.d_output),dtype=labels.dtype)
-      labels_full[:,self.continuous_idx] = labels
-      labels_full[:,self.discrete_idx] = labels_todiscretize
       res['labels_discrete'] = labels_discrete[starttoff:,:,:]
       res['labels_todiscretize'] = labels_todiscretize[starttoff:,:]
-    else:
-      labels_discrete = None
-      labels_todiscretize = None
-      labels_full = labels
-
 
     nin = input.shape[-1]
     contextl = input.shape[0]
@@ -2052,7 +2077,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       res['labels_stacked'] = labels
     else:
       if self.input_labels:
-        input = torch.cat((labels_full[:-starttoff,:],input[starttoff:,:]),dim=-1)
+        input = torch.cat((input_labels[:-starttoff,:],input[starttoff:,:]),dim=-1)
       labels = labels[starttoff:,:]
       res['input'] = input
       res['labels'] = labels
@@ -2062,6 +2087,41 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if dropout_mask is not None:
       res['dropout_mask'] = dropout_mask
     return res
+  
+  def add_noise(self,input,input_labels,labels,labels_todiscretize,labels_discrete):
+
+    # add noise to the input movement and pose
+    # desire is to do movement truemovement(t-1->t)
+    # movement noisemovement(t-1->t) = truemovement(t-1->t) + eta(t) actually done
+    # resulting in noisepose(t) = truepose(t) + eta(t)[featrelative]
+    # output should then be fixmovement(t->t+1) = truemovement(t->t+1) - eta(t)
+    # input pose: noise_input_pose(t) = truepose(t) + eta(t)[featrelative]
+    # input movement: noise_input_movement(t-1->t) = truemovement(t-1->t) + eta(t)
+    # output movement: noise_output_movement(t->t+1) = truemovement(t->t+1) - eta(t)
+    # movement(t->t+1) = truemovement(t->t+1)
+
+    input_noise_sigma = self.input_noise_sigma
+    if self.sig_labels is not None:
+      input_noise_sigma = input_noise_sigma / self.sig_labels
+
+    eta = torch.as_tensor(input_noise_sigma[None,:]*np.random.randn(input.shape[0],self.d_output))
+    # no noise on first time point
+    eta[0,:] = 0.
+    # input pose
+    inputidx = get_sensory_feature_idx(self.simplify_in)
+    i0 = inputidx['pose'][0]
+    i1 = inputidx['pose'][1]
+    input[:,i0:i1] += eta[:,featrelative]
+    # input labels
+    if self.input_labels:
+      input_labels += eta
+    # output labels
+    if self.continuous:
+      labels -= eta[:,self.continuous_idx]
+    if self.discretize and np.any(self.input_noise_sigma!=0.):
+      labels_todiscretize -= eta[:,self.discrete_idx]
+      labels_discrete = torch.as_tensor(self.discretize_fun(labels_todiscretize.numpy()))
+    return eta,input,input_labels,labels,labels_todiscretize,labels_discrete
   
   def __len__(self):
     return len(self.data)
@@ -2149,7 +2209,6 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     input0 = split_features(input0,simplify=self.simplify_in)
     Xorigin0 = global0[...,:2]
     Xtheta0 = global0[...,2] 
-
     thetavel = movements[...,feattheta]
     
     Xtheta = np.cumsum(np.concatenate((Xtheta0[...,None],thetavel),axis=-1),axis=-1)
@@ -4276,6 +4335,12 @@ def read_config(jsonfile):
     
   if 'all_discretize_epsilon' in config:
     config['all_discretize_epsilon'] = np.array(config['all_discretize_epsilon'])
+  if 'input_noise_sigma' in config:
+    config['input_noise_sigma'] = np.array(config['input_noise_sigma'])
+  elif 'input_noise_sigma_mult' in config and 'all_discretize_epsilon' in config:
+    config['input_noise_sigma'] = np.zeros(config['all_discretize_epsilon'].shape)
+    l = len(config['input_noise_sigma_mult'])
+    config['input_noise_sigma'][:l] = config['all_discretize_epsilon'][:l]*np.array(config['input_noise_sigma_mult'])    
     
   assert config['modeltype'] in ['mlm','clm']
   assert config['modelstatetype'] in ['prob','best',None]
@@ -5027,10 +5092,30 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   }
 
   print('Creating training data set...')
-  train_dataset = FlyMLMDataset(X,**dataset_params)
+  train_dataset = FlyMLMDataset(X,input_noise_sigma=config['input_noise_sigma'],**dataset_params)
 
   dataset_params['zscore_params'] = train_dataset.get_zscore_params()
   dataset_params['discretize_params'] = train_dataset.get_discretize_params()
+
+  # debugging adding noise
+  idxsample = 123
+  train_dataset.set_eval_mode()
+  extrue = train_dataset[idxsample]
+  train_dataset.set_train_mode()
+  exnoise = train_dataset[idxsample]
+  exboth = {}
+  for k in exnoise.keys():
+    if type(exnoise[k]) == torch.Tensor:
+      exboth[k] = torch.stack((extrue[k],exnoise[k]),dim=0)
+    elif type(exnoise[k]) == dict:
+      exboth[k] = {}
+      for k1 in exnoise[k].keys():
+        exboth[k][k1] = torch.stack((torch.tensor(extrue[k][k1]),torch.tensor(exnoise[k][k1])))
+    else:
+      raise ValueError('huh')  
+  hpose,ax,fig = debug_plot_batch_pose(exboth,train_dataset,data=data,tsplot=np.round(np.linspace(0,64,4)).astype(int))
+  Xfeat_true = train_dataset.get_Xfeat(example=extrue,use_todiscretize=True)
+  Xfeat_noise = train_dataset.get_Xfeat(example=exnoise,use_todiscretize=True)
 
   print('Creating validation data set...')
   val_dataset = FlyMLMDataset(valX,**dataset_params)
