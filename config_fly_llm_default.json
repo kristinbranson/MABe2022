@@ -45,6 +45,10 @@
     "_comment_discretize_nbins": "number of bins to discretize each output into",
     "discretize_nbins": 25,
 
+    "p_add_input_noise": 0,
+    "input_noise_sigma": null,
+
+
     "_comment_all_discretize_epsilon": "smallest bin for each output type, related to tracking noise",
     "all_discretize_epsilon": [0.01322199, 0.01349601, 0.02598117, 0.02033068, 0.01859137, 0.05900833, 0.05741996, 0.02196621, 0.0558432 , 0.02196207, 0.05579313, 0.02626397, 0.12436298, 0.02276208, 0.04065661, 0.02275847, 0.04038093, 0.02625952, 0.12736998, 0.02628111, 0.13280959, 0.02628102, 0.13049692, 0.02439783, 0.0367505, 0.02445746, 0.03742915, 0.02930942, 0.02496748],
 

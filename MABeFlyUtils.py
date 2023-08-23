@@ -1207,7 +1207,7 @@ hkpt: Optional. Handle of keypoints to update instead of plot new key points. De
 """
 def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax=None, kptcolors=None, color=None, name=None,
              plotskel=True, plotkpts=True, hedge=None, hkpt=None, textlabels=None, htxt=None, kpt_ms=6, skel_lw=1,
-             kpt_alpha=1.,skel_alpha=1., skeledgecolors=None):
+             kpt_alpha=1.,skel_alpha=1., skeledgecolors=None, kpt_marker='.'):
   # plot_fly(x,fig=None,ax=None,kptcolors=None):
   # x is nfeatures x 2
   assert(pose is not None)
@@ -1234,11 +1234,11 @@ def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax
         kptname = 'keypoints'
         if name is not None:
           kptname = name + ' ' + kptname
-        hkpt = ax.plot(xc,yc,'.',color=kptcolors,label=kptname,zorder=10,ms=kpt_ms,alpha=kpt_alpha)[0]
+        hkpt = ax.plot(xc,yc,kpt_marker,color=kptcolors,label=kptname,zorder=10,ms=kpt_ms,alpha=kpt_alpha)[0]
       else:
         if type(kptcolors) == str:
           kptcolors = plt.get_cmap(kptcolors)
-        hkpt = ax.scatter(xc,yc,c=np.arange(len(kptidx)),marker='.',cmap=kptcolors,s=kpt_ms,alpha=kpt_alpha,zorder=10)
+        hkpt = ax.scatter(xc,yc,c=np.arange(len(kptidx)),marker=kpt_marker,cmap=kptcolors,s=kpt_ms,alpha=kpt_alpha,zorder=10)
     else:
       if type(hkpt) == matplotlib.lines.Line2D:
         hkpt.set_data(xc,yc)
@@ -1254,7 +1254,7 @@ def plot_fly(pose=None, kptidx=keypointidx, skelidx=skeleton_edges, fig=None, ax
       if htxt is None:
         htxt = []
         for i in range(len(xc)):
-          htxt.append(plt.text([],[],'%d: %s'%(i+1,keypointnames[i]),horizontalalignment='left',visible=isreal))
+          htxt.append(plt.text(xc[i],yc[i],'%d: %s'%(i+1,keypointnames[i]),horizontalalignment='left',visible=isreal))
       else:
         for i in range(len(xc)):
           htxt[i].set_visible(isreal)
@@ -2149,8 +2149,7 @@ def flip_flies(X,arena_center=[0,0],flipdim=0):
   flipidx = get_flip_idx()
   for i in range(len(flipidx)):
     flipX[i,flipdim,...] = arena_center[flipdim]-X[flipidx[i],flipdim,...]
-    if flipidx[i] != i:
-      flipX[flipidx[i],flipdim,...] = arena_center[flipdim]-X[flipidx[i],flipdim,...]
+    flipX[i,1-flipdim,...] = X[flipidx[i],1-flipdim,...]
 
   return flipX
 
