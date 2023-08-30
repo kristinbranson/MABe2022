@@ -23,6 +23,9 @@
     "_comment_compute_sensory_diffs": "whether to compute sensory diffs as additional inputs",
     "compute_sensory_diffs": false,
 
+    "dct_tau": null,
+    "tspred_global": [1],
+    
     "obs_embedding": false,
     "obs_embedding_types": null,
     "obs_embedding_params": null,

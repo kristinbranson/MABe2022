@@ -22,6 +22,8 @@ import sklearn.decomposition
 import json
 import argparse
 import pathlib
+import pickle
+import gzip
 
 print('fly_llm...')
 
@@ -134,9 +136,9 @@ def interval_all(x,l):
 X = chunk_data(data,contextl,reparamfun)
 
 """
-def chunk_data(data,contextl,reparamfun):
+def chunk_data(data,contextl,reparamfun,npad=1):
   
-  contextlpad = contextl + 1
+  contextlpad = contextl + npad
   
   # all frames for the main fly must have real data
   allisdata = interval_all(data['isdata'],contextlpad)
@@ -181,8 +183,8 @@ def chunk_data(data,contextl,reparamfun):
       # this is guaranteed to be < T
       t1 = t0+contextlpad-1
       id = data['ids'][t0,flynum]
-      xcurr = reparamfun(data['X'][...,t0:t1+1,:],id,flynum)
-      xcurr['metadata'] = {'flynum': flynum, 'id': id, 't0': t0, 'videoidx': data['videoidx'][t0], 'frame0': data['frames'][t0]}
+      xcurr = reparamfun(data['X'][...,t0:t1+1,:],id,flynum,npad=npad)
+      xcurr['metadata'] = {'flynum': flynum, 'id': id, 't0': t0, 'videoidx': data['videoidx'][t0,0], 'frame0': data['frames'][t0,0]}
       xcurr['categories'] = data['y'][:,t0:t1+1,flynum].astype(np.float32)
       X.append(xcurr)
       if t0+contextl >= maxt0curr:
@@ -829,7 +831,7 @@ def compute_pose_features(X,scale):
 
   return relpose,globalpos
 
-def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred=[1,]):
+def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred_global=[1,]):
   """
   movement = compute_movement(X=X,scale=scale,simplify=simplify_out)
   movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out)
@@ -860,22 +862,26 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
 
   Xorigin = globalpos[:2,...]
   Xtheta = globalpos[2,...]
+  ntspred_global = len(tspred_global)
+  nmovement_features = ntspred_global*nglobal
   if (dct_m is not None) and simplify != 'global':
-    ntspred = dct_m.shape[0]
-    tspred = np.arange(1,ntspred+1)
-    nmovement_features = nfeatures*ntspred
+    ntspred_dct = dct_m.shape[0]
+    tspred_dct = np.arange(1,ntspred_dct+1)
+    tspred_relative = tspred_dct
   else:
-    ntspred = len(tspred)
-    nmovement_features = nglobal*ntspred
-    if simplify != 'global':
-      nmovement_features += nrelative
-  lastT = T - tspred[-1]
+    ntspred_dct = 0
+    tspred_dct = []
+    tspred_relative = [1,]
+  nmovement_features += (ntspred_dct+1)*nrelative
+  # compute the max of tspred_global and tspred_dct
+  tspred_all = np.unique(np.concatenate((tspred_global,tspred_relative)))
+  lastT = T - np.max(tspred_all)
   
   # dXoriginrel[tau,:,t,fly] is the global position for fly fly at time t+tau in the coordinate system of the fly at time t
-  dXoriginrel = np.zeros((ntspred,2,T,nflies),dtype=Xorigin.dtype)
+  dXoriginrel = np.zeros((ntspred_global,2,T,nflies),dtype=Xorigin.dtype)
   dXoriginrel[:] = np.nan
   # dtheta[tau,t,fly] is the change in orientation for fly fly at time t+tau from time t
-  dtheta = np.zeros((ntspred,T,nflies),dtype=Xtheta.dtype)
+  dtheta = np.zeros((ntspred_global,T,nflies),dtype=Xtheta.dtype)
   dtheta[:] = np.nan
   # dtheta1[t,fly] is the change in orientation for fly from frame t to t+1
   dtheta1 = mabe.modrange(Xtheta[1:,:]-Xtheta[:-1,:],-np.pi,np.pi)
@@ -886,8 +892,9 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
     drelpose1[featangle[featrelative],:,:] = mabe.modrange(drelpose1[featangle[featrelative],:,:],-np.pi,np.pi)
     # drelpose[tau,t,fly] is the change in pose for fly fly at time t+tau from time t
     if dct_m is not None:
-      drelpose = np.zeros((ntspred,relpose.shape[0],T,nflies),dtype=relpose.dtype)
+      drelpose = np.zeros((relpose.shape[0],T,ntspred_dct+1,nflies),dtype=relpose.dtype)
       drelpose[:] = np.nan
+      drelpose[:,:-1,0,:] = drelpose1
     else:
       drelpose = drelpose1
   
@@ -898,29 +905,30 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
     y = torch.nn.functional.conv2d(xtorch,torch.ones((1,1,n,1),dtype=xtorch.dtype),padding='valid')
     return y[:,0,...].numpy()
   
-  for i in range(ntspred):
-    toff = tspred[i]
+  for i in range(ntspred_global):
+    toff = tspred_global[i]
     dXoriginrel[i,:,:-toff,:] = mabe.rotate_2d_points((Xorigin[:,toff:,:]-Xorigin[:,:-toff,:]).transpose((1,0,2)),Xtheta[:-toff,:]).transpose((1,0,2))
     dtheta[i,:-toff,:] = boxsum(dtheta1[None,...],toff)
+  for i,toff in enumerate(tspred_dct):
     if (dct_m is not None) and (simplify != 'global'):
-      drelpose[i,:,:-toff,:] = boxsum(drelpose1,toff)
+      drelpose[:,:-toff,i+1,:] = boxsum(drelpose1,toff)
 
   # only full data up to frame lastT
   dXoriginrel = dXoriginrel[:,:,:lastT,:]
   dtheta = dtheta[:,:lastT,:]
+  drelpose = drelpose[:,:lastT]
   if (simplify != 'global'):
-    drelpose = drelpose[:,:lastT,:]
     if (dct_m is not None):
-      drelpose_dct = dct_m @ drelpose
+      drelpose[:,:,1:,:] = dct_m @ drelpose[:,:,1:,:]
+    drelpose = np.moveaxis(drelpose,2,0)
 
   movement_global = np.concatenate((dXoriginrel[:,[1,0]],dtheta[:,None,:,:]),axis=1)
+  movement_global = movement_global.reshape((ntspred_global*nglobal,lastT,nflies))  
   if simplify == 'global':
     movement = movement_global
-  elif dct_m is not None:
-    movement = np.concatenate((movement_global,drelpose_dct),axis=1)
   else:
-    movement = np.concatenate((movement_global.reshape((nglobal*ntspred,lastT,nflies)),drelpose),axis=0)
-  movement = movement.reshape((nmovement_features,lastT,nflies))
+    drelpose = drelpose.reshape(((ntspred_dct+1)*nrelative,lastT,nflies))
+    movement = np.concatenate((movement_global,drelpose),axis=0)
 
   # old code
   # dXoriginrel = mabe.rotate_2d_points((Xorigin[:,1:,:]-Xorigin[:,:-1,:]).transpose((1,0,2)),Xtheta[:-1,:]).transpose((1,0,2))
@@ -1010,8 +1018,56 @@ def get_dct_matrix(N: int) -> (np.ndarray,np.ndarray):
   idct_m = np.linalg.inv(dct_m)
   return dct_m, idct_m
 
+def unravel_label_index(idx,dct_m=None,tspred_global=[1,]):
+  idx = np.array(idx)
+  sz = idx.shape
+  idx = idx.flatten()
+  if dct_m is None:
+    dct_tau = 1
+  else:
+    dct_tau = dct_m.shape[0]+1
+  offrelative = len(tspred_global)*nglobal
+  ftidx = np.zeros((len(idx),2),dtype=int)
+  for ii,i in enumerate(idx):
+    if i < offrelative:
+      tidx,fidx = np.unravel_index(i,(len(tspred_global),nglobal))
+      ftidx[ii] = (fidx,tspred_global[tidx])
+    else:
+      t,fidx = np.unravel_index(i-offrelative,(dct_tau,nrelative))
+      ftidx[ii] = (fidx+nglobal,t)
+  return ftidx.reshape(sz+(2,))
+
+def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
+
+  ftidx = np.array(ftidx)
+  sz = ftidx.shape
+  assert sz[-1] == 2
+  ftidx = ftidx.reshape((-1,2))
+  
+  idx = np.zeros(ftidx.shape[:-1],dtype=int)
+  
+  if dct_m is None:
+    dct_tau = 1
+  else:
+    dct_tau = dct_m.shape[0]+1
+  offrelative = len(tspred_global)*nglobal
+  
+  for i,ft in enumerate(ftidx):
+    fidx = ft[0]
+    t = ft[1]
+    isglobal = fidx < nglobal
+    if isglobal:
+      tidx = np.nonzero(tspred_global==t)[0][0]
+      assert tidx is not None
+      idx[i] = np.ravel_multi_index((tidx,fidx),(len(tspred_global),nglobal))
+    else:
+      idx[i] = np.ravel_multi_index((t,fidx-nglobal),(dct_tau,nrelative))+offrelative
+  
+  return idx.reshape(sz[:-1])
+
 def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
-                     simplify_out=None,simplify_in=None,dct_m=None):
+                     simplify_out=None,simplify_in=None,dct_m=None,tspred_global=[1,],
+                     npad=1):
   
   res = {}
   
@@ -1024,29 +1080,27 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
   relpose,globalpos = compute_pose_features(X[...,flynum],scale)
   relpose = relpose[...,0]
   globalpos = globalpos[...,0]
+  if npad == 0:
+    endidx = None
+  else:
+    endidx = -npad
   sensory,wall_touch,otherflies_vision,otherflies_touch = \
-    compute_sensory_wrapper(X,flynum,theta_main=globalpos[featthetaglobal,...],
+    compute_sensory_wrapper(X[:,:,:endidx,:],flynum,theta_main=globalpos[featthetaglobal,:endidx],
                             returnall=True)
-  input = combine_inputs(relpose=relpose,sensory=sensory).T
-  res['input'] = input[:-1,:]
+  res['input'] = combine_inputs(relpose=relpose[:,:endidx],sensory=sensory).T
+  #res['input'] = input[:-1,:]
 
-  movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out)
+  movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out,dct_m=dct_m,tspred_global=tspred_global)
   if simplify_out is not None:
     if simplify_out == 'global':
       movement = movement[featglobal,...]
     else:
       raise
-
-  if dct_m is not None:
-    featpose = combine_relative_global_pose(relpose,globalpos)
     
-  #   dct_m,_ = get_dct_matrix(posout.shape[-1])
-  #   dct_out = dct_m @ posout
-
   res['labels'] = movement.T
   res['init'] = globalpos[:,:2]
   res['scale'] = scale
-  res['nextinput'] = input[-1,:]
+  #res['nextinput'] = input[-1,:]
   
   if not smush:
     res['global'] = globalpos[:,:-1]
@@ -1482,6 +1536,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                dozscore=False,
                zscore_params={},
                discreteidx=None,
+               discrete_tspred=[1,],
                discretize_nbins=50,
                discretize_epsilon=None,
                discretize_params={},
@@ -1489,7 +1544,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                flatten_obs_idx=None,
                flatten_do_separate_inputs=False,
                input_noise_sigma=None,
-               p_add_input_noise=0):
+               p_add_input_noise=0,
+               dct_ms=None,
+               tspred_global=[1,],):
 
     self.data = data
     self.dtype = data[0]['input'].dtype
@@ -1510,6 +1567,26 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if maskflag is None:
       maskflag = (masktype is not None) or (pdropout_past>0.)
     self.maskflag = maskflag
+  
+    
+    self.dct_m = None
+    self.idct_m = None
+    if dct_ms is not None:
+      self.dct_m = dct_ms[0]
+      self.idct_m = dct_ms[1]
+    self.tspred_global = tspred_global
+    # indices of labels corresponding to the next frame if multiple frames are predicted
+    tnext = np.min(self.tspred_global)
+    self.nextframeidx_global = self.ravel_label_index([(f,tnext) for f in featglobal])
+    if self.simplify_out is None:
+      self.nextframeidx_relative = self.ravel_label_index([(i,0) for i in np.nonzero(featrelative)[0]])
+    else:
+      self.nextframeidx_relative = np.array([])
+    self.nextframeidx = np.r_[self.nextframeidx_global,self.nextframeidx_relative]
+    if self.dct_m is not None:
+      dct_tau = self.dct_m.shape[0]
+      self.idxdct_relative = np.stack([self.ravel_label_index([(i,f+1) for i in np.nonzero(featrelative)[0]]) for f in range(dct_tau)])
+    self.d_output_nextframe = len(self.nextframeidx)
     
     if input_labels:
       assert(masktype is None)
@@ -1517,12 +1594,13 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       
     self.input_labels = input_labels
     if self.input_labels:
-      self.d_input_labels = self.d_output
+      self.d_input_labels = self.d_output_nextframe
     else:
       self.d_input_labels = 0
     
     # which outputs to discretize, which to keep continuous
     self.discrete_idx = np.array([])
+    self.discrete_tspred = np.array([1,])
     self.discretize = False
     self.continuous_idx = np.arange(self.d_output)
     self.discretize_nbins = None
@@ -1552,7 +1630,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       self.zscore(**zscore_params)
 
     if discreteidx is not None:
-      self.discretize_labels(discreteidx,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)
+      self.discretize_labels(discreteidx,discrete_tspred,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)
     
     self.set_flatten_params(flatten_labels=flatten_labels,flatten_obs_idx=flatten_obs_idx,flatten_do_separate_inputs=flatten_do_separate_inputs)
     
@@ -1596,6 +1674,21 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       return len(self.discrete_idx) + int(self.continuous)
     else:
       return 1
+    
+  @property
+  def dct_tau(self):
+    if self.dct_m is None:
+      return 0
+    else:
+      return self.dct_m.shape[0]
+    
+  @property
+  def ntspred_relative(self):
+    return self.dct_tau + 1
+  
+  @property
+  def ntspred_global(self):
+    return len(self.tspred_global)
           
   def set_train_mode(self):
     self.do_add_noise = self.input_noise_sigma is not None and self.p_add_input_noise > 0
@@ -1670,12 +1763,34 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         self.idx_output_token_continuous = torch.tensor([])
         
     return
+  
+  def ravel_label_index(self,ftidx):
     
-  def discretize_labels(self,discrete_idx,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs):
+    idx = ravel_label_index(ftidx,dct_m=self.dct_m,tspred_global=self.tspred_global)
+    return idx
+  
+  def unravel_label_index(self,idx):
+      
+    ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global)
+    return ftidx
+    
+  def discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs):
         
     if not isinstance(discrete_idx,np.ndarray):
       discrete_idx = np.array(discrete_idx)
-    self.discrete_idx = discrete_idx
+    if not isinstance(discrete_tspred,np.ndarray):
+      discrete_tspred = np.array(discrete_tspred)
+
+    ftidx = []
+    for f in discrete_idx:
+      for t in discrete_tspred:
+        if f in featglobal:
+          ftidx.append((f,t))
+        else:
+          # only t = 1 -> 0 can be discrete for relative features
+          if t == 1:
+            ftidx.append((f,0))
+    self.discrete_idx = np.sort(self.ravel_label_index(ftidx))
     
     self.discretize_nbins = nbins
     self.continuous_idx = np.ones(self.d_output,dtype=bool)
@@ -2007,12 +2122,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       labels_todiscretize = None
       labels_discrete = None
     if self.input_labels:
+      # should we use all future predictions, or just the next time point?
       if self.discretize:
         input_labels = torch.zeros((labels.shape[0],self.d_output),dtype=labels.dtype)
         input_labels[:,self.continuous_idx] = labels
         input_labels[:,self.discrete_idx] = labels_todiscretize
+        input_labels = input_labels[:,self.nextframeidx] # probably could be made faster
       else:
-        input_labels = labels.clone()
+        input_labels = labels[:,self.nextframeidx].clone()
     else:
       input_labels = None
     
@@ -2026,7 +2143,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     init = torch.as_tensor(datacurr['init'][:,starttoff].copy())      
     scale = torch.as_tensor(datacurr['scale'].copy())
     categories = torch.as_tensor(datacurr['categories'].copy())
-    metadata = datacurr['metadata'].copy()
+    metadata =copy.deepcopy(datacurr['metadata'])
     metadata['t0'] += starttoff
     metadata['frame0'] += starttoff
 
@@ -2191,7 +2308,58 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       #globalnext = globalin+movement[featglobal]
     return posenext,globalnext
   
-  def get_Xfeat(self,input0=None,global0=None,movements=None,example=None,**kwargs):
+  def get_next_relative_movements_dct(self,movements,iszscored=True,dozscore=True):
+    if self.simplify_out == 'global':
+      return movements[...,[]]
+    
+    if type(movements) is np.ndarray:
+      movements = torch.as_tensor(movements)
+
+    movements_dct = movements[...,self.idxdct_relative]
+    if not iszscored and self.mu_labels is not None:
+      mu = torch.as_tensor(self.mu_labels[self.idxdct_relative]).to(dtype=movements.dtype,device=movements.device)
+      sig = torch.as_tensor(self.sig_labels[self.idxdct_relative]).to(dtype=movements.dtype,device=movements.device)
+      movements_dct = unzscore(movements_dct,mu,sig)
+      
+    idct_m0 = torch.as_tensor(self.idct_m[[0,],:]).to(dtype=movements.dtype,device=movements.device)
+    dctfeat = movements[...,self.idxdct_relative]
+    movements_next_relative = torch.matmult(idct_m0,dctfeat)
+    
+    if dozscore:
+      movements_next_relative = zscore(movements_next_relative,self.mu_labels[self.nextframeidx_relative],self.sig_labels[self.nextframeidx_relative])
+      
+    return movements_next_relative
+  
+  def compare_dct_to_next_relative(self,movements):
+    movements_next_relative_dct = self.get_next_relative_movements_dct(movements,iszscored=True,dozscore=True)
+    movements_next_relative0 = movements[...,self.nextframeidx_relative]
+    err = movements_next_relative_dct - movements_next_relative0
+    return err
+  
+  def get_next_movements(self,movements=None,example=None,iszscored=False,use_dct=False,**kwargs):
+    if movements is None:
+      movements = self.get_full_labels(example=example,**kwargs)
+      iszscored = True
+      
+    if torch.is_tensor(movements):
+      movements = movements.numpy()
+      
+    if iszscored and self.mu_labels is not None:
+      movements = unzscore(movements,self.mu_labels,self.sig_labels)
+    
+    movements_next_global = movements[...,self.nextframeidx_global]
+    if self.simplify_out is None:
+      if use_dct and self.dct_m is not None:
+        dctfeat = movements[...,self.idxdct_relative]
+        movements_next_relative = self.idct_m[[0,],:] @ dctfeat
+      else:
+        movements_next_relative = movements[...,self.nextframeidx_relative]
+      movements_next = np.concatenate((movements_next_global,movements_next_relative),axis=-1)
+    else:
+      movements_next = movements_next_global
+    return movements_next
+  
+  def get_Xfeat(self,input0=None,global0=None,movements=None,example=None,use_dct=False,**kwargs):
     """
     Xfeat = self.get_Xfeat(input0,global0,movements)
     Xfeat = self.get_Xfeat(example=example)
@@ -2236,13 +2404,15 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       input0 = unzscore(input0,self.mu_input,self.sig_input)
       movements = unzscore(movements,self.mu_labels,self.sig_labels)
       
+    movements_next = self.get_next_movements(movements=movements,iszscored=False,use_dct=use_dct)
+      
     input0 = split_features(input0,simplify=self.simplify_in)
     Xorigin0 = global0[...,:2]
     Xtheta0 = global0[...,2] 
-    thetavel = movements[...,feattheta]
+    thetavel = movements_next[...,feattheta]
     
     Xtheta = np.cumsum(np.concatenate((Xtheta0[...,None],thetavel),axis=-1),axis=-1)
-    Xoriginvelrel = movements[...,[1,0]]
+    Xoriginvelrel = movements_next[...,[featorigin[1],featorigin[0]]]
     Xoriginvel = mabe.rotate_2d_points(Xoriginvelrel.reshape((n,2)),-Xtheta[...,:-1].reshape(n)).reshape(szrest+(2,))
     Xorigin = np.cumsum(np.concatenate((Xorigin0[...,None,:],Xoriginvel),axis=-2),axis=-2)
     Xfeat = np.zeros(szrest[:-1]+(szrest[-1]+1,nfeatures),dtype=self.dtype)
@@ -2252,11 +2422,11 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.simplify_out == 'global':
       Xfeat[...,featrelative] = np.tile(input0['pose'],szrest[:-1]+(szrest[-1]+1,1))
     else:
-      Xfeatpose = np.cumsum(np.concatenate((input0['pose'][...,None,:],movements[...,featrelative]),axis=-2),axis=-2)
+      Xfeatpose = np.cumsum(np.concatenate((input0['pose'][...,None,:],movements_next[...,featrelative]),axis=-2),axis=-2)
       Xfeat[...,featrelative] = Xfeatpose
     
     return Xfeat
-
+  
   def get_Xkp(self,example,pred=None,**kwargs):
     """
     Xkp = self.get_Xkp(example,pred=None)
@@ -2642,11 +2812,15 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         outnames (list of strings): names of each output motion
     """
     outnames_global = ['forward','sideways','orientation']
-
     if self.simplify_out == 'global':
       outnames = outnames_global
-    else:
+    else:        
       outnames = outnames_global + [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+      
+    if len(self.tspred_global) > 1 or self.dct_m is not None:
+      ftidx = self.unravel_label_index(np.arange(self.d_output,dtype=int))
+      outnames = [f'{outnames[ft[0]]}_{ft[1]}' for ft in ftidx]
+      
     return outnames
     
   def parse_label_fields(self,example):
@@ -2874,6 +3048,9 @@ def mixed_causal_criterion(tgt,pred,weight_discrete=.5,extraout=False):
     return err,err_discrete,err_continuous
   else:
     return err
+  
+def dct_consistency(pred):
+  return
 
 def prob_causal_criterion(tgt,pred):
   d = tgt.shape[-1]
@@ -3780,7 +3957,8 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
                           pred=None,data=None,nsamplesplot=3,
                           true_discrete_mode='to_discretize',
                           pred_discrete_mode='sample',
-                          h=None,ax=None,fig=None,label_true='True',label_pred='Pred'):
+                          h=None,ax=None,fig=None,label_true='True',label_pred='Pred',
+                          ntspred_plot=2):
   batch_size = example['input'].shape[0]
   contextl = train_dataset.ntimepoints
     
@@ -3809,6 +3987,32 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
   else:
     pred_args = {}
 
+  ntsplot_global = np.minimum(train_dataset.ntspred_global,ntspred_plot)
+  ntsplot_relative = np.minimum(train_dataset.ntspred_relative,ntspred_plot)
+  if ntsplot_global == 1:
+    tidxplot_global = np.zeros((nglobal,1),dtype=int)
+  elif ntsplot_global == train_dataset.ntspred_global:
+    tidxplot_global = np.tile(np.arange(ntsplot_global,dtype=int)[None,:],(nglobal,1))
+  else:
+    # choose 0 + a variety of different timepoints for each global feature so that a variety of timepoints are selected
+    tidxplot_global = np.concatenate((np.zeros((nglobal,1),dtype=int),
+                                      np.round(np.linspace(1,train_dataset.ntspred_global-1,(ntsplot_global-1)*nglobal)).astype(int).reshape(-1,nglobal).T),axis=-1)
+  if ntsplot_relative == 1:
+    tsplot_relative = np.zeros((nrelative,1),dtype=int)
+  elif ntsplot_relative == train_dataset.ntspred_relative:
+    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:],(nrelative,1))
+  else:
+    # choose 0 + a variety of different timepoints for each feature so that a variety of timepoints are selected
+    tsplot_relative = np.concatenate((np.zeros((nrelative,1),dtype=int),
+                                      np.round(np.linspace(1,train_dataset.ntspred_relative-1,(ntsplot_relative-1)*nrelative)).astype(int).reshape(-1,nrelative).T),axis=-1)
+  ftidx = []
+  for fi,f in enumerate(featglobal):
+    for ti in range(ntsplot_global):
+      ftidx.append((f,train_dataset.tspred_global[tidxplot_global[fi,ti]]))
+  for fi,f in enumerate(np.nonzero(featrelative)[0]):
+    for ti in range(ntsplot_relative):
+      ftidx.append((f,tsplot_relative[fi,ti]))
+  featidxplot = train_dataset.ravel_label_index(ftidx)
     
   samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
   for i in range(nsamplesplot):
@@ -3824,10 +4028,7 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
     if mask is not None:
       maskcurr = np.zeros(mask.shape[-1]+1,dtype=bool)
       maskcurr[:-1] = mask[iplot,...].numpy()
-    else:
-      maskcurr = np.zeros(ntimepoints+1,dtype=bool)
-      maskcurr[:-1] = True
-    maskidx = np.nonzero(maskcurr)[0]
+      maskidx = np.nonzero(maskcurr)[0]
     if pred is not None:
       predcurr = get_batch_idx(pred,iplot)
       zmovement_continuous_pred,zmovement_discrete_pred = train_dataset.get_continuous_discrete_labels(predcurr)
@@ -3851,41 +4052,49 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
       #Xtheta_pred = None
       zmovement_pred = None
     
-    mult = 4.
-    d = train_dataset.d_output
+    mult = 6.
+    d = len(featidxplot)
     outnames = train_dataset.get_outnames()
     contextl = train_dataset.ntimepoints
 
     ax[i].cla()
     
-    for featii in range(len(train_dataset.discrete_idx)):
-      feati = train_dataset.discrete_idx[featii]
+    for featii,feati in enumerate(featidxplot):
+      featidx = np.nonzero(train_dataset.discrete_idx == feati)[0]
+      if len(featidx) == 0:
+        continue
+      featidx = featidx[0]
       im = np.ones((train_dataset.discretize_nbins,contextl,3))
-      ztrue = zmovement_discrete_true[:,featii,:].cpu().T
+      ztrue = zmovement_discrete_true[:,featidx,:].cpu().T
       ztrue = ztrue - torch.min(ztrue)
       ztrue = ztrue / torch.max(ztrue)
       im[:,:,0] = 1.-ztrue
       if pred is not None:
-        zpred = zmovement_discrete_pred[:,featii,:].detach().cpu().T
+        zpred = zmovement_discrete_pred[:,featidx,:].detach().cpu().T
         zpred = zpred - torch.min(zpred)
         zpred = zpred / torch.max(zpred)
         im[:,:,1] = 1.-zpred
-      ax[i].imshow(im,extent=(0,contextl,(feati-.5)*mult,(feati+.5)*mult),origin='lower',aspect='auto')
+      ax[i].imshow(im,extent=(0,contextl,(featii-.5)*mult,(featii+.5)*mult),origin='lower',aspect='auto')
       
-    for featii in range(len(train_dataset.continuous_idx)):
-      feati = train_dataset.continuous_idx[featii]
-      ax[i].plot([0,contextl],[mult*feati,]*2,':',color=[.5,.5,.5])
-      ax[i].plot(mult*feati + zmovement_continuous_true[:,featii],'-',color=true_color,label=f'{outnames[feati]}, true')
-      ax[i].plot(maskidx,mult*feati + zmovement_continuous_true[maskcurr[:-1],featii],'o',color=true_color,label=f'{outnames[feati]}, true')
+    for featii,feati in enumerate(featidxplot):
+      featidx = np.nonzero(train_dataset.continuous_idx == feati)[0]
+      if len(featidx) == 0:
+        continue
+      featidx = featidx[0]
+      ax[i].plot([0,contextl],[mult*featii,]*2,':',color=[.5,.5,.5])
+      ax[i].plot(mult*featii + zmovement_continuous_true[:,featidx],'-',color=true_color,label=f'{outnames[feati]}, true')
+      if mask is not None:
+        ax[i].plot(maskidx,mult*featii + zmovement_continuous_true[maskcurr[:-1],featidx],'o',color=true_color,label=f'{outnames[feati]}, true')
 
       labelcurr = outnames[feati]
       if pred is not None:
-        h = ax[i].plot(mult*feati + zmovement_continuous_pred[:,featii],'--',label=f'{outnames[feati]}, pred',color=pred_cmap(feati))
-        ax[i].plot(maskidx,mult*feati + zmovement_continuous_pred[maskcurr[:-1],featii],'o',color=pred_cmap(feati),label=f'{outnames[feati]}, pred')
+        h = ax[i].plot(mult*featii + zmovement_continuous_pred[:,featidx],'--',label=f'{outnames[feati]}, pred',color=pred_cmap(featii))
+        if mask is not None:
+          ax[i].plot(maskidx,mult*featii + zmovement_continuous_pred[maskcurr[:-1],featidx],'o',color=pred_cmap(featii),label=f'{outnames[feati]}, pred')
         
-    for feati in range(d):
+    for featii,feati in enumerate(featidxplot):
       labelcurr = outnames[feati]
-      ax[i].text(0,mult*(feati+.5),labelcurr,horizontalalignment='left',verticalalignment='top')
+      ax[i].text(0,mult*(featii+.5),labelcurr,horizontalalignment='left',verticalalignment='top')
 
     if (err_total is not None):
       if train_dataset.discretize:
@@ -4372,6 +4581,9 @@ def read_config(jsonfile):
     
   if 'all_discretize_epsilon' in config:
     config['all_discretize_epsilon'] = np.array(config['all_discretize_epsilon'])
+    if 'discreteidx' in config and config['discreteidx'] is not None:
+      config['discretize_epsilon'] = config['all_discretize_epsilon'][config['discreteidx']]
+    
   if 'input_noise_sigma' in config:
     config['input_noise_sigma'] = np.array(config['input_noise_sigma'])
   #elif 'input_noise_sigma_mult' in config and 'all_discretize_epsilon' in config:
@@ -4733,6 +4945,7 @@ def initialize_model(d_input,d_output,config,train_dataset,device):
     model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
     
     if train_dataset.discretize:
+      # this should be maybe be len(train_dataset.discrete_idx) / train_dataset.d_output
       config['weight_discrete'] = len(config['discreteidx']) / nfeatures
       if config['modeltype'] == 'mlm':
         criterion = mixed_masked_criterion
@@ -4743,6 +4956,9 @@ def initialize_model(d_input,d_output,config,train_dataset,device):
         criterion = masked_criterion
       else:
         criterion = causal_criterion
+        
+  # if train_dataset.dct_m is not None and config['weight_dct_consistency'] > 0:
+  #   criterion = lambda tgt,pred,**kwargs: criterion(tgt,pred,**kwargs) + train_dataset.compare_dct_to_next_relative(pred)
           
   return model,criterion
 
@@ -5094,7 +5310,56 @@ def clean_intermediate_results(savedir):
   print(f'Removed {nremoved} files')
   return removed
 
+def gzip_pickle_dump(filename, data):
+  with gzip.open(filename, 'wb') as f:
+    pickle.dump(data, f)
+
+def gzip_pickle_load(filename):
+  with gzip.open(filename, 'rb') as f:
+    return pickle.load(f)
+
+# import h5py
+# def hdf5_save(f, d, name="root"):
+
+#   try:
+#     if isinstance(f,str):
+#       f = h5py.File(f, "w")
+#     if isinstance(d,dict):
+#       g = f.create_group('dict__'+name)
+#       for k,v in d.items():
+#         hdf5_save(g,v,name=k)
+#     elif isinstance(d,list):
+#       if np.all(np.array([isinstance(x,str) for x in d])):
+#         g = f.create_dataset('liststr__'+name,data=np.array(d,dtype='S'))
+#       else:
+#         g = f.create_group('list__'+name)
+#         for i,v in enumerate(d):
+#           hdf5_save(g,v,name=str(i))
+#     elif isinstance(d,np.ndarray):    
+#       if np.all(np.array([isinstance(x,str) for x in d])):
+#         g = f.create_dataset('ndarraystr__'+name,data=np.array(d,dtype='S'))
+#       else:
+#         g = f.create_dataset('ndarray__'+name,data=d)
+#     else:
+#       g = f.create_dataset('other__'+name,data=d)
+  
+#   except Exception as e:
+#     print(f'Error saving {name}')
+#     raise e
+  
+#   return f
+
+def save_chunked_data(savefile,d):
+  gzip_pickle_dump(savefile,d)
+  return
+
+def load_chunked_data(savefile):
+  return gzip_pickle_load(savefile)
+
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
+
+  tmpsavefile = 'chunkeddata20230828.pkl'
+  #tmpsavefile = None
 
   config = read_config(configfile)
   if loadmodelfile is None and 'loadmodelfile' in config:
@@ -5116,24 +5381,75 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
   plt.ion()
   
-  data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
-  valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
+  
+  if tmpsavefile is not None:
+    print(f'Loading tmp save file {tmpsavefile}')
+    with open(tmpsavefile,'rb') as f:
+      tmp = pickle.load(f)
+    data = tmp['data']
+    scale_perfly = tmp['scale_perfly']
+    valdata = tmp['valdata']
+    val_scale_perfly = tmp['val_scale_perfly']
+    X = tmp['X']
+    valX = tmp['valX']
+
+  if tmpsavefile is None:  
+    data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
+    valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
+  
+  if config['dct_tau'] is not None and config['dct_tau'] > 0:
+    dct_m,idct_m = get_dct_matrix(config['dct_tau'])
+  else:
+    dct_m = None
+    idct_m = None
 
   # function for computing features
-  reparamfun = lambda x,id,flynum: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
-                                                    simplify_out=config['simplify_out'],
-                                                    simplify_in=config['simplify_in'])
+  reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
+                                                            simplify_out=config['simplify_out'],
+                                                            simplify_in=config['simplify_in'],
+                                                            dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
 
   val_reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,val_scale_perfly,
                                                                 outtype=np.float32,
                                                                 simplify_out=config['simplify_out'],
-                                                                simplify_in=config['simplify_in'],**kwargs)
-  print('Chunking training data...')
-  X = chunk_data(data,config['contextl'],reparamfun)
-  print('Chunking val data...')
-  valX = chunk_data(valdata,config['contextl'],val_reparamfun)
+                                                                simplify_in=config['simplify_in'],
+                                                                dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
+  npad = np.max(config['tspred_global'])
+  if dct_m is not None:
+    npad = np.maximum(dct_m.shape[0],npad)
 
-  print('Done.')
+  # sanity check on computing features when predicting many frames into the future
+  t0 = 510
+  flynum = 0
+  contextl = config['contextl']
+  id = data['ids'][t0,flynum]
+
+  contextlpad = contextl+npad
+  t1 = t0+contextlpad-1
+  x = data['X'][...,t0:t1+1,:]
+  xcurr1 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,dct_m=dct_m,tspred_global=config['tspred_global'],npad=npad)
+
+  contextlpad = contextl+1
+  t1 = t0+contextlpad-1
+  x = data['X'][...,t0:t1+1,:]
+  xcurr0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32)
+  
+  assert np.all(xcurr0['input']==xcurr1['input'])
+  ftidx = [(f,1) for f in featglobal] + [(f,0) for f in np.nonzero(featrelative)[0]]
+  idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
+  assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
+                  
+  if tmpsavefile is None:    
+    print('Chunking training data...')
+    X = chunk_data(data,config['contextl'],reparamfun,npad=npad)
+    print('Chunking val data...')
+    valX = chunk_data(valdata,config['contextl'],val_reparamfun,npad=npad)
+    print('Done.')
+    
+    print('Saving chunked data to file')
+    with open('chunkeddata20230828.pkl','wb') as f:
+      pickle.dump({'X': X,'valX': valX, 'data': data, 'valdata': valdata, 'scale_perfly': scale_perfly,'val_scale_perfly': val_scale_perfly},f)
+    print('Done.')
 
   dataset_params = {
     'max_mask_length': config['max_mask_length'],
@@ -5150,6 +5466,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     'flatten_obs_idx': config['flatten_obs_idx'],
     'flatten_do_separate_inputs': config['flatten_do_separate_inputs'],
     'p_add_input_noise': config['p_add_input_noise'],
+    'dct_ms': (dct_m,idct_m),
+    'tspred_global': config['tspred_global'],
   }
   train_dataset_params = {
     'input_noise_sigma': config['input_noise_sigma'],
