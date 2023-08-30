@@ -918,6 +918,8 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   dtheta = dtheta[:,:lastT,:]
   drelpose = drelpose[:,:lastT]
   if (simplify != 'global'):
+    # the pose forecasting papers compute error on the actual pose, not the dct. they just force the network to go through the dct
+    # representation first.
     if (dct_m is not None):
       drelpose[:,:,1:,:] = dct_m @ drelpose[:,:,1:,:]
     drelpose = np.moveaxis(drelpose,2,0)
@@ -1548,7 +1550,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                dct_ms=None,
                tspred_global=[1,],):
 
-    self.data = data
+    # copy dicts
+    self.data = [example.copy() for example in data]
     self.dtype = data[0]['input'].dtype
     # number of outputs
     self.d_output = self.data[0]['labels'].shape[-1]
@@ -1627,10 +1630,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.set_eval_mode()
 
     if dozscore:
+      print('Z-scoring data...')
       self.zscore(**zscore_params)
+      print('Done.')
 
     if discreteidx is not None:
+      print('Discretizing labels...')
       self.discretize_labels(discreteidx,discrete_tspred,nbins=discretize_nbins,bin_epsilon=discretize_epsilon,**discretize_params)
+      print('Done.')
     
     self.set_flatten_params(flatten_labels=flatten_labels,flatten_obs_idx=flatten_obs_idx,flatten_do_separate_inputs=flatten_do_separate_inputs)
     
@@ -5439,11 +5446,13 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
   assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
                   
+  chunk_data_params = {'npad': npad}
+                  
   if tmpsavefile is None:    
     print('Chunking training data...')
-    X = chunk_data(data,config['contextl'],reparamfun,npad=npad)
+    X = chunk_data(data,config['contextl'],reparamfun,**chunk_data_params)
     print('Chunking val data...')
-    valX = chunk_data(valdata,config['contextl'],val_reparamfun,npad=npad)
+    valX = chunk_data(valdata,config['contextl'],val_reparamfun,**chunk_data_params)
     print('Done.')
     
     print('Saving chunked data to file')
@@ -5475,12 +5484,14 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
   print('Creating training data set...')
   train_dataset = FlyMLMDataset(X,**train_dataset_params,**dataset_params)
+  print('Done.')
 
   dataset_params['zscore_params'] = train_dataset.get_zscore_params()
   dataset_params['discretize_params'] = train_dataset.get_discretize_params()
 
   print('Creating validation data set...')
   val_dataset = FlyMLMDataset(valX,**dataset_params)
+  print('Done.')
 
   example = train_dataset[0]
   d_input = example['input'].shape[-1]
@@ -5667,11 +5678,12 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
       plt.pause(.1)
 
       # rechunk the training data
-      print(f'Rechunking data after epoch {epoch}')
-      X = chunk_data(data,config['contextl'],reparamfun)
+      if np.mod(epoch+1,config['epochs_rechunk']) == 0:
+        print(f'Rechunking data after epoch {epoch}')
+        X = chunk_data(data,config['contextl'],reparamfun,**chunk_data_params)
       
-      train_dataset = FlyMLMDataset(X,**train_dataset_params,**dataset_params)
-      print('New training data set created')
+        train_dataset = FlyMLMDataset(X,**train_dataset_params,**dataset_params)
+        print('New training data set created')
 
       if (epoch+1)%config['save_epoch'] == 0:
         savefile = os.path.join(config['savedir'],f"fly{modeltype_str}_epoch{epoch+1}_{savetime}.pth")
@@ -5734,7 +5746,7 @@ if __name__ == "__main__":
 
   # parse arguments
   parser = argparse.ArgumentParser()
-  parser.add_argument('-c',type=str,required=True,help='Path to config file',metavar='configfile',dest='configfile')
+  parser.add_argument('-c',type=str,required=False,help='Path to config file',metavar='configfile',dest='configfile')
   parser.add_argument('-l',type=str,required=False,help='Path to model file to load',metavar='loadmodelfile',dest='loadmodelfile')
   parser.add_argument('-r',type=str,required=False,help='Path to model file to restart training from',metavar='restartmodelfile',dest='restartmodelfile')
   parser.add_argument('--clean',type=str,required=False,help='Delete intermediate networks saved in input directory.',metavar='cleandir',dest='cleandir')
