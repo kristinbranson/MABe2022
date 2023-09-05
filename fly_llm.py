@@ -1974,6 +1974,18 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       input = (rawinput-self.mu_input)/self.sig_input
     return input.astype(self.dtype)
   
+  def zscore_nextframe_labels(self,rawlabels):
+    if self.mu_labels is None:
+      labels = rawlabels.copy()
+    else:
+      # if rawlabels.shape[-1] > self.d_output_continuous:
+      #   labels = rawlabels.copy()
+      #   labels[...,self.continuous_idx] = (rawlabels[...,self.continuous_idx]-self.mu_labels)/self.sig_labels
+      # else:
+      labels = (rawlabels-self.mu_labels[self.nextframeidx])/self.sig_labels[self.nextframeidx]
+    return labels.astype(self.dtype)
+    
+  
   def zscore_labels(self,rawlabels):
     if self.mu_labels is None:
       labels = rawlabels.copy()
@@ -1984,6 +1996,18 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       # else:
       labels = (rawlabels-self.mu_labels)/self.sig_labels
     return labels.astype(self.dtype)
+
+  def unzscore_nextframe_labels(self,zlabels):
+    if self.mu_labels is None:
+      rawlabels = zlabels.copy()
+    else:
+      # if zlabels.shape[-1] > self.d_output_continuous:
+      #   rawlabels = zlabels.copy()
+      #   rawlabels[...,self.continuous_idx] = unzscore(zlabels[...,self.continuous_idx],self.mu_labels,self.sig_labels)
+      # else:
+      rawlabels = unzscore(zlabels,self.mu_labels[self.nextframeidx],self.sig_labels[self.nextframeidx])
+    return rawlabels.astype(self.dtype)
+
 
   def unzscore_labels(self,zlabels):
     if self.mu_labels is None:
@@ -2299,23 +2323,52 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         globalnext (ndarray, dglobal): Global position for the next frame. 
         
     """
-    movement = self.unzscore_labels(pred)
+    if isnorm:
+      movement = self.unzscore_labels(pred)
+    else:
+      movement = pred
+
+    # tspred_global x nglobal
+    movement_global = self.get_global_movement(movement)
+    originvelrel = movement_global[:,[1,0],...]
+    theta0 = globalin[2]
+    originvel = mabe.rotate_2d_points(originvelrel,-theta0)
+    globalnext = np.tile(globalin[None,:],(self.ntspred_global,1))
+    globalnext[:,:2,...] += originvel
+    globalnext[:,2,...] += movement_global[:,2,...]
+    globalnext[:,2,...] = mabe.modrange(globalnext[:,2,...],-np.pi,np.pi)
+
+    
     if self.simplify_out == 'global':
       posenext = posein
-      globalnext = globalin+movement
     else:
-      posenext = posein+movement[featrelative]
-      movementglobal = movement[featglobal]
-      originvelrel = movementglobal[[1,0],...]
-      theta0 = globalin[2]
-      originvel = mabe.rotate_2d_points(originvelrel[None,:],-theta0)
-      globalnext = globalin.copy()
-      globalnext[:2,...] += originvel.flatten()
-      globalnext[2,...] += movementglobal[2,...]
+      movement_relative_next = self.get_next_relative_movement(movement)
+      if self.dct_m is None:
+        movement_relative = movement_relative_next[None,...]
+      else:
+        movement_relative = self.get_relative_movement_dct(movement,iszscored=False)
+        movement_relative[0,...] = movement_relative_next
+      posenext = posein+movement_relative
       #globalnext = globalin+movement[featglobal]
     return posenext,globalnext
   
-  def get_next_relative_movements_dct(self,movements,iszscored=True,dozscore=True):
+  def get_global_movement(self,movement):
+    idxglobal = self.ravel_label_index(np.stack(np.meshgrid(featglobal,self.tspred_global),axis=-1))
+    movement_global = movement[...,idxglobal]
+    return movement_global
+
+  def get_next_relative_movement(self,movement):
+    movement_next_relative = movement[...,self.nextframeidx_relative]
+    return movement_next_relative
+
+  def get_relative_movement_dct(self,movements,iszscored=False):
+    movements_dct = movements[...,self.idxdct_relative]
+    if not iszscored and self.mu_labels is not None:
+      movements_dct = unzscore(movements_dct,self.mu_labels[self.idxdct_relative],self.sig_labels[self.idxdct_relative])
+    movements_relative = self.idct_m @ movements_dct
+    return movements_relative
+  
+  def get_next_relative_movement_dct(self,movements,iszscored=True,dozscore=True):
     if self.simplify_out == 'global':
       return movements[...,[]]
     
@@ -2338,7 +2391,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     return movements_next_relative
   
   def compare_dct_to_next_relative(self,movements):
-    movements_next_relative_dct = self.get_next_relative_movements_dct(movements,iszscored=True,dozscore=True)
+    movements_next_relative_dct = self.get_next_relative_movement_dct(movements,iszscored=True,dozscore=True)
     movements_next_relative0 = movements[...,self.nextframeidx_relative]
     err = movements_next_relative_dct - movements_next_relative0
     return err
@@ -2553,6 +2606,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     
     return xcurr
   
+  def get_movement_npad(self):
+    npad = compute_npad(self.tspred_global,self.dct_m)
+    return npad
+  
   def predict_open_loop(self,Xkp,fliespred,scales,burnin,model,maxcontextl=np.inf,debug=False,need_weights=False):
       """
       Xkp = predict_open_loop(self,Xkp,fliespred,scales,burnin,model,sensory_params,maxcontextl=np.inf,debug=False)
@@ -2581,6 +2638,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       nfliespred = len(fliespred)
       relpose = np.zeros((tpred,nrelative,nfliespred),dtype=dtype)
       globalpos = np.zeros((tpred,nglobal,nfliespred),dtype=dtype)
+      relposefuture = np.zeros((tpred,self.dct_tau,nrelative,nfliespred),dtype=dtype)
+      globalposfuture = np.zeros((tpred,self.ntspred_global,nglobal,nfliespred),dtype=dtype)
       sensory = None
       zinputs = None
       if need_weights:
@@ -2596,18 +2655,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       relpose0,globalpos0 = compute_pose_features(Xkp[...,:burnin,fliespred],scales)
       relpose[:burnin,:,:] = relpose0.transpose((1,0,2))
       globalpos[:burnin,:,:] = globalpos0.transpose((1,0,2))
-      # compute movement for pred flies between first burnin frames
+      # compute one-frame movement for pred flies between first burnin frames 
       movement0 = compute_movement(relpose=relpose0,
                                   globalpos=globalpos0,
                                   simplify=self.simplify_out)
+      
       movement0 = movement0.transpose((1,0,2))
       if self.flatten:
         zmovement = np.zeros((tpred-1,self.noutput_tokens_per_timepoint,self.flatten_max_doutput,nfliespred),dtype=dtype)
       else:
-        zmovement = np.zeros((tpred-1,nfeatures,nfliespred),dtype=dtype)
+        zmovement = np.zeros((tpred-1,movement0.shape[1],nfliespred),dtype=dtype)
         
       for i in range(nfliespred):
-        zmovementcurr = self.zscore_labels(movement0[...,i])
+        zmovementcurr = self.zscore_nextframe_labels(movement0[...,i])
         if self.flatten:
           if self.discretize:
             zmovement_todiscretize = zmovementcurr[...,self.discrete_idx]
@@ -2748,7 +2808,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
             else:
             
               if need_weights:
-                pred,attn_weights_curr = get_output_and_attention_weights(model,xcurr[None,...].to(device),net_mask)
+                with torch.no_grad():
+                  pred,attn_weights_curr = get_output_and_attention_weights(model,xcurr[None,...].to(device),net_mask)
                 # dimensions correspond to layer, output frame, input frame
                 attn_weights_curr = torch.cat(attn_weights_curr,dim=0).cpu().numpy()
                 if i == 0:
@@ -2770,13 +2831,15 @@ class FlyMLMDataset(torch.utils.data.Dataset):
               zmovementout = self.get_full_pred(pred,sample=True)
               zmovementout = zmovementout.numpy()
           relposenext,globalposnext = self.pred2pose(relposecurr,globalposcurr,zmovementout)
-          relpose[t,:,i] = relposenext
-          globalpos[t,:,i] = globalposnext
+          relpose[t,:,i] = relposenext[0,:]
+          globalpos[t,:,i] = globalposnext[0,:]
+          relposefuture[t,:,:,i] = relposenext
+          globalposfuture[t,:,:,i] = globalposnext
           if self.flatten:
             zmovement[t-1,:,:,i] = zmovementout_flattened
           else:
-            zmovement[t-1,:,i] = zmovementout
-          featnext = combine_relative_global(relposenext,globalposnext)
+            zmovement[t-1,:,i] = zmovementout[self.nextframeidx]
+          featnext = combine_relative_global(relposenext[0,:],globalposnext[0,:])
           Xkp_next = mabe.feat2kp(featnext,scales[...,i])
           Xkp_next = Xkp_next[:,:,0,0]
           Xkp[:,:,t,flynum] = Xkp_next
@@ -2807,9 +2870,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       #     zinputs = zinputs[:,0,...]
 
       if need_weights:
-        return Xkp,zinputs,attn_weights
+        return Xkp,zinputs,globalposfuture,relposefuture,attn_weights
       else:
-        return Xkp,zinputs
+        return Xkp,zinputs,globalposfuture,relposefuture
     
   def get_outnames(self):
     """
@@ -3960,6 +4023,38 @@ def debug_plot_batch_state(stateprob,nsamplesplot=3,
   fig.tight_layout(h_pad=0)
   return h,ax,fig
 
+
+def select_featidx_plot(train_dataset,ntspred_plot):
+  
+  ntsplot_global = np.minimum(train_dataset.ntspred_global,ntspred_plot)
+  ntsplot_relative = np.minimum(train_dataset.ntspred_relative,ntspred_plot)
+    
+  if ntsplot_global == 1:
+    tidxplot_global = np.zeros((nglobal,1),dtype=int)
+  elif ntsplot_global == train_dataset.ntspred_global:
+    tidxplot_global = np.tile(np.arange(ntsplot_global,dtype=int)[None,:],(nglobal,1))
+  else:
+    # choose 0 + a variety of different timepoints for each global feature so that a variety of timepoints are selected
+    tidxplot_global = np.concatenate((np.zeros((nglobal,1),dtype=int),
+                                      np.round(np.linspace(1,train_dataset.ntspred_global-1,(ntsplot_global-1)*nglobal)).astype(int).reshape(-1,nglobal).T),axis=-1)
+  if ntsplot_relative == 1:
+    tsplot_relative = np.zeros((nrelative,1),dtype=int)
+  elif ntsplot_relative == train_dataset.ntspred_relative:
+    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:],(nrelative,1))
+  else:
+    # choose 0 + a variety of different timepoints for each feature so that a variety of timepoints are selected
+    tsplot_relative = np.concatenate((np.zeros((nrelative,1),dtype=int),
+                                      np.round(np.linspace(1,train_dataset.ntspred_relative-1,(ntsplot_relative-1)*nrelative)).astype(int).reshape(-1,nrelative).T),axis=-1)
+  ftidx = []
+  for fi,f in enumerate(featglobal):
+    for ti in range(ntsplot_global):
+      ftidx.append((f,train_dataset.tspred_global[tidxplot_global[fi,ti]]))
+  for fi,f in enumerate(np.nonzero(featrelative)[0]):
+    for ti in range(ntsplot_relative):
+      ftidx.append((f,tsplot_relative[fi,ti]))
+  featidxplot = train_dataset.ravel_label_index(ftidx)
+  return featidxplot
+
 def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
                           pred=None,data=None,nsamplesplot=3,
                           true_discrete_mode='to_discretize',
@@ -3994,33 +4089,7 @@ def debug_plot_batch_traj(example,train_dataset,criterion=None,config=None,
   else:
     pred_args = {}
 
-  ntsplot_global = np.minimum(train_dataset.ntspred_global,ntspred_plot)
-  ntsplot_relative = np.minimum(train_dataset.ntspred_relative,ntspred_plot)
-  if ntsplot_global == 1:
-    tidxplot_global = np.zeros((nglobal,1),dtype=int)
-  elif ntsplot_global == train_dataset.ntspred_global:
-    tidxplot_global = np.tile(np.arange(ntsplot_global,dtype=int)[None,:],(nglobal,1))
-  else:
-    # choose 0 + a variety of different timepoints for each global feature so that a variety of timepoints are selected
-    tidxplot_global = np.concatenate((np.zeros((nglobal,1),dtype=int),
-                                      np.round(np.linspace(1,train_dataset.ntspred_global-1,(ntsplot_global-1)*nglobal)).astype(int).reshape(-1,nglobal).T),axis=-1)
-  if ntsplot_relative == 1:
-    tsplot_relative = np.zeros((nrelative,1),dtype=int)
-  elif ntsplot_relative == train_dataset.ntspred_relative:
-    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:],(nrelative,1))
-  else:
-    # choose 0 + a variety of different timepoints for each feature so that a variety of timepoints are selected
-    tsplot_relative = np.concatenate((np.zeros((nrelative,1),dtype=int),
-                                      np.round(np.linspace(1,train_dataset.ntspred_relative-1,(ntsplot_relative-1)*nrelative)).astype(int).reshape(-1,nrelative).T),axis=-1)
-  ftidx = []
-  for fi,f in enumerate(featglobal):
-    for ti in range(ntsplot_global):
-      ftidx.append((f,train_dataset.tspred_global[tidxplot_global[fi,ti]]))
-  for fi,f in enumerate(np.nonzero(featrelative)[0]):
-    for ti in range(ntsplot_relative):
-      ftidx.append((f,tsplot_relative[fi,ti]))
-  featidxplot = train_dataset.ravel_label_index(ftidx)
-    
+  featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
   samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
   for i in range(nsamplesplot):
     iplot = samplesplot[i]
@@ -4306,13 +4375,14 @@ def stackhelper(all_pred,all_labels,all_mask,nplot):
   
   return predv,labelsv,maskv  
   
-def debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx=None,ax=None,prctile_lim=.1):
+def debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx=None,ax=None,prctile_lim=.1,naxc=1):
   
   ismasked = maskidx is not None and len(maskidx) > 0
   d_output = predv.shape[-1]
-  
+  naxr = int(np.ceil(d_output/naxc))
   if ax is None:
-    fig,ax = plt.subplots(d_output,1,sharex='all',sharey='row')
+    fig,ax = plt.subplots(naxr,naxc,sharex='all')
+    ax = ax.flatten()
     fig.set_figheight(20)
     fig.set_figwidth(20)
     plt.tight_layout(h_pad=0)
@@ -5077,6 +5147,7 @@ def compute_all_attention_weight_rollouts(attn_weights0):
 
 
 def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False):
+    
   if burnin is None:
     burnin = config['contextl']-1
 
@@ -5090,9 +5161,10 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
   model.eval()
 
   if plotattnweights:
-    Xkp_pred,zinputs,attn_weights0 = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+    Xkp_pred,zinputs,relposefuture,globalposfuture,attn_weights0 = \
+      dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
   else:
-    Xkp_pred,zinputs = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+    Xkp_pred,zinputs,relposefuture,globalposfuture = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
 
   Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
   #Xkps = {'Pred': Xkp_pred.copy()}
@@ -5363,9 +5435,16 @@ def save_chunked_data(savefile,d):
 def load_chunked_data(savefile):
   return gzip_pickle_load(savefile)
 
+def compute_npad(tspred_global,dct_m):
+  npad = np.max(tspred_global)
+  if dct_m is not None:
+    npad = np.maximum(dct_m.shape[0],npad)
+  return npad
+
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
-  tmpsavefile = 'chunkeddata20230828.pkl'
+  tmpsavefile = 'chunkeddata20230905.pkl'
+  doloadtmpsavefile = os.path.exists(tmpsavefile)
   #tmpsavefile = None
 
   config = read_config(configfile)
@@ -5389,7 +5468,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   plt.ion()
   
   
-  if tmpsavefile is not None:
+  if doloadtmpsavefile:
     print(f'Loading tmp save file {tmpsavefile}')
     with open(tmpsavefile,'rb') as f:
       tmp = pickle.load(f)
@@ -5399,8 +5478,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     val_scale_perfly = tmp['val_scale_perfly']
     X = tmp['X']
     valX = tmp['valX']
-
-  if tmpsavefile is None:  
+  else:
     data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
     valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
   
@@ -5409,6 +5487,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   else:
     dct_m = None
     idct_m = None
+
+  npad = compute_npad(config['tspred_global'],dct_m)
 
   # function for computing features
   reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
@@ -5421,10 +5501,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
                                                                 simplify_out=config['simplify_out'],
                                                                 simplify_in=config['simplify_in'],
                                                                 dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
-  npad = np.max(config['tspred_global'])
-  if dct_m is not None:
-    npad = np.maximum(dct_m.shape[0],npad)
-
+  
   # sanity check on computing features when predicting many frames into the future
   t0 = 510
   flynum = 0
@@ -5448,17 +5525,18 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
                   
   chunk_data_params = {'npad': npad}
                   
-  if tmpsavefile is None:    
+  if not doloadtmpsavefile:
     print('Chunking training data...')
     X = chunk_data(data,config['contextl'],reparamfun,**chunk_data_params)
     print('Chunking val data...')
     valX = chunk_data(valdata,config['contextl'],val_reparamfun,**chunk_data_params)
     print('Done.')
     
-    print('Saving chunked data to file')
-    with open('chunkeddata20230828.pkl','wb') as f:
-      pickle.dump({'X': X,'valX': valX, 'data': data, 'valdata': valdata, 'scale_perfly': scale_perfly,'val_scale_perfly': val_scale_perfly},f)
-    print('Done.')
+    if tmpsavefile is not None:
+      print('Saving chunked data to file')
+      with open(tmpsavefile,'wb') as f:
+        pickle.dump({'X': X,'valX': valX, 'data': data, 'valdata': valdata, 'scale_perfly': scale_perfly,'val_scale_perfly': val_scale_perfly},f)
+      print('Done.')
 
   dataset_params = {
     'max_mask_length': config['max_mask_length'],
@@ -5707,11 +5785,20 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   # plot comparison between predictions and labels on validation data
   nplot = min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
   predv,labelsv,maskv = stackhelper(all_pred,all_labels,all_mask,nplot)
+  
+  if train_dataset.dct_m is not None:
+    debug_plot_dct_relative_error(predv,labelsv)
+    
+  
   if maskv is not None and len(maskv) > 0:
     maskidx = torch.nonzero(maskv)[:,0]
   else:
     maskidx = None
-  fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx)
+  
+  ntspred_plot = 2
+  featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
+  naxc = int(np.round(len(featidxplot)/nfeatures))
+  fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx,naxc=naxc)
 
   # generate an animation of open loop prediction
   tpred = 2000 + config['contextl']
@@ -5741,6 +5828,71 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   writer = animation.PillowWriter(fps=30)
   ani.save(savevidfile,writer=writer)
   print('Finished writing.')
+
+def debug_plot_dct_relative_error(predv,labelsv):
+    dcterr = np.sqrt(np.nanmean((predv[:,train_dataset.idxdct_relative]-labelsv[:,train_dataset.idxdct_relative])**2.,axis=0))
+    plt.figure()
+    plt.plot(dcterr)
+    plt.imshow(dcterr,aspect='auto')
+    plt.xticks(np.arange(nrelative))
+    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+    plt.ylabel('i')
+    plt.xticks(rotation=90)
+    plt.tight_layout()
+    
+    plt.figure()
+    plt.clf()
+    colors = mabe.get_n_colors_from_colormap('viridis',train_dataset.dct_tau)
+    for i in range(train_dataset.dct_tau):
+      plt.plot(dcterr[i,:],'o-',color=colors[i],label=f'i={i+1}')
+    plt.xticks(np.arange(nrelative))
+    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+    plt.xticks(rotation=90)
+    plt.legend()
+    plt.tight_layout()  
+    
+    predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
+    labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
+    zpredrelative_dct = np.zeros(predrelative_dct.shape)
+    zlabelsrelative_dct = np.zeros(labelsrelative_dct.shape)
+    for i in range(predrelative_dct.shape[1]):
+      zpredrelative_dct[:,i,:] = zscore(predrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
+                                        train_dataset.sig_labels[train_dataset.nextframeidx_relative])
+      zlabelsrelative_dct[:,i,:] = zscore(labelsrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
+                                          train_dataset.sig_labels[train_dataset.nextframeidx_relative])
+    idcterr = np.sqrt(np.nanmean((zpredrelative_dct-zlabelsrelative_dct)**2.,axis=0))
+    nexterr = np.sqrt(np.nanmean((train_dataset.get_next_relative_movement(predv)-train_dataset.get_next_relative_movement(labelsv))**2,axis=0))
+    err0 = np.sqrt(np.nanmean((zlabelsrelative_dct)**2,axis=0))
+    errprev = np.sqrt(np.nanmean((zlabelsrelative_dct[:-1,:,:]-zlabelsrelative_dct[1:,:,:])**2,axis=0))
+    plt.figure()
+    plt.imshow(idcterr,aspect='auto')
+    plt.xticks(np.arange(nrelative))
+    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+    plt.ylabel('delta t future')
+    plt.xticks(rotation=90)
+    plt.tight_layout()
+    
+    plt.figure()
+    plt.clf()
+    plt.plot(idcterr[0,:],'s-',label='DCT')
+    plt.plot(nexterr,'o-',label='Next')
+    plt.plot(err0[0,:],'s-',label='Zero')
+    plt.plot(errprev[0,:],'s-',label='Prev')
+    plt.legend()
+    plt.xticks(np.arange(nrelative))
+    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+    plt.xticks(rotation=90)
+    plt.tight_layout()
+    
+    plt.figure()
+    plt.clf()
+    for i in range(train_dataset.dct_tau):
+      plt.plot(idcterr[i,:],'o-',color=colors[i],label=f't={i+1}')
+    plt.xticks(np.arange(nrelative))
+    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+    plt.xticks(rotation=90)
+    plt.legend()
+    plt.tight_layout()  
 
 if __name__ == "__main__":
 
