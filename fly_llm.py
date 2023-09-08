@@ -2372,6 +2372,21 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     idxglobal = self.ravel_label_index(np.stack(np.meshgrid(featglobal,self.tspred_global),axis=-1))
     movement_global = movement[...,idxglobal]
     return movement_global
+  
+  def get_global_movement_discrete(self,movement_discrete):
+    if not self.discretize:
+      return None
+    idxglobal = self.ravel_label_index(np.stack(np.meshgrid(featglobal,self.tspred_global),axis=-1))
+    movement_global_discrete = np.zeros(movement_discrete.shape[:-2]+idxglobal.shape+movement_discrete.shape[-1:],dtype=self.dtype)
+    movement_global_discrete[:] = np.nan
+    for i in range(idxglobal.shape[0]):
+      for j in range(idxglobal.shape[1]):
+        idx = idxglobal[i,j]
+        didx = np.nonzero(self.discrete_idx==idx)[0]
+        if len(didx) == 0:
+          continue
+        movement_global_discrete[...,i,j,:] = movement_discrete[...,didx[0],:]
+    return movement_global_discrete
 
   def get_next_relative_movement(self,movement):
     movement_next_relative = movement[...,self.nextframeidx_relative]
@@ -2892,6 +2907,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       else:
         return Xkp,zinputs,globalposfuture,relposefuture
     
+  def get_movement_names(self):
+    outnames_global = ['forward','sideways','orientation']
+    if self.simplify_out == 'global':
+      outnames = outnames_global
+    else:        
+      outnames = outnames_global + [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+    return outnames
+  
   def get_outnames(self):
     """
     outnames = self.get_outnames()
@@ -2899,11 +2922,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     Returns:
         outnames (list of strings): names of each output motion
     """
-    outnames_global = ['forward','sideways','orientation']
-    if self.simplify_out == 'global':
-      outnames = outnames_global
-    else:        
-      outnames = outnames_global + [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+    outnames = self.get_movement_names()
       
     if len(self.tspred_global) > 1 or self.dct_m is not None:
       ftidx = self.unravel_label_index(np.arange(self.d_output,dtype=int))
@@ -4371,7 +4390,17 @@ def debug_plot_sample_inputs(dataset,example,nplot=3):
     ax[iplot,1].set_title(f'Labels {iplot}')
   return fig,ax
   
-def stackhelper(all_pred,all_labels,all_mask,nplot):
+def stack_batch_list(allx,n=None):
+  if len(allx) == 0:
+    return []
+  xv = torch.cat(allx[:n],dim=0)
+  nan = torch.zeros((xv.shape[0],1)+xv.shape[2:],dtype=xv.dtype)
+  nan[:] = torch.nan
+  xv = torch.cat((xv,nan),dim=1)
+  xv = xv.flatten(0,1)
+  return xv
+  
+def stackhelper(all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discrete,nplot):
 
   predv = torch.stack(all_pred[:nplot],dim=0)
   if len(all_mask) > 0:
@@ -4384,14 +4413,34 @@ def stackhelper(all_pred,all_labels,all_mask,nplot):
   nan = torch.zeros(s,dtype=predv.dtype)
   nan[:] = torch.nan
   predv = torch.cat((predv,nan),dim=2)
-  predv = predv.reshape((predv.shape[0]*predv.shape[1]*predv.shape[2],predv.shape[3]))
+  predv = predv.flatten(0,2)
   labelsv = torch.cat((labelsv,nan),dim=2)
-  labelsv = labelsv.reshape((labelsv.shape[0]*labelsv.shape[1]*labelsv.shape[2],labelsv.shape[3]))
+  labelsv = labelsv.flatten(0,2)
   if maskv is not None:
     maskv = torch.cat((maskv,torch.zeros(s[:-1],dtype=bool)),dim=2)
     maskv = maskv.flatten()
+  if len(all_pred_discrete) > 0:
+    pred_discretev = torch.stack(all_pred_discrete[:nplot],dim=0)
+    s = list(pred_discretev.shape)
+    s[2] = 1
+    nan = torch.zeros(s,dtype=pred_discretev.dtype)
+    nan[:] = torch.nan
+    pred_discretev = torch.cat((pred_discretev,nan),dim=2)
+    pred_discretev = pred_discretev.flatten(0,2)
+  else:
+    pred_discretev = None
+  if len(all_labels_discrete) > 0:
+    pred_discretev = torch.stack(all_labels_discrete[:nplot],dim=0)
+    s = list(pred_discretev.shape)
+    s[2] = 1
+    nan = torch.zeros(s,dtype=pred_discretev.dtype)
+    nan[:] = torch.nan
+    pred_discretev = torch.cat((pred_discretev,nan),dim=2)
+    pred_discretev = pred_discretev.flatten(0,2)
+  else:
+    pred_discretev = None
   
-  return predv,labelsv,maskv  
+  return predv,labelsv,maskv,pred_discretev
   
 def debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx=None,ax=None,prctile_lim=.1,naxc=1):
   
@@ -5127,6 +5176,8 @@ def predict_all(dataloader,dataset,model,config,mask):
   all_pred = []
   all_mask = []
   all_labels = []
+  all_pred_discrete = []
+  all_labels_discrete = []
   with torch.no_grad():
     for example in dataloader:
       pred = model.output(example['input'].to(device=device),mask=mask,is_causal=is_causal)
@@ -5142,10 +5193,13 @@ def predict_all(dataloader,dataset,model,config,mask):
       labels1 = dataset.get_full_labels(example=example,use_todiscretize=True)
       all_pred.append(pred1)
       all_labels.append(labels1)
+      if dataset.discretize:
+        all_pred_discrete.append(pred['discrete'])
+        all_labels_discrete.append(example['labels_discrete'])
       if 'mask' in example:
         all_mask.append(example['mask'])
 
-  return all_pred,all_labels,all_mask
+  return all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discrete
 
 def parse_modelfile(modelfile):
   _,filestr = os.path.split(modelfile)
@@ -5826,16 +5880,20 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   model.eval()
 
   # compute predictions and labels for all validation data using default masking
-  all_pred,all_labels,all_mask = predict_all(val_dataloader,val_dataset,model,config,train_src_mask)
+  all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discrete = predict_all(val_dataloader,val_dataset,model,config,train_src_mask)
 
   # plot comparison between predictions and labels on validation data
   nplot = min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
-  predv,labelsv,maskv = stackhelper(all_pred,all_labels,all_mask,nplot)
+  predv = stack_batch_list(all_pred,nplot)
+  labelsv = stack_batch_list(all_labels,nplot)
+  maskv = stack_batch_list(all_mask,nplot)
+  pred_discretev = stack_batch_list(all_pred_discrete,nplot)
+  labels_discretev = stack_batch_list(all_labels_discrete,nplot)
   
   if train_dataset.dct_m is not None:
     debug_plot_dct_relative_error(predv,labelsv,train_dataset)
   if train_dataset.ntspred_global > 1:
-    debug_plot_global_error(predv,labelsv,train_dataset)
+    debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_dataset)
     
   
   if maskv is not None and len(maskv) > 0:
@@ -5898,34 +5956,105 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   ani.save(savevidfile,writer=writer)
   print('Finished writing.')
 
-def debug_plot_global_error(predv,labelsv,train_dataset):
+def debug_plot_histograms(dataset,alpha=1):
+  r = np.random.rand(dataset.discretize_bin_samples.shape[0])-.5
+  ftidx = dataset.unravel_label_index(dataset.discrete_idx)
+  ftidx[featrelative[ftidx[:,0]],1]+=1
+  fs = np.unique(ftidx[:,0])
+  ts = np.unique(ftidx[:,1])
+  nfs = len(fs)
+  fig,ax = plt.subplots(nfs,1,sharey=True)
+  fig.set_figheight(17)
+  fig.set_figwidth(30)
+  colors = mabe.get_n_colors_from_colormap('hsv',dataset.discretize_nbins)
+  colors[:,:-1] *= .7
+  colors = colors[np.random.permutation(dataset.discretize_nbins),:]
+  colors[:,-1] = alpha
+  edges = np.zeros((len(fs),2))
+  edges[:,0] = np.inf
+  edges[:,1] = -np.inf
+  bin_edges = dataset.discretize_bin_edges
+  bin_samples = dataset.discretize_bin_samples
+  if dataset.sig_labels is not None:
+    bin_edges = unzscore(bin_edges,dataset.mu_labels[dataset.discrete_idx,None],dataset.sig_labels[dataset.discrete_idx,None])
+    bin_samples = unzscore(bin_samples,dataset.mu_labels[None,dataset.discrete_idx,None],dataset.sig_labels[None,dataset.discrete_idx,None])
+  for i,idx in enumerate(dataset.discrete_idx):
+    f = ftidx[i,0]
+    t = ftidx[i,1]
+    fi = np.nonzero(fs==f)[0][0]
+    ti = np.nonzero(ts==t)[0][0]
+    edges[fi,0] = np.minimum(edges[fi,0],bin_edges[i,0])
+    edges[fi,1] = np.maximum(edges[fi,1],bin_edges[i,-1])
+    for j in range(dataset.discretize_nbins):
+      ax[fi].plot(bin_samples[:,i,j],ti+r,'.',ms=.01,color=colors[j])
+      ax[fi].plot([bin_edges[i,j],]*2,ti+np.array([-.5,.5]),'k-')
+    ax[fi].plot([bin_edges[i,-1],]*2,ti+np.array([-.5,.5]),'k-')
+    ax[fi].plot(bin_edges[i,[0,-1]],[ti+.5,]*2,'k-')
+    ax[fi].plot(bin_edges[i,[0,-1]],[ti-.5,]*2,'k-')
+  fnames = dataset.get_movement_names()
+  for i,f in enumerate(fs):
+    ax[i].set_title(fnames[f])
+    ax[i].set_xlim(edges[i,0],edges[i,1])
+    ax[i].set_yticks(np.arange(len(ts)))
+    ax[i].set_yticklabels([str(t) for t in ts])
+    ax[i].set_ylim(-.5,len(ts)-.5)
+    ax[i].set_xscale('symlog')
+  ax[-1].set_ylabel('Delta t')
+  fig.tight_layout()
+  return
+
+def debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_dataset):
   outnames_global = ['forward','sideways','orientation']
   gpredv = train_dataset.get_global_movement(predv)
   glabelsv = train_dataset.get_global_movement(labelsv)
-  gerr = np.sqrt(np.nanmean((gpredv-glabelsv)**2,axis=0))
-  err0 = np.sqrt(np.nanmean((glabelsv)**2,axis=0))
-  gpredprev = np.zeros(glabelsv.shape)
+  errcont = np.nanmean(torch.nn.L1Loss(reduction='none')(gpredv,glabelsv),axis=0)
+  err0cont = np.nanmean(torch.nn.L1Loss(reduction='none')(torch.zeros(gpredv.shape,dtype=gpredv.dtype),glabelsv),axis=0)
+  gpredprev = torch.zeros(glabelsv.shape)
   gpredprev[:] = np.nan
   for i,dt in enumerate(train_dataset.tspred_global):
     gpredprev[dt:,i,:] = glabelsv[:-dt,i,:]
-  errprev = np.sqrt(np.nanmean((gpredprev-glabelsv.numpy())**2,axis=0))
+  errprevcont = np.nanmean(torch.nn.L1Loss(reduction='none')(gpredprev,glabelsv),axis=0)
   
-  nc = 1
+  if train_dataset.discretize:
+    gpreddiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(pred_discretev))
+    glabelsdiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(labels_discretev))
+    errdiscrete = np.nanmean(torch.nn.CrossEntropyLoss(reduction='none')(gpreddiscretev.moveaxis(-1,1),glabelsdiscretev.moveaxis(-1,1)),axis=0)
+
+    zerodiscretev = train_dataset.discretize_fun(np.zeros(predv.shape))
+    gzerodiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(zerodiscretev))
+    err0discrete = np.nanmean(torch.nn.CrossEntropyLoss(reduction='none')(gzerodiscretev.moveaxis(-1,1),glabelsdiscretev.moveaxis(-1,1)),axis=0)
+
+    gpredprevdiscrete = torch.zeros(gpreddiscretev.shape,dtype=gpreddiscretev.dtype)
+    gpredprevdiscrete[:] = np.nan
+    for i,dt in enumerate(train_dataset.tspred_global):
+      gpredprevdiscrete[dt:,i,:,:] = glabelsdiscretev[:-dt,i,:,:]
+    errprevdiscrete = np.nanmean(torch.nn.CrossEntropyLoss(reduction='none')(gpredprevdiscrete.moveaxis(-1,1),glabelsdiscretev.moveaxis(-1,1)),axis=0)
+
+  if train_dataset.discretize:
+    nc = 2
+  else:
+    nc = 1
   nr = nglobal
-  fig,ax = plt.subplots(nr,nc,sharex=True)
+  fig,ax = plt.subplots(nr,nc,sharex=True,squeeze=False)
   fig.set_figheight(10)
   fig.set_figwidth(12)
   #colors = mabe.get_n_colors_from_colormap('viridis',train_dataset.dct_tau)
-  ax = ax.flatten()
   for i in range(nglobal):
-    ax[i].plot(gerr[:,i],'o-',label=f'pred')
-    ax[i].plot(err0[:,i],'s-',label=f'zero')
-    ax[i].plot(errprev[:,i],'s-',label=f'prev')
-    ax[i].set_title(outnames_global[i])
-  ax[-1].set_xticks(np.arange(train_dataset.ntspred_global))
-  ax[-1].set_xticklabels([str(t) for t in train_dataset.tspred_global])
-  ax[-1].set_xlabel('Delta t')
-  ax[0].legend()
+    ax[i,0].plot(errcont[:,i],'o-',label=f'Pred')
+    ax[i,0].plot(err0cont[:,i],'s-',label=f'Zero')
+    ax[i,0].plot(errprevcont[:,i],'s-',label=f'Prev')
+    if train_dataset.discretize:
+      ax[i,1].plot(errdiscrete[:,i],'o-',label=f'Pred')
+      ax[i,1].plot(err0discrete[:,i],'s-',label=f'Zero')
+      ax[i,1].plot(errprevdiscrete[:,i],'s-',label=f'Prev')
+      ax[i,0].set_title(f'{outnames_global[i]} L1 error')
+      ax[i,1].set_title(f'{outnames_global[i]} CE error')
+    else:
+      ax[i,0].set_title(outnames_global[i])
+  ax[-1,-1].set_xticks(np.arange(train_dataset.ntspred_global))
+  ax[-1,-1].set_xticklabels([str(t) for t in train_dataset.tspred_global])
+  ax[-1,-1].set_xlabel('Delta t')
+  ax[0,0].legend()
   plt.tight_layout()  
   
   return
