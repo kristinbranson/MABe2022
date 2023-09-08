@@ -25,6 +25,7 @@
 
     "dct_tau": null,
     "tspred_global": [1],
+    "discrete_tspred": [1],
     
     "obs_embedding": false,
     "obs_embedding_types": null,
@@ -114,6 +115,8 @@
 
     "_comment_pdropout_past": "probability of dropping out labels as inputs",
     "pdropout_past": 0.0,
+
+    "epochs_rechunk": 1,
 
     "_comment_nstates": "deprecated? if learning discrete states as part of the model, how many to learn",
     "nstates": null,

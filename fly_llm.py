@@ -1788,16 +1788,31 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if not isinstance(discrete_tspred,np.ndarray):
       discrete_tspred = np.array(discrete_tspred)
 
+    is_bin_epsilon_perfeat = len(bin_epsilon) == len(discrete_idx)
+    if is_bin_epsilon_perfeat:
+      bin_epsilon_feat = bin_epsilon
+      bin_epsilon = []
+
+    # bin_epsilon is per feature
     ftidx = []
-    for f in discrete_idx:
+    for i,f in enumerate(discrete_idx):
       for t in discrete_tspred:
         if f in featglobal:
           ftidx.append((f,t))
+          if is_bin_epsilon_perfeat:
+            bin_epsilon.append(bin_epsilon_feat[i])
         else:
           # only t = 1 -> 0 can be discrete for relative features
           if t == 1:
             ftidx.append((f,0))
-    self.discrete_idx = np.sort(self.ravel_label_index(ftidx))
+            if is_bin_epsilon_perfeat:
+              bin_epsilon.append(bin_epsilon_feat[i])
+    self.discrete_idx = self.ravel_label_index(ftidx)
+    order = np.argsort(self.discrete_idx)
+    self.discrete_idx = self.discrete_idx[order]
+    bin_epsilon = np.array(bin_epsilon)
+    if is_bin_epsilon_perfeat:
+      bin_epsilon = bin_epsilon[order]
     
     self.discretize_nbins = nbins
     self.continuous_idx = np.ones(self.d_output,dtype=bool)
@@ -1805,13 +1820,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.continuous_idx = np.nonzero(self.continuous_idx)[0]
     self.d_output_continuous = len(self.continuous_idx)
     self.d_output_discrete = len(self.discrete_idx)
+    self.discrete_tspred = discrete_tspred
 
     assert((bin_edges is None) == (bin_samples is None))
 
     if bin_edges is None:
       if self.sig_labels is not None:
         bin_epsilon = np.array(bin_epsilon) / self.sig_labels[self.discrete_idx]
-      self.discretize_bin_edges,self.discretize_bin_samples = fit_discretize_labels(self,discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
+      self.discretize_bin_edges,self.discretize_bin_samples = fit_discretize_labels(self,self.discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
     else:
       self.discretize_bin_samples = bin_samples
       self.discretize_bin_edges = bin_edges
@@ -2640,6 +2656,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       globalpos = np.zeros((tpred,nglobal,nfliespred),dtype=dtype)
       relposefuture = np.zeros((tpred,self.dct_tau,nrelative,nfliespred),dtype=dtype)
       globalposfuture = np.zeros((tpred,self.ntspred_global,nglobal,nfliespred),dtype=dtype)
+      relposefuture[:] = np.nan
+      globalposfuture[:] = np.nan
       sensory = None
       zinputs = None
       if need_weights:
@@ -4410,12 +4428,16 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
                  figsizebase=11,ms=6,lw=1,focus_ms=12,focus_lw=3,
                  titletexts={},savevidfile=None,fps=30,trel0=0,
                  inputs=None,nstd_input=3,contextl=10,axinput=None,
-                 attn_weights=None,skeledgecolors=None):
+                 attn_weights=None,skeledgecolors=None,
+                 globalpos_future=None,tspred_future=None,
+                 futurecolor=[0,0,0,.25],futurelw=1,futurems=6):
 
   plotinput = inputs is not None and len(inputs) > 0
 
   # attn_weights[key] should be T x >=contextl x nfocusflies
   plotattn = attn_weights is not None
+  
+  plotfuture = globalpos_future is not None
 
   ninputs = 0
   if plotinput:
@@ -4506,6 +4528,8 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
   h['kpt'] = []
   h['edge'] = []
   h['ti'] = []
+  if plotfuture:
+    h['future'] = []
   
   titletext_ts = np.array(list(titletexts.keys()))
   
@@ -4515,12 +4539,22 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
     titletext_str = ''
 
   for i,k in enumerate(Xkps):
+    
+    if plotfuture and k in globalpos_future:
+      hfuture = []
+      for j in range(len(focusflies)):
+        hfuturecurr = ax[i].plot(globalpos_future[k][trel,:,0,j],globalpos_future[k][trel,:,0,j],'.-',color=futurecolor,ms=futurems,lw=futurelw)[0]
+        hfuture.append(hfuturecurr)
+      h['future'].append(hfuture)
+    
     hkpt,hedge,_,_,_ = mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[i],kpt_ms=ms,skel_lw=lw,skeledgecolors='tab20')
+
     for j in focusflies:
       hkpt[j].set_markersize(focus_ms)
       hedge[j].set_linewidth(focus_lw)
     h['kpt'].append(hkpt)
     h['edge'].append(hedge)
+
     ax[i].set_aspect('equal')
     mabe.plot_arena(ax=ax[i])
     if i == 0:
@@ -4581,6 +4615,10 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
       for i,k in enumerate(Xkps):
         mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[0],hkpts=h['kpt'][i],hedges=h['edge'][i])
+        if plotfuture and k in globalpos_future:
+          for j in range(len(focusflies)):
+            h['future'][i][j].set_xdata(globalpos_future[k][trel,:,0,j])
+            h['future'][i][j].set_ydata(globalpos_future[k][trel,:,1,j])
         if i == 0:
           h['ti'][i].set_text(f'{titletext_str} {k}, t = {t}')
         else:
@@ -5146,7 +5184,7 @@ def compute_all_attention_weight_rollouts(attn_weights0):
   return attn_weights_rollout
 
 
-def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False):
+def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False,plotfuture=False):
     
   if burnin is None:
     burnin = config['contextl']-1
@@ -5161,10 +5199,10 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
   model.eval()
 
   if plotattnweights:
-    Xkp_pred,zinputs,relposefuture,globalposfuture,attn_weights0 = \
+    Xkp_pred,zinputs,globalposfuture,relposefuture,attn_weights0 = \
       dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
   else:
-    Xkp_pred,zinputs,relposefuture,globalposfuture = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+    Xkp_pred,zinputs,globalposfuture,relposefuture = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
 
   Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
   #Xkps = {'Pred': Xkp_pred.copy()}
@@ -5180,9 +5218,15 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
 
   focusflies = fliespred
   titletexts = {0: 'Initialize', burnin: ''}
-
+  
+  if plotfuture:
+    future_args = {'globalpos_future': {'Pred': globalposfuture},'tspred_future': dataset.tspred_global}
+  else:
+    future_args = {}
+    
   ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,config['contextl']-64),
-                    inputs=inputs,contextl=config['contextl']-1,attn_weights=attn_weights)
+                    inputs=inputs,contextl=config['contextl']-1,attn_weights=attn_weights,
+                    **future_args)
   
   return ani
 
@@ -5444,6 +5488,7 @@ def compute_npad(tspred_global,dct_m):
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
   tmpsavefile = 'chunkeddata20230905.pkl'
+  #tmpsavefile = 'chunkeddata20230828.pkl'
   doloadtmpsavefile = os.path.exists(tmpsavefile)
   #tmpsavefile = None
 
@@ -5555,6 +5600,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     'p_add_input_noise': config['p_add_input_noise'],
     'dct_ms': (dct_m,idct_m),
     'tspred_global': config['tspred_global'],
+    'discrete_tspred': config['discrete_tspred'],
   }
   train_dataset_params = {
     'input_noise_sigma': config['input_noise_sigma'],
@@ -5787,7 +5833,9 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   predv,labelsv,maskv = stackhelper(all_pred,all_labels,all_mask,nplot)
   
   if train_dataset.dct_m is not None:
-    debug_plot_dct_relative_error(predv,labelsv)
+    debug_plot_dct_relative_error(predv,labelsv,train_dataset)
+  if train_dataset.ntspred_global > 1:
+    debug_plot_global_error(predv,labelsv,train_dataset)
     
   
   if maskv is not None and len(maskv) > 0:
@@ -5799,6 +5847,27 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
   naxc = int(np.round(len(featidxplot)/nfeatures))
   fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx,naxc=naxc)
+  
+  if train_dataset.ntspred_global > 1:
+    featidxplot = train_dataset.ravel_label_index([(featglobal[0],t) for t in train_dataset.tspred_global])
+    fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx)
+
+  if train_dataset.dct_tau > 0:
+    fstrs = ['left_middle_leg_tip_angle','left_front_leg_tip_angle','left_wing_angle']
+    fs = [mabe.posenames.index(x) for x in fstrs]
+    featidxplot = train_dataset.ravel_label_index([(f,i) for i in range(train_dataset.dct_tau+1) for f in fs])
+    fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx,naxc=len(fs))
+
+    predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
+    labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
+    fsdct = [np.array(mabe.posenames)[featrelative].tolist().index(x) for x in fstrs]
+    predrelative_dct = predrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
+    labelsrelative_dct = labelsrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
+    outnamescurr = [f'{f}_dt{i+1}' for i in range(train_dataset.dct_tau) for f in fstrs]
+    fig,ax = debug_plot_predictions_vs_labels(torch.as_tensor(predrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
+                                              torch.as_tensor(labelsrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
+                                              outnamescurr,maskidx,naxc=len(fstrs))
+
 
   # generate an animation of open loop prediction
   tpred = 2000 + config['contextl']
@@ -5819,7 +5888,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   randstate_np = np.random.get_state()
   randstate_torch = torch.random.get_rng_state()
   
-  ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False)
+  ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False,plotfuture=train_dataset.ntspred_global>1)
 
   vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
   savevidfile = os.path.join(config['savedir'],f"samplevideo_{modeltype_str}_{savetime}_{vidtime}.gif")
@@ -5829,70 +5898,109 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   ani.save(savevidfile,writer=writer)
   print('Finished writing.')
 
-def debug_plot_dct_relative_error(predv,labelsv):
-    dcterr = np.sqrt(np.nanmean((predv[:,train_dataset.idxdct_relative]-labelsv[:,train_dataset.idxdct_relative])**2.,axis=0))
-    plt.figure()
-    plt.plot(dcterr)
-    plt.imshow(dcterr,aspect='auto')
-    plt.xticks(np.arange(nrelative))
-    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
-    plt.ylabel('i')
-    plt.xticks(rotation=90)
-    plt.tight_layout()
-    
-    plt.figure()
-    plt.clf()
-    colors = mabe.get_n_colors_from_colormap('viridis',train_dataset.dct_tau)
-    for i in range(train_dataset.dct_tau):
-      plt.plot(dcterr[i,:],'o-',color=colors[i],label=f'i={i+1}')
-    plt.xticks(np.arange(nrelative))
-    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
-    plt.xticks(rotation=90)
-    plt.legend()
-    plt.tight_layout()  
-    
-    predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
-    labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
-    zpredrelative_dct = np.zeros(predrelative_dct.shape)
-    zlabelsrelative_dct = np.zeros(labelsrelative_dct.shape)
-    for i in range(predrelative_dct.shape[1]):
-      zpredrelative_dct[:,i,:] = zscore(predrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
+def debug_plot_global_error(predv,labelsv,train_dataset):
+  outnames_global = ['forward','sideways','orientation']
+  gpredv = train_dataset.get_global_movement(predv)
+  glabelsv = train_dataset.get_global_movement(labelsv)
+  gerr = np.sqrt(np.nanmean((gpredv-glabelsv)**2,axis=0))
+  err0 = np.sqrt(np.nanmean((glabelsv)**2,axis=0))
+  gpredprev = np.zeros(glabelsv.shape)
+  gpredprev[:] = np.nan
+  for i,dt in enumerate(train_dataset.tspred_global):
+    gpredprev[dt:,i,:] = glabelsv[:-dt,i,:]
+  errprev = np.sqrt(np.nanmean((gpredprev-glabelsv.numpy())**2,axis=0))
+  
+  nc = 1
+  nr = nglobal
+  fig,ax = plt.subplots(nr,nc,sharex=True)
+  fig.set_figheight(10)
+  fig.set_figwidth(12)
+  #colors = mabe.get_n_colors_from_colormap('viridis',train_dataset.dct_tau)
+  ax = ax.flatten()
+  for i in range(nglobal):
+    ax[i].plot(gerr[:,i],'o-',label=f'pred')
+    ax[i].plot(err0[:,i],'s-',label=f'zero')
+    ax[i].plot(errprev[:,i],'s-',label=f'prev')
+    ax[i].set_title(outnames_global[i])
+  ax[-1].set_xticks(np.arange(train_dataset.ntspred_global))
+  ax[-1].set_xticklabels([str(t) for t in train_dataset.tspred_global])
+  ax[-1].set_xlabel('Delta t')
+  ax[0].legend()
+  plt.tight_layout()  
+  
+  return
+
+def debug_plot_dct_relative_error(predv,labelsv,train_dataset):
+  dt = train_dataset.dct_tau
+  dcterr = np.sqrt(np.nanmean((predv[:,train_dataset.idxdct_relative]-labelsv[:,train_dataset.idxdct_relative])**2.,axis=0))
+  dcterr0 = np.sqrt(np.nanmean((labelsv[:,train_dataset.idxdct_relative])**2.,axis=0))
+  dcterrprev = np.sqrt(np.nanmean((labelsv[:-dt,train_dataset.idxdct_relative]-labelsv[dt:,train_dataset.idxdct_relative])**2.,axis=0))
+  
+  nc = int(np.ceil(np.sqrt(nrelative)))
+  nr = int(np.ceil(nrelative/nc))
+  fig,ax = plt.subplots(nr,nc,sharex=True,sharey=True)
+  fig.set_figheight(14)
+  fig.set_figwidth(23)
+  ax = ax.flatten()
+  for i in range(nrelative,nc*nr):
+    ax[i].remove()
+  ax = ax[:nrelative]
+  for i in range(nrelative):
+    ax[i].plot(dcterr[:,i],'o-',label=f'pred')
+    ax[i].plot(dcterr0[:,i],'s-',label=f'zero')
+    ax[i].plot(dcterrprev[:,i],'s-',label=f'prev')
+    ax[i].set_title(mabe.posenames[np.nonzero(featrelative)[0][i]])
+  ax[-1].set_xticks(np.arange(train_dataset.dct_tau))
+  ax[(nc-1)*nr-1].set_xlabel('DCT feature')
+  ax[0].legend()
+  plt.tight_layout()  
+  
+  predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
+  labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
+  zpredrelative_dct = np.zeros(predrelative_dct.shape)
+  zlabelsrelative_dct = np.zeros(labelsrelative_dct.shape)
+  for i in range(predrelative_dct.shape[1]):
+    zpredrelative_dct[:,i,:] = zscore(predrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
+                                      train_dataset.sig_labels[train_dataset.nextframeidx_relative])
+    zlabelsrelative_dct[:,i,:] = zscore(labelsrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
                                         train_dataset.sig_labels[train_dataset.nextframeidx_relative])
-      zlabelsrelative_dct[:,i,:] = zscore(labelsrelative_dct[:,i,:],train_dataset.mu_labels[train_dataset.nextframeidx_relative],
-                                          train_dataset.sig_labels[train_dataset.nextframeidx_relative])
-    idcterr = np.sqrt(np.nanmean((zpredrelative_dct-zlabelsrelative_dct)**2.,axis=0))
-    nexterr = np.sqrt(np.nanmean((train_dataset.get_next_relative_movement(predv)-train_dataset.get_next_relative_movement(labelsv))**2,axis=0))
-    err0 = np.sqrt(np.nanmean((zlabelsrelative_dct)**2,axis=0))
-    errprev = np.sqrt(np.nanmean((zlabelsrelative_dct[:-1,:,:]-zlabelsrelative_dct[1:,:,:])**2,axis=0))
-    plt.figure()
-    plt.imshow(idcterr,aspect='auto')
-    plt.xticks(np.arange(nrelative))
-    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
-    plt.ylabel('delta t future')
-    plt.xticks(rotation=90)
-    plt.tight_layout()
-    
-    plt.figure()
-    plt.clf()
-    plt.plot(idcterr[0,:],'s-',label='DCT')
-    plt.plot(nexterr,'o-',label='Next')
-    plt.plot(err0[0,:],'s-',label='Zero')
-    plt.plot(errprev[0,:],'s-',label='Prev')
-    plt.legend()
-    plt.xticks(np.arange(nrelative))
-    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
-    plt.xticks(rotation=90)
-    plt.tight_layout()
-    
-    plt.figure()
-    plt.clf()
-    for i in range(train_dataset.dct_tau):
-      plt.plot(idcterr[i,:],'o-',color=colors[i],label=f't={i+1}')
-    plt.xticks(np.arange(nrelative))
-    plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
-    plt.xticks(rotation=90)
-    plt.legend()
-    plt.tight_layout()  
+  idcterr = np.sqrt(np.nanmean((zpredrelative_dct-zlabelsrelative_dct)**2.,axis=0))
+  nexterr = np.sqrt(np.nanmean((train_dataset.get_next_relative_movement(predv)-train_dataset.get_next_relative_movement(labelsv))**2,axis=0))
+  err0 = np.sqrt(np.nanmean((zlabelsrelative_dct)**2,axis=0))
+  errprev = np.sqrt(np.nanmean((zlabelsrelative_dct[:-dt,:,:]-zlabelsrelative_dct[dt:,:,:])**2,axis=0))
+  
+  plt.figure()
+  plt.clf()
+  plt.plot(idcterr[0,:],'s-',label='dct pred')
+  plt.plot(nexterr,'o-',label='next pred')
+  plt.plot(err0[0,:],'s-',label='zero')
+  plt.plot(errprev[0,:],'s-',label='prev')
+  plt.legend()
+  plt.xticks(np.arange(nrelative))
+  plt.gca().set_xticklabels([mabe.posenames[i] for i in np.nonzero(featrelative)[0]])
+  plt.xticks(rotation=90)
+  plt.title('Next frame prediction')
+  plt.tight_layout()
+  
+  
+  fig,ax = plt.subplots(nr,nc,sharex=True,sharey=True)
+  fig.set_figheight(14)
+  fig.set_figwidth(23)
+  ax = ax.flatten()
+  for i in range(nrelative,nc*nr):
+    ax[i].remove()
+  ax = ax[:nrelative]
+  for i in range(nrelative):
+    ax[i].plot(idcterr[:,i],'o-',label=f'pred')
+    ax[i].plot(err0[:,i],'s-',label=f'zero')
+    ax[i].plot(errprev[:,i],'s-',label=f'prev')
+    ax[i].set_title(mabe.posenames[np.nonzero(featrelative)[0][i]])
+  ax[-1].set_xticks(np.arange(train_dataset.dct_tau))
+  ax[(nc-1)*nr-1].set_xlabel('Delta t')
+  ax[0].legend()
+  plt.tight_layout()  
+  
+  return
 
 if __name__ == "__main__":
 
