@@ -833,20 +833,23 @@ def compute_pose_features(X,scale):
 
 def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred_global=[1,]):
   """
-  movement = compute_movement(X=X,scale=scale,simplify=simplify_out)
-  movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out)
+  movement = compute_movement(X=X,scale=scale,...)
+  movement = compute_movement(relpose=relpose,globalpos=globalpos,...)
 
   Args:
       X (ndarray, nkpts x 2 x T x nflies, optional): Keypoints. Can be None only if relpose and globalpos are input. Defaults to None. T>=2
-      scale (ndarray, nscale x nflies): Scaling parameters. Can be None only if relpose and globalpos are input. Defaults to None.
+      scale (ndarray, nscale x nflies): Scaling parameters related to an individual fly. Can be None only if relpose and globalpos are input. Defaults to None.
       relpose (ndarray, nrelative x T x nflies or nrelative x T, optional): Relative pose features. T>=2
       If input, X and scale are ignored. Defaults to None.
       globalpos (ndarray, nglobal x T x nflies or nglobal x T, optional): Global position. If input, X and scale are ignored. Defaults to None. T>=2
       simplify (string or None, optional): Whether/how to simplify the output. Defaults to None for no simplification.
+  Optional args:
+      dct_m (ndarray, nrelative x ntspred_dct+1 x nflies): DCT matrix for pose features. Defaults to None.
+      tspred_global (list of int, optional): Time steps to predict for global features. Defaults to [1,].
 
   Returns:
-      movement (ndarray, nfeatures x T-1 x nflies or nfeatures x T-1): Per-frame movement. movement[:,t,i] is the movement from frame 
-      t to t+1 for fly i. 
+      movement (ndarray, d_output x T-1 x nflies): Per-frame movement. movement[:,t,i] is the movement from frame 
+      t for fly i. 
   """
 
   if relpose is None or globalpos is None:
@@ -905,11 +908,13 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
     y = torch.nn.functional.conv2d(xtorch,torch.ones((1,1,n,1),dtype=xtorch.dtype),padding='valid')
     return y[:,0,...].numpy()
   
-  for i in range(ntspred_global):
-    toff = tspred_global[i]
+  for i,toff in enumerate(tspred_global):
+    # center and rotate absolute position around position toff frames previous
     dXoriginrel[i,:,:-toff,:] = mabe.rotate_2d_points((Xorigin[:,toff:,:]-Xorigin[:,:-toff,:]).transpose((1,0,2)),Xtheta[:-toff,:]).transpose((1,0,2))
+    # compute total change in global orientation in toff frame intervals
     dtheta[i,:-toff,:] = boxsum(dtheta1[None,...],toff)
   for i,toff in enumerate(tspred_dct):
+    # compute total change in relative pose in toff frame intervals
     if (dct_m is not None) and (simplify != 'global'):
       drelpose[:,:-toff,i+1,:] = boxsum(drelpose1,toff)
 
@@ -1368,7 +1373,7 @@ def to_size(sz):
     raise ValueError('Input sz must be an int, list, or tuple')
   return sz
 
-def weighted_sample(w):
+def weighted_sample(w,nsamples=0):
   SMALLNUM = 1e-6
   assert(torch.all(w>=0.))
   nbins = w.shape[-1]
@@ -1378,10 +1383,16 @@ def weighted_sample(w):
   assert(torch.all(torch.abs(p[:,-1]-1)<=SMALLNUM))
   p[p>1.] = 1.
   p[:,-1] = 1.
-  r = torch.rand(n,device=w.device)
-  s = torch.zeros(p.shape,dtype=w.dtype,device=w.device)
+  if nsamples == 0:
+    nsamples1 = 1
+  else:
+    nsamples1 = nsamples
+  r = torch.rand((nsamples1,n),device=w.device)
+  s = torch.zeros((nsamples1,)+p.shape,dtype=w.dtype,device=w.device)
   s[:] = r[:,None] <= p
   idx = torch.argmax(s,dim=-1)
+  if nsamples > 0:
+    szrest = (nsamples,)+szrest
   return idx.reshape(szrest)
 
 # def samplebin(X,sz=None):
@@ -1448,13 +1459,17 @@ def fit_discretize_labels(dataset,featidx,nbins=50,bin_epsilon=None,outlierprct=
 
   # for each bin, approximate the distribution
   samples = np.zeros((nsamples,nfeat,nbins),movement.dtype)
+  bin_means = np.zeros((nfeat,nbins),movement.dtype)
+  bin_medians = np.zeros((nfeat,nbins),movement.dtype)
   for i in range(nfeat):
     for j in range(nbins):
       movementcurr = torch.tensor(movement[binnum[:,i]==j,i])
       samples[:,i,j] = np.random.choice(movementcurr,size=nsamples,replace=True)
+      bin_means[i,j] = np.nanmean(movementcurr)
+      bin_medians[i,j] = np.nanmedian(movementcurr)
       #kde[j,i] = KernelDensity(kernel='tophat',bandwidth=kde_bandwidth).fit(movementcurr[:,None])
 
-  return bin_edges,samples
+  return bin_edges,samples,bin_means,bin_medians
 
 def discretize_labels(movement,bin_edges,soften_to_ends=False):
 
@@ -1781,7 +1796,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global)
     return ftidx
     
-  def discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs):
+  def discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,
+                        bin_edges=None,bin_samples=None,bin_epsilon=None,
+                        bin_means=None,bin_medians=None,**kwargs):    
+    """
+    discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs)
+    For each feature in discrete_idx, discretize the labels into nbins bins. For each example in the data,
+    labels_discrete is an ndarray of shape T x len(discrete_idx) x nbins, where T is the number of time points, and 
+    indicates whether the label is in each bin, with soft-binning. 
+    labels_todiscretize is an ndarray of shape T x len(discrete_idx) with the original continuous labels.
+    labels gets replaced with an ndarray of shape T x len(continuous_idx) with the continuous labels.
+    discretize_bin_edges is an ndarray of shape len(discrete_idx) x (nbins+1) with the bin edges for each discrete feature.
+    discretize_bin_samples is an ndarray of shape nsamples x len(discrete_idx) x nbins with samples from each bin
+    """
         
     if not isinstance(discrete_idx,np.ndarray):
       discrete_idx = np.array(discrete_idx)
@@ -1827,10 +1854,13 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if bin_edges is None:
       if self.sig_labels is not None:
         bin_epsilon = np.array(bin_epsilon) / self.sig_labels[self.discrete_idx]
-      self.discretize_bin_edges,self.discretize_bin_samples = fit_discretize_labels(self,self.discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
+      self.discretize_bin_edges,self.discretize_bin_samples,self.discretize_bin_means,self.discretize_bin_medians = \
+        fit_discretize_labels(self,self.discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
     else:
       self.discretize_bin_samples = bin_samples
       self.discretize_bin_edges = bin_edges
+      self.discretize_bin_means = bin_means
+      self.discretize_bin_medians = bin_medians
       assert nbins == bin_edges.shape[-1]-1
         
     for example in self.data:
@@ -1845,8 +1875,36 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     discretize_params = {
       'bin_edges': self.discretize_bin_edges.copy(),
       'bin_samples': self.discretize_bin_samples.copy(),
+      'bin_means': self.discretize_bin_means.copy(),
+      'bin_medians': self.discretize_bin_medians.copy(),
     }
     return discretize_params
+    
+  def get_bin_edges(self,zscored=False):
+
+    if self.discretize == False:
+      return
+    
+    if zscored or (self.mu_labels is None):
+      bin_edges = self.discretize_bin_edges
+    else:
+      bin_edges = self.unzscore_labels(self.discretize_bin_edges.T,self.discrete_idx).T
+    
+    return bin_edges
+  
+  def get_bin_samples(self,zscored=False):
+    if self.discretize == False:
+      return
+    
+    if zscored or (self.mu_labels is None):
+      bin_samples = self.discretize_bin_samples
+    else:
+      sz = self.discretize_bin_samples.shape
+      bin_samples = self.discretize_bin_samples.transpose(0,2,1).reshape((sz[0]*sz[2],sz[1]))
+      bin_samples = self.unzscore_labels(bin_samples,self.discrete_idx)
+      bin_samples = bin_samples.reshape((sz[0],sz[2],sz[1])).transpose(0,2,1)
+    
+    return bin_samples
     
   def remove_labels_from_input(self,input):
     if self.hasmaskflag():
@@ -2025,7 +2083,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     return rawlabels.astype(self.dtype)
 
 
-  def unzscore_labels(self,zlabels):
+  def unzscore_labels(self,zlabels,featidx=None):
     if self.mu_labels is None:
       rawlabels = zlabels.copy()
     else:
@@ -2033,7 +2091,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       #   rawlabels = zlabels.copy()
       #   rawlabels[...,self.continuous_idx] = unzscore(zlabels[...,self.continuous_idx],self.mu_labels,self.sig_labels)
       # else:
-      rawlabels = unzscore(zlabels,self.mu_labels,self.sig_labels)
+      if featidx is None:
+        rawlabels = unzscore(zlabels,self.mu_labels,self.sig_labels)
+      else:
+        rawlabels = unzscore(zlabels,self.mu_labels[featidx],self.sig_labels[featidx])
     return rawlabels.astype(self.dtype)
 
   
@@ -2343,40 +2404,60 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       movement = self.unzscore_labels(pred)
     else:
       movement = pred
+      
+    if pred.ndim > posein.ndim:
+      nsamples = pred.shape[0]
+    else:
+      nsamples = 1
 
-    # tspred_global x nglobal
+    # nsamples x tspred_global x nglobal
     movement_global = self.get_global_movement(movement)
-    originvelrel = movement_global[:,[1,0],...]
+    originvelrel = movement_global[:,:,[1,0],...]
     theta0 = globalin[2]
-    originvel = mabe.rotate_2d_points(originvelrel,-theta0)
-    globalnext = np.tile(globalin[None,:],(self.ntspred_global,1))
-    globalnext[:,:2,...] += originvel
-    globalnext[:,2,...] += movement_global[:,2,...]
-    globalnext[:,2,...] = mabe.modrange(globalnext[:,2,...],-np.pi,np.pi)
-
+    sz = originvelrel.shape
+    originvel = mabe.rotate_2d_points(originvelrel.reshape((-1,sz[-1])),-theta0).reshape(sz)
+    globalnext = np.tile(globalin[None,None,:],(nsamples,self.ntspred_global,1))
+    globalnext[:,:,:2,...] += originvel
+    globalnext[:,:,2,...] += movement_global[:,:,2,...]
+    globalnext[:,:,2,...] = mabe.modrange(globalnext[:,:,2,...],-np.pi,np.pi)
     
     if self.simplify_out == 'global':
-      posenext = posein
+      posenext = globalnext
     else:
       movement_relative_next = self.get_next_relative_movement(movement)
       if self.dct_m is None:
-        movement_relative = movement_relative_next[None,...]
+        movement_relative = movement_relative_next[:,None,...]
       else:
+        # to do: not sure how this will work with multiple samples
         movement_relative = self.get_relative_movement_dct(movement,iszscored=False)
         movement_relative[0,...] = movement_relative_next
       posenext = posein+movement_relative
       #globalnext = globalin+movement[featglobal]
+      
+    if pred.ndim == posein.ndim:
+      posenext = posenext[0]
+      globalnext = globalnext[0]
+      
     return posenext,globalnext
   
-  def get_global_movement(self,movement):
+  def get_global_movement_idx(self):
     idxglobal = self.ravel_label_index(np.stack(np.meshgrid(featglobal,self.tspred_global),axis=-1))
+    return idxglobal
+  
+  def get_global_movement(self,movement):
+    idxglobal = self.get_global_movement_idx()
     movement_global = movement[...,idxglobal]
     return movement_global
+  
+  def set_global_movement(self,movement_global,movement):
+    idxglobal = self.get_global_movement_idx()
+    movement[...,idxglobal] = movement_global
+    return movement
   
   def get_global_movement_discrete(self,movement_discrete):
     if not self.discretize:
       return None
-    idxglobal = self.ravel_label_index(np.stack(np.meshgrid(featglobal,self.tspred_global),axis=-1))
+    idxglobal = self.get_global_movement_idx()
     movement_global_discrete = np.zeros(movement_discrete.shape[:-2]+idxglobal.shape+movement_discrete.shape[-1:],dtype=self.dtype)
     movement_global_discrete[:] = np.nan
     for i in range(idxglobal.shape[0]):
@@ -2641,7 +2722,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     npad = compute_npad(self.tspred_global,self.dct_m)
     return npad
   
-  def predict_open_loop(self,Xkp,fliespred,scales,burnin,model,maxcontextl=np.inf,debug=False,need_weights=False):
+  def predict_open_loop(self,Xkp,fliespred,scales,burnin,model,maxcontextl=np.inf,debug=False,need_weights=False,nsamples=0):
       """
       Xkp = predict_open_loop(self,Xkp,fliespred,scales,burnin,model,sensory_params,maxcontextl=np.inf,debug=False)
 
@@ -2664,13 +2745,22 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         w = next(iter(model.parameters()))
         dtype = w.cpu().numpy().dtype
         device = w.device
+        
+      if nsamples == 0:
+        nsamples1 = 1
+      else:
+        nsamples1 = nsamples
 
       tpred = Xkp.shape[-2]
       nfliespred = len(fliespred)
-      relpose = np.zeros((tpred,nrelative,nfliespred),dtype=dtype)
-      globalpos = np.zeros((tpred,nglobal,nfliespred),dtype=dtype)
-      relposefuture = np.zeros((tpred,self.dct_tau,nrelative,nfliespred),dtype=dtype)
-      globalposfuture = np.zeros((tpred,self.ntspred_global,nglobal,nfliespred),dtype=dtype)
+      relpose = np.zeros((nsamples1,tpred,nrelative,nfliespred),dtype=dtype)
+      globalpos = np.zeros((nsamples1,tpred,nglobal,nfliespred),dtype=dtype)
+      if self.dct_tau == 0:
+        ntspred_rel = 1
+      else:
+        ntspred_rel = self.dct_tau
+      relposefuture = np.zeros((nsamples1,tpred,ntspred_rel,nrelative,nfliespred),dtype=dtype)
+      globalposfuture = np.zeros((nsamples1,tpred,self.ntspred_global,nglobal,nfliespred),dtype=dtype)
       relposefuture[:] = np.nan
       globalposfuture[:] = np.nan
       sensory = None
@@ -2686,8 +2776,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       
       # compute the pose for pred flies for first burnin frames
       relpose0,globalpos0 = compute_pose_features(Xkp[...,:burnin,fliespred],scales)
-      relpose[:burnin,:,:] = relpose0.transpose((1,0,2))
-      globalpos[:burnin,:,:] = globalpos0.transpose((1,0,2))
+      relpose[:,:burnin] = relpose0.transpose((1,0,2))
+      globalpos[:,:burnin] = globalpos0.transpose((1,0,2))
       # compute one-frame movement for pred flies between first burnin frames 
       movement0 = compute_movement(relpose=relpose0,
                                   globalpos=globalpos0,
@@ -2716,7 +2806,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         for i in range(nfliespred):
           flynum = fliespred[i]
           sensorycurr = compute_sensory_wrapper(Xkp[...,:burnin,:],flynum,
-                                                theta_main=globalpos[:burnin,featthetaglobal,i])
+                                                theta_main=globalpos[0,:burnin,featthetaglobal,i]) # 0th sample
           if sensory is None:
             nsensory = sensorycurr.shape[0]
             sensory = np.zeros((tpred,nsensory,nfliespred),dtype=dtype)
@@ -2724,10 +2814,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     
       for i in range(nfliespred):
         if self.simplify_in is None:
-          rawinputscurr = combine_inputs(relpose=relpose[:burnin,:,i],
+          rawinputscurr = combine_inputs(relpose=relpose[0,:burnin,:,i],
                                          sensory=sensory[:burnin,:,i],dim=1)
         else:
-          rawinputscurr = relpose[:burnin,:,i]
+          rawinputscurr = relpose[:burnin,:,i,0]
           
         zinputscurr = self.zscore_input(rawinputscurr)
         
@@ -2767,8 +2857,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         for i in range(nfliespred):
           flynum = fliespred[i]
           zinputcurr = zinputs[t0:t,...,i]
-          relposecurr = relpose[t-1,:,i]
-          globalposcurr = globalpos[t-1,:,i]
+          relposecurr = relpose[0,t-1,:,i] # 0th sample
+          globalposcurr = globalpos[0,t-1,:,i] # 0th sample
 
           
           if self.input_labels:
@@ -2798,12 +2888,13 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           xcurr,_,_ = self.mask_input(xcurr,masktype)
           
           if debug:
-            zmovementout = self.zscore_labels(movement_true[t-1,:,i]).astype(dtype)
+            zmovementout = np.tile(self.zscore_labels(movement_true[t-1,:,i]).astype(dtype)[None],(nsamples1,1))
           else:
             
             if self.flatten:
+              # to do: not sure if multiple samples here works
               
-              zmovementout = np.zeros(self.d_output,dtype=dtype)
+              zmovementout = np.zeros((nsamples1,self.d_output),dtype=dtype)
               zmovementout_flattened = np.zeros((self.noutput_tokens_per_timepoint,self.flatten_max_doutput),dtype=dtype)
               
               for token in range(self.noutput_tokens_per_timepoint):
@@ -2820,23 +2911,23 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                 if token < len(self.discrete_idx):
                   # sample
                   sampleprob = torch.softmax(predtoken[0,-1,:self.discretize_nbins],dim=-1)
-                  binnum = int(weighted_sample(sampleprob))
+                  binnum = int(weighted_sample(sampleprob,nsamples=nsamples1))
                   
                   # store in input
-                  xcurr[lastidx+token,binnum] = 1.
-                  zmovementout_flattened[token,binnum] = 1.
+                  xcurr[lastidx+token,binnum[0]] = 1.
+                  zmovementout_flattened[token,binnum[0]] = 1.
                   
                   # convert to continuous
-                  nsamples = self.discretize_bin_samples.shape[0]
-                  sample = int(torch.randint(low=0,high=nsamples,size=(1,)))
+                  nsamples_per_bin = self.discretize_bin_samples.shape[0]
+                  sample = int(torch.randint(low=0,high=nsamples_per_bin,size=(nsamples,)))
                   zmovementcurr = self.discretize_bin_samples[sample,token,binnum]
                   
                   # store in output
-                  zmovementout[self.discrete_idx[token]] = zmovementcurr
+                  zmovementout[:,self.discrete_idx[token]] = zmovementcurr
                 else:
                   # continuous
-                  zmovementout[self.continuous_idx] = predtoken[0,-1,:len(self.continuous_idx)].cpu()
-                  zmovementout_flattened[token,:len(self.continuous_idx)] = zmovementout[self.continuous_idx]
+                  zmovementout[:,self.continuous_idx] = predtoken[0,-1,:len(self.continuous_idx)].cpu()
+                  zmovementout_flattened[token,:len(self.continuous_idx)] = zmovementout[self.continuous_idx,0]
                   
             else:
             
@@ -2861,17 +2952,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                 pred = model.randpred(pred)
               # z-scored movement from t to t+1
               pred = pred_apply_fun(pred,lambda x: x[0,-1,...].cpu())
-              zmovementout = self.get_full_pred(pred,sample=True)
+              zmovementout = self.get_full_pred(pred,sample=True,nsamples=nsamples)
               zmovementout = zmovementout.numpy()
+          if nsamples > 0:
+            zmovementout = zmovementout.T
           relposenext,globalposnext = self.pred2pose(relposecurr,globalposcurr,zmovementout)
-          relpose[t,:,i] = relposenext[0,:]
-          globalpos[t,:,i] = globalposnext[0,:]
-          relposefuture[t,:,:,i] = relposenext
-          globalposfuture[t,:,:,i] = globalposnext
+          relpose[t,:,i] = relposenext[0]
+          globalpos[t,:,i] = globalposnext[0]
+          relposefuture[t,:,:,i] = relposenext.transpose((1,2,0))
+          globalposfuture[t,:,:,i] = globalposnext.transpose((1,2,0))
           if self.flatten:
             zmovement[t-1,:,:,i] = zmovementout_flattened
           else:
-            zmovement[t-1,:,i] = zmovementout[self.nextframeidx]
+            zmovement[t-1,:,i] = zmovementout[0,self.nextframeidx]
           featnext = combine_relative_global(relposenext[0,:],globalposnext[0,:])
           Xkp_next = mabe.feat2kp(featnext,scales[...,i])
           Xkp_next = Xkp_next[:,:,0,0]
@@ -2906,9 +2999,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         return Xkp,zinputs,globalposfuture,relposefuture,attn_weights
       else:
         return Xkp,zinputs,globalposfuture,relposefuture
-    
+  
+  def get_movement_names_global(self):
+    return ['forward','sideways','orientation']
+
   def get_movement_names(self):
-    outnames_global = ['forward','sideways','orientation']
+    outnames_global = self.get_movement_names_global()
     if self.simplify_out == 'global':
       outnames = outnames_global
     else:        
@@ -3041,10 +3137,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def get_full_pred(self,pred,**kwargs):
     return self.get_full_labels(example=pred,ispred=True,**kwargs)
         
-  def get_full_labels(self,example=None,idx=None,use_todiscretize=False,sample=False,use_stacked=False,ispred=False):
+  def get_full_labels(self,example=None,idx=None,use_todiscretize=False,sample=False,use_stacked=False,ispred=False,nsamples=0):
     
     if self.discretize and sample:
-      return self.sample_full_labels(example=example,idx=idx)
+      return self.sample_full_labels(example=example,idx=idx,nsamples=nsamples)
     
     if example is None:
       example = self[idx]
@@ -3073,9 +3169,13 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     else:
       return labels_continuous.clone()
     
-  def sample_full_labels(self,example=None,idx=None):
+  def sample_full_labels(self,example=None,idx=None,nsamples=0):
     if example is None:
       example = self[idx]
+      
+    nsamples1 = nsamples
+    if nsamples1 == 0:
+      nsamples1 = 1
       
     # get labels_continuous, labels_discrete from example
     labels_continuous,labels_discrete,_,_ = self.parse_label_fields(example)
@@ -3086,7 +3186,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     # should be ... x d_output_continuous
     sz = labels_discrete.shape[:-2]
     dtype = labels_discrete.dtype
-    newsz = sz+(self.d_output,)
+    newsz = (nsamples1,)+sz+(self.d_output,)
     labels = torch.zeros(newsz,dtype=dtype)
     if self.continuous:
       labels[...,self.continuous_idx] = labels_continuous
@@ -3097,14 +3197,17 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     szrest = labels_discrete.shape[:-2]
     if len(szrest) == 0:
       n = 1
-      szrest = (1,)
     else:
       n = np.prod(szrest)
-    nsamples = self.discretize_bin_samples.shape[0]
+    nsamples_per_bin = self.discretize_bin_samples.shape[0]
     for i in range(nfeat):
-      binnum = weighted_sample(labels_discrete[...,i,:].reshape((n,nbins)))
-      sample = torch.randint(low=0,high=nsamples,size=(n,))
-      labels[...,self.discrete_idx[i]] = torch.Tensor(np.reshape(self.discretize_bin_samples[sample,i,binnum],szrest))
+      binnum = weighted_sample(labels_discrete[...,i,:].reshape((n,nbins)),nsamples=nsamples)
+      sample = torch.randint(low=0,high=nsamples_per_bin,size=(nsamples,n))
+      labelscurr = torch.Tensor(self.discretize_bin_samples[sample,i,binnum].reshape((nsamples,)+szrest))
+      labels[...,self.discrete_idx[i]] = labelscurr
+      
+    if nsamples == 0:
+      labels = labels[0]
 
     return labels
       
@@ -4061,12 +4164,16 @@ def debug_plot_batch_state(stateprob,nsamplesplot=3,
   return h,ax,fig
 
 
-def select_featidx_plot(train_dataset,ntspred_plot):
+def select_featidx_plot(train_dataset,ntspred_plot,ntsplot_global=None,ntsplot_relative=None):
+
+  if ntsplot_global is None: 
+    ntsplot_global = np.minimum(train_dataset.ntspred_global,ntspred_plot)
+  if ntsplot_relative is None:
+    ntsplot_relative = np.minimum(train_dataset.ntspred_relative,ntspred_plot)
   
-  ntsplot_global = np.minimum(train_dataset.ntspred_global,ntspred_plot)
-  ntsplot_relative = np.minimum(train_dataset.ntspred_relative,ntspred_plot)
-    
-  if ntsplot_global == 1:
+  if ntsplot_global == 0:
+    tidxplot_global = None
+  elif ntsplot_global == 1:
     tidxplot_global = np.zeros((nglobal,1),dtype=int)
   elif ntsplot_global == train_dataset.ntspred_global:
     tidxplot_global = np.tile(np.arange(ntsplot_global,dtype=int)[None,:],(nglobal,1))
@@ -4074,7 +4181,9 @@ def select_featidx_plot(train_dataset,ntspred_plot):
     # choose 0 + a variety of different timepoints for each global feature so that a variety of timepoints are selected
     tidxplot_global = np.concatenate((np.zeros((nglobal,1),dtype=int),
                                       np.round(np.linspace(1,train_dataset.ntspred_global-1,(ntsplot_global-1)*nglobal)).astype(int).reshape(-1,nglobal).T),axis=-1)
-  if ntsplot_relative == 1:
+  if ntsplot_relative == 0:
+    tsplot_relative = None
+  elif ntsplot_relative == 1:
     tsplot_relative = np.zeros((nrelative,1),dtype=int)
   elif ntsplot_relative == train_dataset.ntspred_relative:
     tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:],(nrelative,1))
@@ -4442,32 +4551,61 @@ def stackhelper(all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discre
   
   return predv,labelsv,maskv,pred_discretev
   
-def debug_plot_predictions_vs_labels(predv,labelsv,outnames,maskidx=None,ax=None,prctile_lim=.1,naxc=1):
+def debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev=None,labels_discretev=None,outnames=None,maskidx=None,ax=None,prctile_lim=.1,naxc=1,featidxplot=None,dataset=None):
+  
+  d_output = predv.shape[-1]
+  
+  if featidxplot is not None:
+    predv = predv[:,featidxplot]
+    labelsv = labelsv[:,featidxplot]
+    outnames = [outnames[i] for i in featidxplot]
+    if labels_discretev is not None and len(labels_discretev) > 0:
+      tmp = torch.zeros((labels_discretev.shape[0],d_output,labels_discretev.shape[2]),dtype=labels_discretev.dtype)
+      tmp[:] = np.nan
+      tmp[:,dataset.discrete_idx,:] = labels_discretev
+      labels_discretev = tmp[:,featidxplot,:]
+      tmp = torch.zeros((labels_discretev.shape[0],d_output,labels_discretev.shape[2]),dtype=labels_discretev.dtype)
+      tmp[:] = np.nan
+      tmp[:,dataset.discrete_idx,:] = pred_discretev
+      pred_discretev = tmp[:,featidxplot,:]
+    else:
+      labels_discretev = None
+      pred_discretev = None
+    d_output = len(featidxplot)
   
   ismasked = maskidx is not None and len(maskidx) > 0
-  d_output = predv.shape[-1]
   naxr = int(np.ceil(d_output/naxc))
   if ax is None:
-    fig,ax = plt.subplots(naxr,naxc,sharex='all')
+    fig,ax = plt.subplots(naxr,naxc,sharex='all',figsize=(20,20))
     ax = ax.flatten()
-    fig.set_figheight(20)
-    fig.set_figwidth(20)
     plt.tight_layout(h_pad=0)
 
   pred_cmap = lambda x: plt.get_cmap("tab10")(x%10)
   for i in range(d_output):
     ax[i].cla()
-    lims = torch.quantile(labelsv[:,i][torch.isnan(labelsv[:,i])==False],torch.tensor([prctile_lim/100.,1-prctile_lim/100.]))
-    ax[i].plot(labelsv[:,i],'k-',label='True')
-    if ismasked:
-      ax[i].plot(maskidx,predv[maskidx,i],'.',color=pred_cmap(i),label='Pred')
-    else:
-      ax[i].plot(predv[:,i],'-',color=pred_cmap(i),label='Pred')
-    #ax[i].set_ylim([-ylim_nstd,ylim_nstd])
-    ax[i].set_ylim(lims)
-    ax[i].set_xlim([0,labelsv.shape[0]])
-    ti = ax[i].set_title(outnames[i],y=1.0,pad=-14,color=pred_cmap(i),loc='left')
-    plt.setp(ti,color=pred_cmap(i))
+    if outnames is not None:
+      ti = ax[i].set_title(outnames[i],y=1.0,pad=-14,color=pred_cmap(i),loc='left')
+    
+    if pred_discretev is not None and len(pred_discretev) > 0 and (not torch.all(torch.isnan(pred_discretev[:,i,:]))):
+      predcurr = pred_discretev[:,i,:].T
+      labelscurr = labels_discretev[:,i,:].T
+      zlabels = torch.max(labelscurr[torch.isnan(labelscurr)==False])
+      zpred = torch.max(predcurr[torch.isnan(predcurr)==False])
+      im = torch.stack((1-labelscurr/zlabels,1-predcurr/zpred,torch.ones(predcurr.shape)),dim=-1)
+      im[torch.isnan(im)] = 1.
+      ax[i].imshow(im.numpy(),aspect='auto')
+    else:    
+      lims = torch.quantile(labelsv[:,i][torch.isnan(labelsv[:,i])==False],torch.tensor([prctile_lim/100.,1-prctile_lim/100.]))
+      ax[i].plot(labelsv[:,i],'k-',label='True')
+      if ismasked:
+        ax[i].plot(maskidx,predv[maskidx,i],'.',color=pred_cmap(i),label='Pred')
+      else:
+        ax[i].plot(predv[:,i],'-',color=pred_cmap(i),label='Pred')
+      #ax[i].set_ylim([-ylim_nstd,ylim_nstd])
+      ax[i].set_ylim(lims)
+      if outnames is not None:
+        plt.setp(ti,color=pred_cmap(i))
+  ax[0].set_xlim([0,labelsv.shape[0]])
     
   return fig,ax
 
@@ -5238,7 +5376,7 @@ def compute_all_attention_weight_rollouts(attn_weights0):
   return attn_weights_rollout
 
 
-def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False,plotfuture=False):
+def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False,plotfuture=False,nsamplesfuture=1):
     
   if burnin is None:
     burnin = config['contextl']-1
@@ -5252,11 +5390,11 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
 
   model.eval()
 
+  res = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],
+                                  debug=debug,need_weights=plotattnweights,nsamples=nsamplesfuture)
+  Xkp_pred,zinputs,globalposfuture,relposefuture = res[:4]
   if plotattnweights:
-    Xkp_pred,zinputs,globalposfuture,relposefuture,attn_weights0 = \
-      dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
-  else:
-    Xkp_pred,zinputs,globalposfuture,relposefuture = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],debug=debug,need_weights=plotattnweights)
+    attn_weights0 = res[4]
 
   Xkps = {'Pred': Xkp_pred.copy(),'True': Xkp_true.copy()}
   #Xkps = {'Pred': Xkp_pred.copy()}
@@ -5539,19 +5677,73 @@ def compute_npad(tspred_global,dct_m):
     npad = np.maximum(dct_m.shape[0],npad)
   return npad
 
+def sanity_check_tspred(data,config,npad,scale_perfly,dct_m,t0=510,flynum=0):
+  # sanity check on computing features when predicting many frames into the future
+  # compute inputs and outputs for frames t0:t0+contextl+npad+1 with tspred_global set by config
+  # and inputs ant outputs for frames t0:t0+contextl+1 with just next frame prediction.
+  # the inputs should match each other 
+  # the outputs for each of the config['tspred_global'] should match the next frame 
+  # predictions for the corresponding frame
+  
+  contextl = config['contextl']
+  id = data['ids'][t0,flynum]
+
+  contextlpad = contextl+npad
+  t1 = t0+contextlpad-1
+  x = data['X'][...,t0:t1+1,:]
+  xcurr1 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,dct_m=dct_m,tspred_global=config['tspred_global'],npad=npad)
+
+  contextlpad = contextl+1
+  t1 = t0+contextlpad-1
+  x = data['X'][...,t0:t1+1,:]
+  xcurr0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32)
+
+  assert np.all(xcurr0['input']==xcurr1['input'])
+  ftidx = [(f,1) for f in featglobal] + [(f,0) for f in np.nonzero(featrelative)[0]]
+  idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
+  assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
+
+  return
+
+def sanity_check_temporal_dep(train_dataloader,device,train_src_mask,is_causal,model,tmess=300):
+  # sanity check on temporal dependences
+  # create xin2 that is like xin, except xin2 from frame tmess onwards is set to garbage value 100.
+  # make sure that model(xin) and model(xin2) matches before frame tmess
+  x = next(iter(train_dataloader))
+  xin = x['input'].clone()
+  xin2 = xin.clone()
+  tmess = 300
+  xin2[:,tmess:,:] = 100.
+  model.eval()
+  with torch.no_grad():
+    pred = model(xin.to(device),mask=train_src_mask,is_causal=is_causal)
+    pred2 = model(xin2.to(device),mask=train_src_mask,is_causal=is_causal)
+  if type(pred) == dict:
+    for k in pred.keys():
+      matches = torch.all(pred2[k][:,:tmess]==pred[k][:,:tmess]).item()
+      assert matches
+  else:
+    matches = torch.all(pred2[:,:tmess]==pred[:,:tmess]).item()
+    assert matches
+
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
+  # to save time, i saved the chunked data to a pkl file
   tmpsavefile = 'chunkeddata20230905.pkl'
   #tmpsavefile = 'chunkeddata20230828.pkl'
   doloadtmpsavefile = os.path.exists(tmpsavefile)
   #tmpsavefile = None
 
+  # configuration parameters for this model
   config = read_config(configfile)
+  
+  # set loadmodelfile and restartmodelfile from config if not specified
   if loadmodelfile is None and 'loadmodelfile' in config:
     loadmodelfile = config['loadmodelfile']
   if restartmodelfile is None and 'restartmodelfile' in config:
     loadmodelfile = config['restartmodelfile']
   
+  # if loadmodelfile or restartmodelfile specified, use its config
   if loadmodelfile is not None:
     load_config_from_model_file(loadmodelfile,config)
   elif restartmodelfile is not None:
@@ -5560,14 +5752,17 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   
   print(f"batch size = {config['batch_size']}")
 
+  # seed the random number generators
   np.random.seed(config['numpy_seed'])
   torch.manual_seed(config['torch_seed'])
+  
+  # set device (cuda/cpu)
   device = torch.device(config['device'])
 
   plt.ion()
-  
-  
+
   if doloadtmpsavefile:
+    # load cached, pre-chunked data  
     print(f'Loading tmp save file {tmpsavefile}')
     with open(tmpsavefile,'rb') as f:
       tmp = pickle.load(f)
@@ -5578,16 +5773,21 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     X = tmp['X']
     valX = tmp['valX']
   else:
+    # load raw data
     data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
     valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
   
+  # if using discrete cpsine transform, create dct matrix
+  # this didn't seem to work well, so probably won't use in the future
   if config['dct_tau'] is not None and config['dct_tau'] > 0:
     dct_m,idct_m = get_dct_matrix(config['dct_tau'])
   else:
     dct_m = None
     idct_m = None
 
+  # how much to pad outputs by -- depends on how many frames into the future we will predict
   npad = compute_npad(config['tspred_global'],dct_m)
+  chunk_data_params = {'npad': npad}
 
   # function for computing features
   reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
@@ -5602,29 +5802,10 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
                                                                 dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
   
   # sanity check on computing features when predicting many frames into the future
-  t0 = 510
-  flynum = 0
-  contextl = config['contextl']
-  id = data['ids'][t0,flynum]
-
-  contextlpad = contextl+npad
-  t1 = t0+contextlpad-1
-  x = data['X'][...,t0:t1+1,:]
-  xcurr1 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,dct_m=dct_m,tspred_global=config['tspred_global'],npad=npad)
-
-  contextlpad = contextl+1
-  t1 = t0+contextlpad-1
-  x = data['X'][...,t0:t1+1,:]
-  xcurr0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32)
-  
-  assert np.all(xcurr0['input']==xcurr1['input'])
-  ftidx = [(f,1) for f in featglobal] + [(f,0) for f in np.nonzero(featrelative)[0]]
-  idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
-  assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
-                  
-  chunk_data_params = {'npad': npad}
-                  
+  sanity_check_tspred(data,config,npad,scale_perfly,dct_m,t0=510,flynum=0)
+                                    
   if not doloadtmpsavefile:
+    # chunk the data if we didn't load the pre-chunked cache file
     print('Chunking training data...')
     X = chunk_data(data,config['contextl'],reparamfun,**chunk_data_params)
     print('Chunking val data...')
@@ -5664,6 +5845,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   train_dataset = FlyMLMDataset(X,**train_dataset_params,**dataset_params)
   print('Done.')
 
+  # zscore and discretize parameters for validation data set based on train data
+  # we will continue to use these each time we rechunk the data
   dataset_params['zscore_params'] = train_dataset.get_zscore_params()
   dataset_params['discretize_params'] = train_dataset.get_discretize_params()
 
@@ -5671,11 +5854,11 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   val_dataset = FlyMLMDataset(valX,**dataset_params)
   print('Done.')
 
+  # get properties of examples from the first training example
   example = train_dataset[0]
   d_input = example['input'].shape[-1]
   d_output = train_dataset.d_output
   outnames = train_dataset.get_outnames()
-
 
   train_dataloader = torch.utils.data.DataLoader(train_dataset,
                                                 batch_size=config['batch_size'],
@@ -5695,8 +5878,9 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   sz = example['input'].shape
   print(f'batch input shape = {sz}')
 
-  # debug plots
+  # set up debug plots
   debug_params = {}
+  # if contextl is long, still just look at samples from the first 64 frames
   if config['contextl'] > 64:
     debug_params['tsplot'] = np.round(np.linspace(0,64,5)).astype(int)
     debug_params['traj_nsamplesplot'] = 1
@@ -5733,23 +5917,8 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     raise
 
   # sanity check on temporal dependences
-  x = next(iter(train_dataloader))
-  xin = x['input'].clone()
-  xin2 = xin.clone()
-  tmess = 300
-  xin2[:,tmess:,:] = 100.
-  model.eval()
-  with torch.no_grad():
-    pred = model(xin.to(device),mask=train_src_mask,is_causal=is_causal)
-    pred2 = model(xin2.to(device),mask=train_src_mask,is_causal=is_causal)
-  if type(pred) == dict:
-    for k in pred.keys():
-      matches = torch.all(pred2[k][:,:tmess]==pred[k][:,:tmess]).item()
-      assert matches
-  else:
-    matches = torch.all(pred2[:,:tmess]==pred[:,:tmess]).item()
-    assert matches
-  
+  sanity_check_temporal_dep(train_dataloader,device,train_src_mask,is_causal,model,tmess=300)
+
   modeltype_str = get_modeltype_str(config,train_dataset)
   if ('model_nickname' in config) and (config['model_nickname'] is not None):
     modeltype_str = config['model_nickname']
@@ -5883,38 +6052,57 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discrete = predict_all(val_dataloader,val_dataset,model,config,train_src_mask)
 
   # plot comparison between predictions and labels on validation data
-  nplot = min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
-  predv = stack_batch_list(all_pred,nplot)
-  labelsv = stack_batch_list(all_labels,nplot)
-  maskv = stack_batch_list(all_mask,nplot)
-  pred_discretev = stack_batch_list(all_pred_discrete,nplot)
-  labels_discretev = stack_batch_list(all_labels_discrete,nplot)
+  predv = stack_batch_list(all_pred)
+  labelsv = stack_batch_list(all_labels)
+  maskv = stack_batch_list(all_mask)
+  pred_discretev = stack_batch_list(all_pred_discrete)
+  labels_discretev = stack_batch_list(all_labels_discrete)
+  
+  fig,ax = debug_plot_global_histograms(predv,labelsv,train_dataset,nbins=25,subsample=1,compare='pred')
+  # glabelsv = train_dataset.get_global_movement(labelsv)
+  # gpredprev = torch.zeros(glabelsv.shape)
+  # gpredprev[:] = np.nan
+  # for i,dt in enumerate(train_dataset.tspred_global):
+  #   gpredprev[dt:,i,:] = glabelsv[:-dt,i,:]
+  # predprev = torch.zeros(labelsv.shape)
+  # predprev[:] = np.nan
+  # train_dataset.set_global_movement(gpredprev,predprev)
+  # fig,ax = debug_plot_global_histograms(predprev,labelsv,train_dataset,nbins=25,subsample=100)
   
   if train_dataset.dct_m is not None:
     debug_plot_dct_relative_error(predv,labelsv,train_dataset)
   if train_dataset.ntspred_global > 1:
     debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_dataset)
-    
+
+  # crop to nplot for plotting
+  nplot = 8000 #min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
+  predv = predv[:nplot,:]
+  labelsv = labelsv[:nplot,:]
+  if len(maskv) > 0:
+    maskv = maskv[:nplot,:]
+  pred_discretev = pred_discretev[:nplot,:]
+  labels_discretev = labels_discretev[:nplot,:]
   
   if maskv is not None and len(maskv) > 0:
     maskidx = torch.nonzero(maskv)[:,0]
   else:
     maskidx = None
   
-  ntspred_plot = 2
+  ntspred_plot = 4
   featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
+  featidxplot = select_featidx_plot(train_dataset,ntspred_plot=13,ntsplot_relative=0)
   naxc = int(np.round(len(featidxplot)/nfeatures))
-  fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx,naxc=naxc)
+  fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,naxc=naxc,featidxplot=featidxplot,dataset=val_dataset)
   
   if train_dataset.ntspred_global > 1:
     featidxplot = train_dataset.ravel_label_index([(featglobal[0],t) for t in train_dataset.tspred_global])
-    fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx)
+    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset)
 
   if train_dataset.dct_tau > 0:
     fstrs = ['left_middle_leg_tip_angle','left_front_leg_tip_angle','left_wing_angle']
     fs = [mabe.posenames.index(x) for x in fstrs]
     featidxplot = train_dataset.ravel_label_index([(f,i) for i in range(train_dataset.dct_tau+1) for f in fs])
-    fig,ax = debug_plot_predictions_vs_labels(predv[:,featidxplot],labelsv[:,featidxplot],[outnames[i] for i in featidxplot],maskidx,naxc=len(fs))
+    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset,naxc=len(fs))
 
     predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
     labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
@@ -5924,7 +6112,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     outnamescurr = [f'{f}_dt{i+1}' for i in range(train_dataset.dct_tau) for f in fstrs]
     fig,ax = debug_plot_predictions_vs_labels(torch.as_tensor(predrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
                                               torch.as_tensor(labelsrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
-                                              outnamescurr,maskidx,naxc=len(fstrs))
+                                              outnames=outnamescurr,maskidx=maskidx,naxc=len(fstrs))
 
 
   # generate an animation of open loop prediction
@@ -5945,8 +6133,10 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
   randstate_np = np.random.get_state()
   randstate_torch = torch.random.get_rng_state()
-  
-  ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,plotattnweights=False,plotfuture=train_dataset.ntspred_global>1)
+
+  nsamplesfuture = 100  
+  ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,
+                                  plotattnweights=False,plotfuture=train_dataset.ntspred_global>1,nsamplesfuture=nsamplesfuture)
 
   vidtime = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
   savevidfile = os.path.join(config['savedir'],f"samplevideo_{modeltype_str}_{savetime}_{vidtime}.gif")
@@ -6003,12 +6193,110 @@ def debug_plot_histograms(dataset,alpha=1):
   fig.tight_layout()
   return
 
+def debug_plot_global_histograms(predv,labelsv,train_dataset,nbins=50,subsample=1,compare='time'):
+  outnames_global = train_dataset.get_movement_names_global()
+  
+  # global labels, continuous representation, unzscored
+  # ntimepoints x tspred x nglobal
+  unz_labelsv = train_dataset.unzscore_labels(labelsv.numpy())
+  unz_glabelsv = train_dataset.get_global_movement(unz_labelsv)  
+
+  # global predictions, continuous representation, unzscored
+  # ntimepoints x tspred x nglobal
+  unz_predv = train_dataset.unzscore_labels(predv.numpy())
+  unz_gpredv = train_dataset.get_global_movement(unz_predv)
+
+  if train_dataset.discretize:
+
+    bin_edges = train_dataset.get_bin_edges(zscored=False)
+    ftidx = train_dataset.unravel_label_index(train_dataset.discrete_idx)
+    bins = []
+    for f in featglobal:
+      j = np.nonzero(np.all(ftidx == np.array([f,1])[None,...],axis=1))[0][0]
+      bins.append(bin_edges[j])
+    nbins = train_dataset.discretize_nbins
+  else:
+    lims = [[np.percentile(unz_glabelsv[::100,:,axi].flatten(),i).item() for i in [.1,99.9]] for axi in range(nglobal)]
+    bins = [np.arange(l[0],l[1],nbins+1) for l in lims]
+
+  ntspred = len(train_dataset.tspred_global)
+  off0 = .1
+  
+  if compare == 'time':
+    colors = mabe.get_n_colors_from_colormap('jet',len(train_dataset.tspred_global))
+    colors[:,:-1] *=.8
+
+    fig,ax = plt.subplots(2,nglobal,figsize=(30,10),sharex='col')
+    w = (1-2*off0)/ntspred
+    for axj,(datacurr,datatype) in enumerate(zip([unz_glabelsv,unz_gpredv],['label ','pred '])):
+      for axi in range(nglobal):
+        ax[axj,axi].cla()
+        off = off0
+        for i in range(unz_glabelsv.shape[1]):
+          density,_ = np.histogram(datacurr[::subsample,i,axi],bins=bins[axi],density=True)
+          ax[axj,axi].bar(np.arange(nbins)+off,density,width=w,color=colors[i],log=True,
+                          align='edge',label=str(train_dataset.tspred_global[i]))
+          off+=w
+        ax[axj,axi].set_xticks(np.arange(nbins+1))
+        ax[axj,axi].set_xticklabels(['%.2f'%x for x in bins[axi]],rotation=90)
+        ax[axj,axi].set_title(datatype+outnames_global[axi])
+  elif compare == 'pred':
+    colors = [[0,.5,.8],[.8,.5,.8]]
+
+    fig,ax = plt.subplots(ntspred,nglobal,figsize=(20,30),sharex='col',sharey='all')
+    w = (1-2*off0)/2
+    for ti in range(ntspred):
+      for fi in range(nglobal):
+        axcurr = ax[ti,fi]
+        axcurr.cla()
+        off = off0
+        for i,(datacurr,datatype) in enumerate(zip([unz_glabelsv,unz_gpredv],['label','pred'])):
+          density,_ = np.histogram(datacurr[::subsample,ti,fi],bins=bins[fi],density=True)
+          axcurr.bar(np.arange(nbins)+off,density,width=w,color=colors[i],log=False,
+                     align='edge',label=datatype)
+          off+=w
+        axcurr.set_xticks(np.arange(nbins+1))
+        axcurr.set_xticklabels(['%.2f'%x for x in bins[fi]],rotation=90)
+        axcurr.set_title(f'{outnames_global[fi]} t = {train_dataset.tspred_global[ti]}')
+
+  ax[0,0].legend()
+  fig.tight_layout()
+  
+  return fig,ax
+
 def debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_dataset):
-  outnames_global = ['forward','sideways','orientation']
+  """
+  debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_dataset)
+  inputs:
+  predv: torch.Tensor, shape (ntimepoints,d_output), all prediction features in continuous representation
+  labelsv: torch.Tensor, shape (ntimepoints,d_output) all labels in continuous representation
+  pred_discretev: torch.Tensor, shape (ntimepoints,len(train_dataset.discrete_idx),train_dataset.discretize_nbins), discrete predictions
+  labels_discretev: torch.Tensor, shape (ntimepoints,len(train_dataset.discrete_idx),train_dataset.discretize_nbins), discrete labels
+  train_dataset: FlyMLMDataset, the training dataset
+  """
+  outnames_global = train_dataset.get_movement_names_global()
+  ntimepoints = predv.shape[0]
+  
+  # global predictions, continuous representation
+  # ntimepoints x tspred x nglobal
   gpredv = train_dataset.get_global_movement(predv)
+  
+  # global labels, continuous representation
+  # ntimepoints x tspred x nglobal
   glabelsv = train_dataset.get_global_movement(labelsv)
+  
+  # compute L1 error from continuous representations, all global features
+  # network predictions
   errcont = np.nanmean(torch.nn.L1Loss(reduction='none')(gpredv,glabelsv),axis=0)
-  err0cont = np.nanmean(torch.nn.L1Loss(reduction='none')(torch.zeros(gpredv.shape,dtype=gpredv.dtype),glabelsv),axis=0)
+  # just predicting zero velocity all the time
+  pred0 = np.zeros((ntimepoints,train_dataset.d_output))
+  if train_dataset.mu_labels is not None:
+    pred0 = train_dataset.zscore_labels(pred0)
+  gpred0 = torch.as_tensor(train_dataset.get_global_movement(pred0))
+  err0cont = np.nanmean(torch.nn.L1Loss(reduction='none')(gpred0,glabelsv),axis=0)
+  
+  # constant velocity predictions: use real labels from dt frames previous. 
+  # note we we won't have predictions for the first dt frames
   gpredprev = torch.zeros(glabelsv.shape)
   gpredprev[:] = np.nan
   for i,dt in enumerate(train_dataset.tspred_global):
@@ -6016,11 +6304,14 @@ def debug_plot_global_error(predv,labelsv,pred_discretev,labels_discretev,train_
   errprevcont = np.nanmean(torch.nn.L1Loss(reduction='none')(gpredprev,glabelsv),axis=0)
   
   if train_dataset.discretize:
+    # ntimepoints x tspred x nglobal x nbins: discretized global predictions
     gpreddiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(pred_discretev))
+    # ntimepoints x tspred x nglobal x nbins: discretized global labels
     glabelsdiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(labels_discretev))
+    # cross entropy error
     errdiscrete = np.nanmean(torch.nn.CrossEntropyLoss(reduction='none')(gpreddiscretev.moveaxis(-1,1),glabelsdiscretev.moveaxis(-1,1)),axis=0)
 
-    zerodiscretev = train_dataset.discretize_fun(np.zeros(predv.shape))
+    zerodiscretev = train_dataset.discretize_fun(pred0)
     gzerodiscretev = torch.as_tensor(train_dataset.get_global_movement_discrete(zerodiscretev))
     err0discrete = np.nanmean(torch.nn.CrossEntropyLoss(reduction='none')(gzerodiscretev.moveaxis(-1,1),glabelsdiscretev.moveaxis(-1,1)),axis=0)
 
@@ -6130,6 +6421,19 @@ def debug_plot_dct_relative_error(predv,labelsv,train_dataset):
   plt.tight_layout()  
   
   return
+
+def debug_plot_histogram_edges(train_dataset):
+  bin_edges = train_dataset.get_bin_edges(zscored=False)
+  ftidx = train_dataset.unravel_label_index(train_dataset.discrete_idx)
+  fs = np.unique(ftidx[:,0])
+  ts = np.unique(ftidx[:,1])
+  fig,ax = plt.subplots(1,len(fs),1,sharey=True)
+  movement_names = train_dataset.get_movement_names()
+  for i,f in enumerate(fs):
+    idx = ftidx[:,0]==f
+    ax[i].plot(bin_edges[idx,0],'.-')
+    ax[i].set_title(movement_names[f])
+  return fig,ax
 
 if __name__ == "__main__":
 
