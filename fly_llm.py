@@ -1041,7 +1041,8 @@ def unravel_label_index(idx,dct_m=None,tspred_global=[1,]):
       ftidx[ii] = (fidx,tspred_global[tidx])
     else:
       t,fidx = np.unravel_index(i-offrelative,(dct_tau,nrelative))
-      ftidx[ii] = (fidx+nglobal,t)
+      # t = 1 corresponds to next frame
+      ftidx[ii] = (fidx+nglobal,t+1)
   return ftidx.reshape(sz+(2,))
 
 def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
@@ -1064,11 +1065,13 @@ def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
     t = ft[1]
     isglobal = fidx < nglobal
     if isglobal:
+      # t = 1 corresponds to next frame
       tidx = np.nonzero(tspred_global==t)[0][0]
       assert tidx is not None
       idx[i] = np.ravel_multi_index((tidx,fidx),(len(tspred_global),nglobal))
     else:
-      idx[i] = np.ravel_multi_index((t,fidx-nglobal),(dct_tau,nrelative))+offrelative
+      # t = 1 corresponds to next frame
+      idx[i] = np.ravel_multi_index((t-1,fidx-nglobal),(dct_tau,nrelative))+offrelative
   
   return idx.reshape(sz[:-1])
 
@@ -1597,13 +1600,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     tnext = np.min(self.tspred_global)
     self.nextframeidx_global = self.ravel_label_index([(f,tnext) for f in featglobal])
     if self.simplify_out is None:
-      self.nextframeidx_relative = self.ravel_label_index([(i,0) for i in np.nonzero(featrelative)[0]])
+      self.nextframeidx_relative = self.ravel_label_index([(i,1) for i in np.nonzero(featrelative)[0]])
     else:
       self.nextframeidx_relative = np.array([])
     self.nextframeidx = np.r_[self.nextframeidx_global,self.nextframeidx_relative]
     if self.dct_m is not None:
       dct_tau = self.dct_m.shape[0]
-      self.idxdct_relative = np.stack([self.ravel_label_index([(i,f+1) for i in np.nonzero(featrelative)[0]]) for f in range(dct_tau)])
+      # not sure if t+1 should be t+2 here -- didn't add 1 when updating code to make t = 1 mean next frame for relative features
+      self.idxdct_relative = np.stack([self.ravel_label_index([(i,t+1) for i in np.nonzero(featrelative)[0]]) for t in range(dct_tau)])
     self.d_output_nextframe = len(self.nextframeidx)
     
     if input_labels:
@@ -1829,9 +1833,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           if is_bin_epsilon_perfeat:
             bin_epsilon.append(bin_epsilon_feat[i])
         else:
-          # only t = 1 -> 0 can be discrete for relative features
+          # only t = 1 can be discrete for relative features
           if t == 1:
-            ftidx.append((f,0))
+            ftidx.append((f,1))
             if is_bin_epsilon_perfeat:
               bin_epsilon.append(bin_epsilon_feat[i])
     self.discrete_idx = self.ravel_label_index(ftidx)
@@ -2399,6 +2403,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         frame. 
         globalnext (ndarray, dglobal): Global position for the next frame. 
         
+    Example call: relposenext,globalposnext = self.pred2pose(relposecurr,globalposcurr,zmovementout)        
     """
     if isnorm:
       movement = self.unzscore_labels(pred)
@@ -2426,15 +2431,18 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     else:
       movement_relative_next = self.get_next_relative_movement(movement)
       if self.dct_m is None:
+        # nsamples x ntspred_relative x nfeatrelative
         movement_relative = movement_relative_next[:,None,...]
       else:
         # to do: not sure how this will work with multiple samples
         movement_relative = self.get_relative_movement_dct(movement,iszscored=False)
         movement_relative[0,...] = movement_relative_next
+      # nsamples x ntspred_relative x nfeatrelative
       posenext = posein+movement_relative
       #globalnext = globalin+movement[featglobal]
       
     if pred.ndim == posein.ndim:
+      # select out the 0th sample
       posenext = posenext[0]
       globalnext = globalnext[0]
       
@@ -2738,6 +2746,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       Returns:
         Xkp (ndarray, nkpts x 2 x tpred x nflies): keypoints for all flies for all frames,
         with predicted frames/flies filled in. 
+        
+      Example call:
+      res = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],
+                                debug=debug,need_weights=plotattnweights,nsamples=nsamplesfuture)
       """
       model.eval()
 
@@ -2750,6 +2762,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         nsamples1 = 1
       else:
         nsamples1 = nsamples
+        
+      # propagate forward with the 0th sample
+      selectsample = 0
 
       tpred = Xkp.shape[-2]
       nfliespred = len(fliespred)
@@ -2924,12 +2939,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                   
                   # store in output
                   zmovementout[:,self.discrete_idx[token]] = zmovementcurr
-                else:
+                else: # else token < len(self.discrete_idx)
                   # continuous
                   zmovementout[:,self.continuous_idx] = predtoken[0,-1,:len(self.continuous_idx)].cpu()
                   zmovementout_flattened[token,:len(self.continuous_idx)] = zmovementout[self.continuous_idx,0]
                   
-            else:
+            else: # else flatten
             
               if need_weights:
                 with torch.no_grad():
@@ -2954,37 +2969,47 @@ class FlyMLMDataset(torch.utils.data.Dataset):
               pred = pred_apply_fun(pred,lambda x: x[0,-1,...].cpu())
               zmovementout = self.get_full_pred(pred,sample=True,nsamples=nsamples)
               zmovementout = zmovementout.numpy()
-          if nsamples > 0:
-            zmovementout = zmovementout.T
+            # end else flatten
+          # end else debug
+
+          if nsamples == 0:
+            zmovementout = zmovementout[None,...]
+          # relposenext is nsamples x ntspred_relative x nrelative
+          # globalposnext is nsamples x ntspred_global x nglobal
           relposenext,globalposnext = self.pred2pose(relposecurr,globalposcurr,zmovementout)
-          relpose[t,:,i] = relposenext[0]
-          globalpos[t,:,i] = globalposnext[0]
-          relposefuture[t,:,:,i] = relposenext.transpose((1,2,0))
-          globalposfuture[t,:,:,i] = globalposnext.transpose((1,2,0))
+          relpose[:,t,:,i] = relposenext[:,0] # select next time point, all samples, all features
+          globalpos[:,t,:,i] = globalposnext[:,0]
+          # relposefuture is (nsamples1,tpred,ntspred_rel,nrelative,nfliespred)
+          relposefuture[:,t,:,:,i] = relposenext
+          globalposfuture[:,t,:,:,i] = globalposnext
           if self.flatten:
             zmovement[t-1,:,:,i] = zmovementout_flattened
           else:
-            zmovement[t-1,:,i] = zmovementout[0,self.nextframeidx]
-          featnext = combine_relative_global(relposenext[0,:],globalposnext[0,:])
+            zmovement[t-1,:,i] = zmovementout[selectsample,self.nextframeidx]
+          # next frame
+          featnext = combine_relative_global(relposenext[selectsample,0,:],globalposnext[selectsample,0,:])
           Xkp_next = mabe.feat2kp(featnext,scales[...,i])
           Xkp_next = Xkp_next[:,:,0,0]
           Xkp[:,:,t,flynum] = Xkp_next
+        # end loop over flies
 
         if self.simplify_in is None:
           for i in range(nfliespred):
             flynum = fliespred[i]
             sensorynext = compute_sensory_wrapper(Xkp[...,[t,],:],flynum,
-                                                  theta_main=globalpos[[t,],featthetaglobal,i])
+                                                  theta_main=globalpos[selectsample,[t,],featthetaglobal,i])
             sensory[t,:,i] = sensorynext.T
     
         for i in range(nfliespred):
           if self.simplify_in is None:
-            rawinputsnext = combine_inputs(relpose=relpose[[t,],:,i],
+            rawinputsnext = combine_inputs(relpose=relpose[selectsample,[t,],:,i],
                                           sensory=sensory[[t,],:,i],dim=1)
           else:
-            rawinputsnext = relpose[[t,],:,i]
+            rawinputsnext = relpose[selectsample,[t,],:,i]
           zinputsnext = self.zscore_input(rawinputsnext)         
           zinputs[t,...,i] = zinputsnext
+        # end loop over flies
+      # end loop over time points
 
       # if self.flatten:
       #   if self.flatten_obs:
@@ -4184,9 +4209,9 @@ def select_featidx_plot(train_dataset,ntspred_plot,ntsplot_global=None,ntsplot_r
   if ntsplot_relative == 0:
     tsplot_relative = None
   elif ntsplot_relative == 1:
-    tsplot_relative = np.zeros((nrelative,1),dtype=int)
+    tsplot_relative = np.ones((nrelative,1),dtype=int)
   elif ntsplot_relative == train_dataset.ntspred_relative:
-    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:],(nrelative,1))
+    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:]+1,(nrelative,1))
   else:
     # choose 0 + a variety of different timepoints for each feature so that a variety of timepoints are selected
     tsplot_relative = np.concatenate((np.zeros((nrelative,1),dtype=int),
@@ -4617,7 +4642,13 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
                  inputs=None,nstd_input=3,contextl=10,axinput=None,
                  attn_weights=None,skeledgecolors=None,
                  globalpos_future=None,tspred_future=None,
-                 futurecolor=[0,0,0,.25],futurelw=1,futurems=6):
+                 futurecolor=[0,0,0,.25],futurelw=1,futurems=6,
+                 futurealpha=.25):
+  
+  #ani = animate_pose(Xkps,focusflies=focusflies,t0=t0,titletexts=titletexts,trel0=np.maximum(0,config['contextl']-64),
+  #                  inputs=inputs,contextl=config['contextl']-1,attn_weights=attn_weights,
+  #                  globalpos_future={'Pred': globalposfuture},
+  #                  tspred_future=dataset.tspred_global)
 
   plotinput = inputs is not None and len(inputs) > 0
 
@@ -4673,7 +4704,7 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
   
   h = {}
 
-  trel = 0
+  trel = trel0
   t = t0+trel
   createdax = False
   if ax is None:
@@ -4717,11 +4748,12 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
   h['ti'] = []
   if plotfuture:
     h['future'] = []
+    nsamples = {k: globalpos_future[k].shape[0] for k in globalpos_future.keys()}
   
   titletext_ts = np.array(list(titletexts.keys()))
   
-  if trel in titletexts:
-    titletext_str = titletexts[trel]
+  if 0 in titletexts:
+    titletext_str = titletexts[0]
   else:
     titletext_str = ''
 
@@ -4729,9 +4761,19 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
     
     if plotfuture and k in globalpos_future:
       hfuture = []
+      ntsfuture = globalpos_future[k].shape[2]
       for j in range(len(focusflies)):
-        hfuturecurr = ax[i].plot(globalpos_future[k][trel,:,0,j],globalpos_future[k][trel,:,0,j],'.-',color=futurecolor,ms=futurems,lw=futurelw)[0]
-        hfuture.append(hfuturecurr)
+        futurecolors = plt.get_cmap('jet')(np.linspace(0,1,ntsfuture))
+        futurecolors[:,-1] = futurealpha
+        hfuturefly = [None,]*ntsfuture
+        for tfuturei in range(ntsfuture-1,-1,-1):
+          hfuturecurr = ax[i].plot(globalpos_future[k][:,trel,tfuturei,0,j],globalpos_future[k][:,trel,tfuturei,1,j],'.',
+                                   color=futurecolors[tfuturei],ms=futurems,lw=futurelw)[0]
+          hfuturefly[tfuturei] = hfuturecurr
+        # for samplei in range(nsamples[k]):
+        #   hfuturecurr = ax[i].plot(globalpos_future[k][samplei,trel,:,0,j],globalpos_future[k][samplei,trel,:,1,j],'.-',color=futurecolor,ms=futurems,lw=futurelw)[0]
+        #   hfuturefly.append(hfuturecurr)
+        hfuture.append(hfuturefly)
       h['future'].append(hfuture)
     
     hkpt,hedge,_,_,_ = mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[i],kpt_ms=ms,skel_lw=lw,skeledgecolors='tab20')
@@ -4755,14 +4797,14 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
 
   if plotinput or plotattn:
     h['input'] = {}
-    t0input = np.maximum(0,trel0-contextl)
+    t0input = np.maximum(0,trel-contextl)
     contextlcurr = trel0-t0input+1
 
     if plotinput:
       for k in inputs.keys():
         h['input'][k] = []
         for i,inputname in enumerate(inputnames):
-          inputcurr = inputs[k][inputname][trel0+1:t0input:-1,:]
+          inputcurr = inputs[k][inputname][trel+1:t0input:-1,:]
           if contextlcurr < contextl:
             pad = np.zeros([contextl-contextlcurr,]+list(inputcurr.shape)[1:])
             pad[:] = np.nan
@@ -4776,7 +4818,7 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
         if k not in h['input']:
           h['input'][k] = []
         # currently only support one focus fly
-        hattn = axinput[k][-1].plot(attn_weights[k][trel0,-contextl:,0],np.arange(contextl,0,-1))[0]
+        hattn = axinput[k][-1].plot(attn_weights[k][trel,-contextl:,0],np.arange(contextl,0,-1))[0]
         #axinput[k][-1].set_xscale('log')
         axinput[k][-1].set_ylim([-.5,contextl-.5])
         axinput[k][-1].set_xlim([0,1])
@@ -4803,9 +4845,16 @@ def animate_pose(Xkps,focusflies=[],ax=None,fig=None,t0=0,
       for i,k in enumerate(Xkps):
         mabe.plot_flies(Xkps[k][...,trel,:],ax=ax[0],hkpts=h['kpt'][i],hedges=h['edge'][i])
         if plotfuture and k in globalpos_future:
+          ntsfuture = globalpos_future[k].shape[2]
           for j in range(len(focusflies)):
-            h['future'][i][j].set_xdata(globalpos_future[k][trel,:,0,j])
-            h['future'][i][j].set_ydata(globalpos_future[k][trel,:,1,j])
+            
+            for tfuturei in range(ntsfuture-1,-1,-1):
+              h['future'][i][j][tfuturei].set_xdata(globalpos_future[k][:,trel,tfuturei,0,j])
+              h['future'][i][j][tfuturei].set_ydata(globalpos_future[k][:,trel,tfuturei,1,j])
+            
+            # for samplei in range(nsamples[k]):
+            #   h['future'][i][j][samplei].set_xdata(globalpos_future[k][samplei,trel,:,0,j])
+            #   h['future'][i][j][samplei].set_ydata(globalpos_future[k][samplei,trel,:,1,j])
         if i == 0:
           h['ti'][i].set_text(f'{titletext_str} {k}, t = {t}')
         else:
@@ -5378,6 +5427,9 @@ def compute_all_attention_weight_rollouts(attn_weights0):
 
 def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False,plotfuture=False,nsamplesfuture=1):
     
+  #ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,
+  #                            plotattnweights=False,plotfuture=train_dataset.ntspred_global>1,nsamplesfuture=nsamplesfuture)
+    
   if burnin is None:
     burnin = config['contextl']-1
 
@@ -5390,6 +5442,7 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
 
   model.eval()
 
+  # capture all outputs of predict_open_loop in a tuple
   res = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],
                                   debug=debug,need_weights=plotattnweights,nsamples=nsamplesfuture)
   Xkp_pred,zinputs,globalposfuture,relposefuture = res[:4]
@@ -5699,7 +5752,7 @@ def sanity_check_tspred(data,config,npad,scale_perfly,dct_m,t0=510,flynum=0):
   xcurr0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32)
 
   assert np.all(xcurr0['input']==xcurr1['input'])
-  ftidx = [(f,1) for f in featglobal] + [(f,0) for f in np.nonzero(featrelative)[0]]
+  ftidx = [(f,1) for f in featglobal] + [(f,1) for f in np.nonzero(featrelative)[0]]
   idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
   assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
 
@@ -6088,11 +6141,14 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   else:
     maskidx = None
   
-  ntspred_plot = 4
+  ntspred_plot = np.minimum(4,train_dataset.ntspred_global)
   featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
-  featidxplot = select_featidx_plot(train_dataset,ntspred_plot=13,ntsplot_relative=0)
-  naxc = int(np.round(len(featidxplot)/nfeatures))
+  naxc = np.maximum(1,int(np.round(len(featidxplot)/nfeatures)))
   fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,naxc=naxc,featidxplot=featidxplot,dataset=val_dataset)
+  if train_dataset.ntspred_global > 1:
+    featidxplot = select_featidx_plot(train_dataset,ntspred_plot=train_dataset.ntspred_global,ntsplot_relative=0)
+    naxc = np.maximum(1,int(np.round(len(featidxplot)/nfeatures)))
+    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,naxc=naxc,featidxplot=featidxplot,dataset=val_dataset)
   
   if train_dataset.ntspred_global > 1:
     featidxplot = train_dataset.ravel_label_index([(featglobal[0],t) for t in train_dataset.tspred_global])
@@ -6101,7 +6157,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   if train_dataset.dct_tau > 0:
     fstrs = ['left_middle_leg_tip_angle','left_front_leg_tip_angle','left_wing_angle']
     fs = [mabe.posenames.index(x) for x in fstrs]
-    featidxplot = train_dataset.ravel_label_index([(f,i) for i in range(train_dataset.dct_tau+1) for f in fs])
+    featidxplot = train_dataset.ravel_label_index([(f,i+1) for i in range(train_dataset.dct_tau+1) for f in fs])
     fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset,naxc=len(fs))
 
     predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
@@ -6149,7 +6205,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 def debug_plot_histograms(dataset,alpha=1):
   r = np.random.rand(dataset.discretize_bin_samples.shape[0])-.5
   ftidx = dataset.unravel_label_index(dataset.discrete_idx)
-  ftidx[featrelative[ftidx[:,0]],1]+=1
+  #ftidx[featrelative[ftidx[:,0]],1]+=1
   fs = np.unique(ftidx[:,0])
   ts = np.unique(ftidx[:,1])
   nfs = len(fs)
@@ -6427,12 +6483,18 @@ def debug_plot_histogram_edges(train_dataset):
   ftidx = train_dataset.unravel_label_index(train_dataset.discrete_idx)
   fs = np.unique(ftidx[:,0])
   ts = np.unique(ftidx[:,1])
-  fig,ax = plt.subplots(1,len(fs),1,sharey=True)
+  fig,ax = plt.subplots(1,len(fs),sharey=True)
   movement_names = train_dataset.get_movement_names()
   for i,f in enumerate(fs):
+    ax[i].cla()
     idx = ftidx[:,0]==f
-    ax[i].plot(bin_edges[idx,0],'.-')
+    tscurr = ftidx[idx,1]
+    tidx = mabe.npindex(ts,tscurr)
+    ax[i].plot(bin_edges[idx,:],tidx,'.-')
     ax[i].set_title(movement_names[f])
+    ax[i].set_xscale('symlog')
+  ax[0].set_yticks(np.arange(len(ts)))
+  ax[0].set_yticklabels([str(t) for t in ts])
   return fig,ax
 
 if __name__ == "__main__":

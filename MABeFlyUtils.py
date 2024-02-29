@@ -168,6 +168,14 @@ YTYPES = {'seq':0,'tgt':1,'frame':2}
 def modrange(x,l,u):
   return np.mod(x-l,u-l)+l
 
+def npindex(big,small):
+  # big and small should be 1D arrays
+  order = np.argsort(big)
+  bigsorted = big[order]
+  idx = np.searchsorted(bigsorted,small,side='left')
+  idx[bigsorted[idx] != small] = -1    
+  return idx
+
 def circle_line_intersection(linex, liney, linedx, linedy, circler, circlex=None, circley=None):
   # intersection of a line and a circle from
   # https://mathworld.wolfram.com/Circle-LineIntersection.html
