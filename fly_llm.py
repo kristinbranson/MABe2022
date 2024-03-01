@@ -5424,6 +5424,30 @@ def compute_all_attention_weight_rollouts(attn_weights0):
     attn_weights_rollout[t,:w.shape[0]] = w
   return attn_weights_rollout
 
+def get_pose_future(data,scales,tspred_global,ts=None,fliespred=None):
+
+  maxT = data['X'].shape[2]
+  if ts is None:
+    ts = np.arange(maxT)
+  if fliespred is None:
+    fliespred = np.arange(data['X'].shape[3])
+  
+  Xkpfuture = np.zeros((data['X'].shape[0],data['X'].shape[1],len(ts),len(tspred_global),len(fliespred)))
+  Xkpfuture[:] = np.nan
+  for ti,toff in enumerate(tspred_global):
+    idxcurr = ts<maxT-toff
+    tscurr = ts[idxcurr]
+    Xkpfuture[:,:,idxcurr,ti] = data['X'][:,:,tscurr+toff][...,fliespred]
+    isbad = data['videoidx'][tscurr,0] != data['videoidx'][tscurr+toff,0]
+    Xkpfuture[:,:,isbad] = np.nan
+  
+  relposefuture,globalposfuture = compute_pose_features(Xkpfuture,scales)
+  if globalposfuture.ndim == 3: # when there is one fly, it gets collapsed
+    globalposfuture = globalposfuture[...,None]
+    relposefuture = relposefuture[...,None]
+  globalposfuture = globalposfuture.transpose(1,2,0,3)
+  relposefuture = relposefuture.transpose(1,2,0,3)
+  return globalposfuture,relposefuture
 
 def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t0,tpred,burnin=None,debug=False,plotattnweights=False,plotfuture=False,nsamplesfuture=1):
     
@@ -5440,12 +5464,16 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
   ids = data['ids'][t0,fliespred]
   scales = scale_perfly[:,ids]
 
+  if plotfuture:
+    # subtract one from tspred_global, as the tspred_global for predicted data come from the previous frame
+    globalposfuture_true,relposefuture_true = get_pose_future(data,scales,[t+1 for t in dataset.tspred_global],ts=np.arange(t0,t0+tpred),fliespred=fliespred)
+
   model.eval()
 
   # capture all outputs of predict_open_loop in a tuple
   res = dataset.predict_open_loop(Xkp,fliespred,scales,burnin,model,maxcontextl=config['contextl'],
                                   debug=debug,need_weights=plotattnweights,nsamples=nsamplesfuture)
-  Xkp_pred,zinputs,globalposfuture,relposefuture = res[:4]
+  Xkp_pred,zinputs,globalposfuture_pred,relposefuture_pred = res[:4]
   if plotattnweights:
     attn_weights0 = res[4]
 
@@ -5465,7 +5493,8 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
   titletexts = {0: 'Initialize', burnin: ''}
   
   if plotfuture:
-    future_args = {'globalpos_future': {'Pred': globalposfuture},'tspred_future': dataset.tspred_global}
+    future_args = {'globalpos_future': {'Pred': globalposfuture_pred, 'True': globalposfuture_true[None,...]},
+                   'tspred_future': dataset.tspred_global}
   else:
     future_args = {}
     
