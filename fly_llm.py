@@ -831,7 +831,98 @@ def compute_pose_features(X,scale):
 
   return relpose,globalpos
 
-def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred_global=[1,]):
+def boxsum(x,n):
+  if n == 1:
+    return x
+  xtorch = torch.tensor(x[:,None,...])
+  y = torch.nn.functional.conv2d(xtorch,torch.ones((1,1,n,1),dtype=xtorch.dtype),padding='valid')
+  return y[:,0,...].numpy()
+
+def compute_global_velocity(Xorigin,Xtheta,tspred_global=[1,]):
+  """
+  compute_global_velocity(Xorigin,Xtheta,tspred_global=[1,])
+  compute the movement from t to t+tau for all tau in tspred_global
+  Xorigin is the centroid position of the fly, shape = (2,T,nflies)
+  Xtheta is the orientation of the fly, shape = (T,nflies)
+  returns dXoriginrel,dtheta
+  dXoriginrel[i,:,t,fly] is the global position for fly fly at time t+tspred_global[i] in the coordinate system of the fly at time t
+  shape = (ntspred_global,2,T,nflies)
+  dtheta[i,t,fly] is the total change in orientation for fly fly at time t+tspred_global[i] from time t. this sums per-frame dthetas,
+  so it could have a value outside [-pi,pi]. shape = (ntspred_global,T,nflies)
+  """
+  
+  T = Xorigin.shape[1]
+  nflies = Xorigin.shape[2]
+  ntspred_global = len(tspred_global)
+
+  # global velocity  
+  # dXoriginrel[tau,:,t,fly] is the global position for fly fly at time t+tau in the coordinate system of the fly at time t
+  dXoriginrel = np.zeros((ntspred_global,2,T,nflies),dtype=Xorigin.dtype)
+  dXoriginrel[:] = np.nan
+  # dtheta[tau,t,fly] is the change in orientation for fly fly at time t+tau from time t
+  dtheta = np.zeros((ntspred_global,T,nflies),dtype=Xtheta.dtype)
+  dtheta[:] = np.nan
+  # dtheta1[t,fly] is the change in orientation for fly from frame t to t+1
+  dtheta1 = mabe.modrange(Xtheta[1:,:]-Xtheta[:-1,:],-np.pi,np.pi)
+
+  for i,toff in enumerate(tspred_global):
+    # center and rotate absolute position around position toff frames previous
+    dXoriginrel[i,:,:-toff,:] = mabe.rotate_2d_points((Xorigin[:,toff:,:]-Xorigin[:,:-toff,:]).transpose((1,0,2)),Xtheta[:-toff,:]).transpose((1,0,2))
+    # compute total change in global orientation in toff frame intervals
+    dtheta[i,:-toff,:] = boxsum(dtheta1[None,...],toff)
+
+  return dXoriginrel,dtheta
+
+def compute_relpose_velocity(relpose,tspred_dct=[]):
+  """
+  compute_relpose_velocity(relpose,tspred_dct=[])
+  compute the relative pose movement from t to t+tau for all tau in tspred_dct
+  relpose is the relative pose features, shape = (nrelative,T,nflies)
+  outputs drelpose, shape = (nrelative,T,ntspred_dct+1,nflies)
+  """
+
+  ntspred_dct = len(tspred_dct)
+  T = relpose.shape[1]
+  nflies = relpose.shape[2]
+  
+  # drelpose1[:,f,fly] is the change in pose for fly from frame t to t+1
+  drelpose1 = relpose[:,1:,:]-relpose[:,:-1,:]
+  drelpose1[featangle[featrelative],:,:] = mabe.modrange(drelpose1[featangle[featrelative],:,:],-np.pi,np.pi)
+  
+  # drelpose[:,tau,t,fly] is the change in pose for fly fly at time t+tau from time t    
+  drelpose = np.zeros((nrelative,T,ntspred_dct+1,nflies),dtype=relpose.dtype)
+  drelpose[:] = np.nan
+  drelpose[:,:-1,0,:] = drelpose1
+  
+  for i,toff in enumerate(tspred_dct):
+    # compute total change in relative pose in toff frame intervals
+    drelpose[:,:-toff,i+1,:] = boxsum(drelpose,toff)
+  
+  return drelpose
+
+def compute_relpose_tspred(relpose,tspred_dct=[]):
+  """
+  compute_relpose_tspred(relpose,tspred_dct=[])
+  concatenate the relative pose at t+tau for all tau in tspred_dct
+  relpose: shape = (nrelative,T,nflies)
+  tspred_dct: list of int
+  returns relpose_tspred: shape = (nrelative,T,ntspred_dct+1,nflies)
+  """
+
+  ntspred_dct = len(tspred_dct)
+  T = relpose.shape[1]
+  nflies = relpose.shape[2]
+
+  relpose_tspred = np.zeros((nrelative,T,ntspred_dct+1,nflies),dtype=relpose.dtype)
+  relpose_tspred[:] = np.nan
+  relpose_tspred[:,:,0,:] = relpose
+  for i,toff in enumerate(tspred_dct):
+    relpose_tspred[:,:-toff,i+1,:] = relpose_tspred[:,toff:,:]
+  
+  return relpose_tspred
+
+
+def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred_global=[1,],compute_pose_vel=True):
   """
   movement = compute_movement(X=X,scale=scale,...)
   movement = compute_movement(relpose=relpose,globalpos=globalpos,...)
@@ -863,8 +954,11 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   T = relpose.shape[1]
   nflies = relpose.shape[2]
 
+  # centroid and orientation position
   Xorigin = globalpos[:2,...]
   Xtheta = globalpos[2,...]
+
+  # which future frames are we predicting, how many features are there total
   ntspred_global = len(tspred_global)
   nmovement_features = ntspred_global*nglobal
   if (dct_m is not None) and simplify != 'global':
@@ -876,90 +970,52 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
     tspred_dct = []
     tspred_relative = [1,]
   nmovement_features += (ntspred_dct+1)*nrelative
+
   # compute the max of tspred_global and tspred_dct
   tspred_all = np.unique(np.concatenate((tspred_global,tspred_relative)))
   lastT = T - np.max(tspred_all)
-  
-  # dXoriginrel[tau,:,t,fly] is the global position for fly fly at time t+tau in the coordinate system of the fly at time t
-  dXoriginrel = np.zeros((ntspred_global,2,T,nflies),dtype=Xorigin.dtype)
-  dXoriginrel[:] = np.nan
-  # dtheta[tau,t,fly] is the change in orientation for fly fly at time t+tau from time t
-  dtheta = np.zeros((ntspred_global,T,nflies),dtype=Xtheta.dtype)
-  dtheta[:] = np.nan
-  # dtheta1[t,fly] is the change in orientation for fly from frame t to t+1
-  dtheta1 = mabe.modrange(Xtheta[1:,:]-Xtheta[:-1,:],-np.pi,np.pi)
 
-  if simplify != 'global':
-    # drelpose1[f,fly] is the change in pose for fly from frame t to t+1
-    drelpose1 = relpose[:,1:,:]-relpose[:,:-1,:]
-    drelpose1[featangle[featrelative],:,:] = mabe.modrange(drelpose1[featangle[featrelative],:,:],-np.pi,np.pi)
-    # drelpose[tau,t,fly] is the change in pose for fly fly at time t+tau from time t
-    if dct_m is not None:
-      drelpose = np.zeros((relpose.shape[0],T,ntspred_dct+1,nflies),dtype=relpose.dtype)
-      drelpose[:] = np.nan
-      drelpose[:,:-1,0,:] = drelpose1
-    else:
-      drelpose = drelpose1
-  
-  def boxsum(x,n):
-    if n == 1:
-      return x
-    xtorch = torch.tensor(x[:,None,...])
-    y = torch.nn.functional.conv2d(xtorch,torch.ones((1,1,n,1),dtype=xtorch.dtype),padding='valid')
-    return y[:,0,...].numpy()
-  
-  for i,toff in enumerate(tspred_global):
-    # center and rotate absolute position around position toff frames previous
-    dXoriginrel[i,:,:-toff,:] = mabe.rotate_2d_points((Xorigin[:,toff:,:]-Xorigin[:,:-toff,:]).transpose((1,0,2)),Xtheta[:-toff,:]).transpose((1,0,2))
-    # compute total change in global orientation in toff frame intervals
-    dtheta[i,:-toff,:] = boxsum(dtheta1[None,...],toff)
-  for i,toff in enumerate(tspred_dct):
-    # compute total change in relative pose in toff frame intervals
-    if (dct_m is not None) and (simplify != 'global'):
-      drelpose[:,:-toff,i+1,:] = boxsum(drelpose1,toff)
+  # global velocity  
+  # dXoriginrel[tau,:,t,fly] is the global position for fly fly at time t+tau in the coordinate system of the fly at time t
+  dXoriginrel,dtheta = compute_global_velocity(Xorigin,Xtheta,tspred_global)
+
+  # relpose_rep is (nrelrep,T,ntspred_dct+1,nflies)
+  if simplify == 'global':
+    relpose_rep = np.zeros((0,T,ntspred_global+1,nflies),dtype=relpose.dtype)
+  elif compute_pose_vel:
+    relpose_rep = compute_relpose_velocity(relpose,tspred_dct)
+  else:
+    relpose_rep = compute_relpose_tspred(relpose,tspred_dct)
+  nrelrep = relpose_rep.shape[0]
 
   # only full data up to frame lastT
+  # dXoriginrel is (ntspred_global,2,lastT,nflies)
   dXoriginrel = dXoriginrel[:,:,:lastT,:]
+  # dtheta is (ntspred_global,lastT,nflies)
   dtheta = dtheta[:,:lastT,:]
-  drelpose = drelpose[:,:lastT]
-  if (simplify != 'global'):
+  # relpose_rep is (nrelative,lastT,ntspred_dct+1,nflies)
+  relpose_rep = relpose_rep[:,:lastT]
+
+  if (simplify != 'global') and (dct_m is not None):
     # the pose forecasting papers compute error on the actual pose, not the dct. they just force the network to go through the dct
     # representation first.
-    if (dct_m is not None):
-      drelpose[:,:,1:,:] = dct_m @ drelpose[:,:,1:,:]
-    drelpose = np.moveaxis(drelpose,2,0)
+    relpose_rep[:,:,1:,:] = dct_m @ relpose_rep[:,:,1:,:]
+  # relpose_rep is now (ntspred_dct+1,nrelative,lastT,nflies)
+  relpose_rep = np.moveaxis(relpose_rep,2,0)
 
+  # concatenate the global (dforward, dsideways, dorientation)
   movement_global = np.concatenate((dXoriginrel[:,[1,0]],dtheta[:,None,:,:]),axis=1)
-  movement_global = movement_global.reshape((ntspred_global*nglobal,lastT,nflies))  
-  if simplify == 'global':
-    movement = movement_global
-  else:
-    drelpose = drelpose.reshape(((ntspred_dct+1)*nrelative,lastT,nflies))
-    movement = np.concatenate((movement_global,drelpose),axis=0)
+  # movement_global is now (ntspred_global*nglobal,lastT,nflies)
+  movement_global = movement_global.reshape((ntspred_global*nglobal,lastT,nflies))
+  # relpose_rep is now ((ntspred_dct+1)*nrelrep,lastT,nflies)
+  relpose_rep = relpose_rep.reshape(((ntspred_dct+1)*nrelrep,lastT,nflies))
+  # concatenate everything together
+  movement = np.concatenate((movement_global,relpose_rep),axis=0)
 
-  # old code
-  # dXoriginrel = mabe.rotate_2d_points((Xorigin[:,1:,:]-Xorigin[:,:-1,:]).transpose((1,0,2)),Xtheta[:-1,:]).transpose((1,0,2))
-  # forward_vel = dXoriginrel[1,...]
-  # sideways_vel = dXoriginrel[0,...]
-
-  # movement = np.zeros([nfeatures,T-1,nflies],relpose.dtype)
-  # movement[featrelative,...] = relpose[:,1:,:]-relpose[:,:-1,:]
-  # movement[featorigin[0],...] = forward_vel
-  # movement[featorigin[1],...] = sideways_vel
-  # movement[feattheta,...] = Xtheta[1:,...]-Xtheta[:-1,...]
-  # movement[featangle,...] = mabe.modrange(movement[featangle,...],-np.pi,np.pi)
-
-  # if simplify is not None:
-  #   if simplify == 'global':
-  #     movement = movement[featglobal,...]
-  #   else:
-  #     raise
-
-  if nd == 2:
+  if nd == 2: # no flies dimension
     movement = movement[...,0]
 
   return movement
-
 
 def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False):
   
@@ -5810,8 +5866,9 @@ def sanity_check_temporal_dep(train_dataloader,device,train_src_mask,is_causal,m
 
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
+  tmpsavefile = ''
   # to save time, i saved the chunked data to a pkl file
-  tmpsavefile = 'chunkeddata20230905.pkl'
+  #tmpsavefile = 'chunkeddata20230905.pkl'
   #tmpsavefile = 'chunkeddata20230828.pkl'
   doloadtmpsavefile = os.path.exists(tmpsavefile)
   #tmpsavefile = None
@@ -5859,7 +5916,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     data,scale_perfly = load_and_filter_data(config['intrainfile'],config)
     valdata,val_scale_perfly = load_and_filter_data(config['invalfile'],config)
   
-  # if using discrete cpsine transform, create dct matrix
+  # if using discrete cosine transform, create dct matrix
   # this didn't seem to work well, so probably won't use in the future
   if config['dct_tau'] is not None and config['dct_tau'] > 0:
     dct_m,idct_m = get_dct_matrix(config['dct_tau'])
@@ -5894,7 +5951,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     valX = chunk_data(valdata,config['contextl'],val_reparamfun,**chunk_data_params)
     print('Done.')
     
-    if tmpsavefile is not None:
+    if len(tmpsavefile) > 0:
       print('Saving chunked data to file')
       with open(tmpsavefile,'wb') as f:
         pickle.dump({'X': X,'valX': valX, 'data': data, 'valdata': valdata, 'scale_perfly': scale_perfly,'val_scale_perfly': val_scale_perfly},f)
