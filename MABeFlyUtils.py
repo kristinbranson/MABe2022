@@ -2021,6 +2021,9 @@ def body_centric_kp(Xkp):
   return Xn,porigin,thorax_theta
 
 def kp2feat(Xkp,scale_perfly=None,flyid=None,return_scale=False):
+  """
+  Xkp is nkeypoints x 2 [x T [x nflies]]
+  """
 
   ndim = np.ndim(Xkp)
   if ndim >= 3:

@@ -128,6 +128,9 @@
     "niterplot": 64,
 
     "_comment_model_nickname": "nickname used when saving files related to this model",
-    "model_nickname": null
+    "model_nickname": null,
+
+    "_comment_compute_pose_vel": "whether to predict the relative pose velocity (true) or position (false)",
+    "compute_pose_vel": true
 }
 

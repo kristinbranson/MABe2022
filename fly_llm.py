@@ -203,7 +203,7 @@ def chunk_data(data,contextl,reparamfun,npad=1):
   return X
 
 def compute_noise_params(data,scale_perfly,sig_tracking=.25/mabe.PXPERMM,
-                         simplify_out=None):
+                         simplify_out=None,compute_pose_vel=True):
 
   # contextlpad = 2
   
@@ -234,10 +234,10 @@ def compute_noise_params(data,scale_perfly,sig_tracking=.25/mabe.PXPERMM,
       scale = scale_perfly[:,id]
       xkp = data['X'][:,:,t0:t1+1,flynum]
       relpose,globalpos = compute_pose_features(xkp,scale)
-      movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out)
+      movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out,compute_pose_vel=compute_pose_vel)
       nu = np.random.normal(scale=sig_tracking,size=xkp.shape)
       relpose_pert,globalpos_pert = compute_pose_features(xkp+nu,scale)
-      movement_pert = compute_movement(relpose=relpose_pert,globalpos=globalpos_pert,simplify=simplify_out)
+      movement_pert = compute_movement(relpose=relpose_pert,globalpos=globalpos_pert,simplify=simplify_out,compute_pose_vel=compute_pose_vel)
       alld += np.nansum((movement_pert-movement)**2.,axis=1)
       ncurr = np.sum((np.isnan(movement)==False),axis=1)
       n+=ncurr
@@ -900,20 +900,89 @@ def compute_relpose_velocity(relpose,tspred_dct=[]):
   
   return drelpose
 
-def compute_relpose_tspred(relpose,tspred_dct=[]):
+def featidx_to_relfeatidx(featidx):
+  return featidx - nglobal
+
+def relfeatidx_to_featidx(relfeatidx):
+  return relfeatidx+nglobal
+
+def relfeatidx_to_cossinidx(discreteidx=[]):
+  """
+  relfeatidx_to_cossinidx(discreteidx=[])
+  get the look up table for relative feature index to the cos sin representation index
+  discreteidx: list of int, feature indices that are discrete
+  returns rel2cossinmap: list, rel2cossinmap[i] is the list of indices for the cos and sin 
+  representation of the i-th relative feature
+  """
+  rel2cossinmap = []
+  csi = 0
+  for relfeati in range(nrelative):
+    feati = relfeatidx_to_featidx(relfeati)
+    if featangle[featrelative][relfeati] and (feati not in discreteidx):
+      rel2cossinmap.append([csi,csi+1])
+      csi += 2
+    else:
+      rel2cossinmap.append(csi)
+      csi += 1
+  return rel2cossinmap,csi
+
+def relpose_angle_to_cos_sin(relpose,discreteidx=[]):
+  """
+  relpose_angle_to_cos_sin(relposein)
+  convert the relative pose angles features from radians to cos and sin
+  relposein: shape = (nrelative,...)
+  """
+  
+  rel2cossinmap,ncs = relfeatidx_to_cossinidx(discreteidx)
+  
+  relpose_cos_sin = np.zeros((ncs,)+relpose.shape[1:],dtype=relpose.dtype)
+  for relfeati in range(nrelative):
+    csi = rel2cossinmap[relfeati]
+    if type(csi) is list:
+      relpose_cos_sin[csi[0],...] = np.cos(relpose[relfeati,...])
+      relpose_cos_sin[csi[1],...] = np.sin(relpose[relfeati,...])
+    else:
+      relpose_cos_sin[csi,...] = relpose[relfeati,...]
+  return relpose_cos_sin
+
+def relpose_cos_sin_to_angle(relpose_cos_sin,discreteidx=[],epsilon=1e-6):
+  sz = relpose_cos_sin.shape[:-1]
+  if len(sz) == 0:
+    n = 1
+  else:
+    n = np.prod(sz)
+  relpose_cos_sin = relpose_cos_sin.reshape((n,relpose_cos_sin.shape[-1]))
+  rel2cossinmap,ncs = relfeatidx_to_cossinidx(discreteidx)
+    
+  relpose = np.zeros((n,nrelative),dtype=relpose_cos_sin.dtype)
+  for relfeati in range(nrelative):
+    csi = rel2cossinmap[relfeati]
+    if type(csi) is list:
+      # if the norm is less than epsilon, just make the angle 0
+      idxgood = np.linalg.norm(relpose_cos_sin[:,csi],axis=-1) >= epsilon
+      relpose[idxgood,relfeati] = np.arctan2(relpose_cos_sin[idxgood,csi[1]],relpose_cos_sin[idxgood,csi[0]])
+    else:
+      relpose[...,relfeati] = relpose_cos_sin[...,csi]
+      
+  relpose = relpose.reshape(sz+(nrelative,))
+  return relpose
+
+def compute_relpose_tspred(relposein,tspred_dct=[],discreteidx=[]):
   """
   compute_relpose_tspred(relpose,tspred_dct=[])
   concatenate the relative pose at t+tau for all tau in tspred_dct
-  relpose: shape = (nrelative,T,nflies)
+  relposein: shape = (nrelative,T,nflies)
   tspred_dct: list of int
   returns relpose_tspred: shape = (nrelative,T,ntspred_dct+1,nflies)
   """
 
   ntspred_dct = len(tspred_dct)
-  T = relpose.shape[1]
-  nflies = relpose.shape[2]
+  T = relposein.shape[1]
+  nflies = relposein.shape[2]
+  relpose = relpose_angle_to_cos_sin(relposein,discreteidx=discreteidx)
+  nrelrep = relpose.shape[0]
 
-  relpose_tspred = np.zeros((nrelative,T,ntspred_dct+1,nflies),dtype=relpose.dtype)
+  relpose_tspred = np.zeros((nrelrep,T,ntspred_dct+1,nflies),dtype=relpose.dtype)
   relpose_tspred[:] = np.nan
   relpose_tspred[:,:,0,:] = relpose
   for i,toff in enumerate(tspred_dct):
@@ -922,7 +991,9 @@ def compute_relpose_tspred(relpose,tspred_dct=[]):
   return relpose_tspred
 
 
-def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,dct_m=None,tspred_global=[1,],compute_pose_vel=True):
+def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None,
+                     dct_m=None,tspred_global=[1,],compute_pose_vel=True,discreteidx=[],
+                     returnidx=False):
   """
   movement = compute_movement(X=X,scale=scale,...)
   movement = compute_movement(relpose=relpose,globalpos=globalpos,...)
@@ -960,7 +1031,6 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
 
   # which future frames are we predicting, how many features are there total
   ntspred_global = len(tspred_global)
-  nmovement_features = ntspred_global*nglobal
   if (dct_m is not None) and simplify != 'global':
     ntspred_dct = dct_m.shape[0]
     tspred_dct = np.arange(1,ntspred_dct+1)
@@ -969,7 +1039,6 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
     ntspred_dct = 0
     tspred_dct = []
     tspred_relative = [1,]
-  nmovement_features += (ntspred_dct+1)*nrelative
 
   # compute the max of tspred_global and tspred_dct
   tspred_all = np.unique(np.concatenate((tspred_global,tspred_relative)))
@@ -985,7 +1054,7 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   elif compute_pose_vel:
     relpose_rep = compute_relpose_velocity(relpose,tspred_dct)
   else:
-    relpose_rep = compute_relpose_tspred(relpose,tspred_dct)
+    relpose_rep = compute_relpose_tspred(relpose,tspred_dct,discreteidx=discreteidx)
   nrelrep = relpose_rep.shape[0]
 
   # only full data up to frame lastT
@@ -993,14 +1062,14 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   dXoriginrel = dXoriginrel[:,:,:lastT,:]
   # dtheta is (ntspred_global,lastT,nflies)
   dtheta = dtheta[:,:lastT,:]
-  # relpose_rep is (nrelative,lastT,ntspred_dct+1,nflies)
+  # relpose_rep is (nrelrep,lastT,ntspred_dct+1,nflies)
   relpose_rep = relpose_rep[:,:lastT]
 
   if (simplify != 'global') and (dct_m is not None):
     # the pose forecasting papers compute error on the actual pose, not the dct. they just force the network to go through the dct
     # representation first.
     relpose_rep[:,:,1:,:] = dct_m @ relpose_rep[:,:,1:,:]
-  # relpose_rep is now (ntspred_dct+1,nrelative,lastT,nflies)
+  # relpose_rep is now (ntspred_dct+1,nrelrep,lastT,nflies)
   relpose_rep = np.moveaxis(relpose_rep,2,0)
 
   # concatenate the global (dforward, dsideways, dorientation)
@@ -1009,15 +1078,26 @@ def compute_movement(X=None,scale=None,relpose=None,globalpos=None,simplify=None
   movement_global = movement_global.reshape((ntspred_global*nglobal,lastT,nflies))
   # relpose_rep is now ((ntspred_dct+1)*nrelrep,lastT,nflies)
   relpose_rep = relpose_rep.reshape(((ntspred_dct+1)*nrelrep,lastT,nflies))
-  # concatenate everything together
-  movement = np.concatenate((movement_global,relpose_rep),axis=0)
 
   if nd == 2: # no flies dimension
-    movement = movement[...,0]
+    movement_global = movement_global[...,0]
+    relpose_rep = relpose_rep[...,0]
+
+  # concatenate everything together
+  movement = np.concatenate((movement_global,relpose_rep),axis=0)
+  
+  if returnidx:
+    idxinfo = {}
+    idxinfo['global'] = [0,ntspred_global*nglobal]
+    idxinfo['global_feat_tau'] = unravel_label_index(np.arange(ntspred_global*nglobal),
+                                                     dct_m=dct_m,tspred_global=tspred_global,
+                                                     nrelrep=nrelrep)
+    idxinfo['relative'] = [ntspred_global*nglobal,ntspred_global*nglobal+nrelrep*(ntspred_dct+1)]
+    return movement,idxinfo
 
   return movement
 
-def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False):
+def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False,returnidx=False):
   
   # other flies positions
   idxother = np.ones(Xkp.shape[-1],dtype=bool)
@@ -1043,12 +1123,25 @@ def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False):
                     xvision_other,yvision_other,
                     xtouch_other,ytouch_other)
   sensory = np.r_[wall_touch,otherflies_vision]
+  idxinfo = {}
+  idxoff = 0
+  idxinfo['wall_touch'] = [0,wall_touch.shape[0]]
+  idxoff += wall_touch.shape[0]
+  idxinfo['otherflies_vision'] = [idxoff,idxoff+otherflies_vision.shape[0]]
+  idxoff += otherflies_vision.shape[0]
+  
   if otherflies_touch is not None:
     sensory = np.r_[sensory,otherflies_touch]
+    idxinfo['otherflies_touch'] = [idxoff,idxoff+otherflies_touch.shape[0]]
+    idxoff += otherflies_touch.shape[0]
+    
+  ret = (sensory,)
   if returnall:
-    return sensory,wall_touch,otherflies_vision,otherflies_touch
-  else:
-    return sensory
+    ret = ret + (wall_touch,otherflies_vision,otherflies_touch)
+  if returnidx:
+    ret = ret + (idxinfo,)
+
+  return ret
 
 def combine_inputs(relpose=None,sensory=None,input=None,labels=None,dim=0):
   if input is None:
@@ -1057,7 +1150,7 @@ def combine_inputs(relpose=None,sensory=None,input=None,labels=None,dim=0):
     input = np.concatenate((input,labels),axis=dim)
   return input 
 
-def get_dct_matrix(N: int) -> (np.ndarray,np.ndarray):
+def get_dct_matrix(N):
   """ Get the Discrete Cosine Transform coefficient matrix
   Copied from https://github.com/dulucas/siMLPe/blob/main/exps/baseline_h36m/train.py
   Back to MLP: A Simple Baseline for Human Motion Prediction
@@ -1081,7 +1174,7 @@ def get_dct_matrix(N: int) -> (np.ndarray,np.ndarray):
   idct_m = np.linalg.inv(dct_m)
   return dct_m, idct_m
 
-def unravel_label_index(idx,dct_m=None,tspred_global=[1,]):
+def unravel_label_index(idx,dct_m=None,tspred_global=[1,],nrelrep=None,d_output=None):
   idx = np.array(idx)
   sz = idx.shape
   idx = idx.flatten()
@@ -1090,18 +1183,23 @@ def unravel_label_index(idx,dct_m=None,tspred_global=[1,]):
   else:
     dct_tau = dct_m.shape[0]+1
   offrelative = len(tspred_global)*nglobal
+  if nrelrep is None:
+    if d_output is None:
+      nrelrep = nrelative
+    else:
+      nrelrep = d_output - offrelative
   ftidx = np.zeros((len(idx),2),dtype=int)
   for ii,i in enumerate(idx):
     if i < offrelative:
       tidx,fidx = np.unravel_index(i,(len(tspred_global),nglobal))
       ftidx[ii] = (fidx,tspred_global[tidx])
     else:
-      t,fidx = np.unravel_index(i-offrelative,(dct_tau,nrelative))
+      t,fidx = np.unravel_index(i-offrelative,(dct_tau,nrelrep))
       # t = 1 corresponds to next frame
       ftidx[ii] = (fidx+nglobal,t+1)
   return ftidx.reshape(sz+(2,))
 
-def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
+def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,],nrelrep=None,d_output=None):
 
   ftidx = np.array(ftidx)
   sz = ftidx.shape
@@ -1115,6 +1213,11 @@ def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
   else:
     dct_tau = dct_m.shape[0]+1
   offrelative = len(tspred_global)*nglobal
+  if nrelrep is None:
+    if d_output is None:
+      nrelrep = nrelative
+    else:
+      nrelrep = d_output - offrelative
   
   for i,ft in enumerate(ftidx):
     fidx = ft[0]
@@ -1127,13 +1230,13 @@ def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,]):
       idx[i] = np.ravel_multi_index((tidx,fidx),(len(tspred_global),nglobal))
     else:
       # t = 1 corresponds to next frame
-      idx[i] = np.ravel_multi_index((t-1,fidx-nglobal),(dct_tau,nrelative))+offrelative
+      idx[i] = np.ravel_multi_index((t-1,fidx-nglobal),(dct_tau,nrelrep))+offrelative
   
   return idx.reshape(sz[:-1])
 
 def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
                      simplify_out=None,simplify_in=None,dct_m=None,tspred_global=[1,],
-                     npad=1):
+                     npad=1,compute_pose_vel=True,discreteidx=[],returnidx=False):
   
   res = {}
   
@@ -1150,13 +1253,26 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
     endidx = None
   else:
     endidx = -npad
-  sensory,wall_touch,otherflies_vision,otherflies_touch = \
-    compute_sensory_wrapper(X[:,:,:endidx,:],flynum,theta_main=globalpos[featthetaglobal,:endidx],
-                            returnall=True)
-  res['input'] = combine_inputs(relpose=relpose[:,:endidx],sensory=sensory).T
-  #res['input'] = input[:-1,:]
+  out = compute_sensory_wrapper(X[:,:,:endidx,:],flynum,theta_main=globalpos[featthetaglobal,:endidx],
+                                returnall=True,returnidx=returnidx)
+  sensory,wall_touch,otherflies_vision,otherflies_touch = out[:4]
+  if returnidx:
+    idxinfo = {}
+    idxinfo['input'] = out[4]
 
-  movement = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out,dct_m=dct_m,tspred_global=tspred_global)
+  res['input'] = combine_inputs(relpose=relpose[:,:endidx],sensory=sensory).T
+  if returnidx:
+    idxinfo['input'] = {k: [vv+relpose.shape[0] for vv in v] for k,v in idxinfo['input'].items()}
+    idxinfo['input']['relpose'] = relpose.shape[0]
+
+  out = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out,dct_m=dct_m,
+                         tspred_global=tspred_global,compute_pose_vel=compute_pose_vel,
+                         discreteidx=discreteidx,returnidx=returnidx)
+  if returnidx:
+    movement,idxinfo['labels'] = out
+  else:
+    movement = out
+  
   if simplify_out is not None:
     if simplify_out == 'global':
       movement = movement[featglobal,...]
@@ -1183,12 +1299,16 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
       if otherflies_touch is not None:
         res['otherflies_touch'] = otherflies_touch[:,:-1]
         res['next_otherflies_touch'] = otherflies_touch[:,-1]
-    
+            
   # debug_plot_compute_features(X,porigin,theta,Xother,Xnother)
     
   if outtype is not None:
     res = {key: val.astype(outtype) for key,val in res.items()}
-  return res
+    
+  if returnidx:
+    return res,idxinfo
+  else:
+    return res
 
 
 # def compute_features(X,id,flynum,scale_perfly,sensory_params,smush=True,outtype=None,
@@ -1622,7 +1742,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                input_noise_sigma=None,
                p_add_input_noise=0,
                dct_ms=None,
-               tspred_global=[1,],):
+               tspred_global=[1,],
+               compute_pose_vel=True):
 
     # copy dicts
     self.data = [example.copy() for example in data]
@@ -1644,7 +1765,17 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if maskflag is None:
       maskflag = (masktype is not None) or (pdropout_past>0.)
     self.maskflag = maskflag
-  
+
+    # features used for representing relative pose
+    if compute_pose_vel:
+      self.nrelrep = nrelative
+      self.featrelative = featrelative.copy()
+    else:
+      self.relfeat_to_cossin_map,self.nrelrep = relfeatidx_to_cossinidx(discreteidx)
+      self.featrelative = np.zeros(nglobal+self.nrelrep,dtype=bool)
+      self.featrelative[nglobal:] = True
+      
+    self.discretefeat = discreteidx
     
     self.dct_m = None
     self.idct_m = None
@@ -1656,15 +1787,18 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     tnext = np.min(self.tspred_global)
     self.nextframeidx_global = self.ravel_label_index([(f,tnext) for f in featglobal])
     if self.simplify_out is None:
-      self.nextframeidx_relative = self.ravel_label_index([(i,1) for i in np.nonzero(featrelative)[0]])
+      self.nextframeidx_relative = self.ravel_label_index([(i,1) for i in np.nonzero(self.featrelative)[0]])
     else:
       self.nextframeidx_relative = np.array([])
     self.nextframeidx = np.r_[self.nextframeidx_global,self.nextframeidx_relative]
     if self.dct_m is not None:
       dct_tau = self.dct_m.shape[0]
       # not sure if t+1 should be t+2 here -- didn't add 1 when updating code to make t = 1 mean next frame for relative features
-      self.idxdct_relative = np.stack([self.ravel_label_index([(i,t+1) for i in np.nonzero(featrelative)[0]]) for t in range(dct_tau)])
+      self.idxdct_relative = np.stack([self.ravel_label_index([(i,t+1) for i in np.nonzero(self.featrelative)[0]]) for t in range(dct_tau)])
     self.d_output_nextframe = len(self.nextframeidx)
+    
+    # whether to predict relative pose velocities (true) or position (false)
+    self.compute_pose_vel = compute_pose_vel
     
     if input_labels:
       assert(masktype is None)
@@ -1848,12 +1982,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   
   def ravel_label_index(self,ftidx):
     
-    idx = ravel_label_index(ftidx,dct_m=self.dct_m,tspred_global=self.tspred_global)
+    idx = ravel_label_index(ftidx,dct_m=self.dct_m,tspred_global=self.tspred_global,nrelrep=self.nrelrep)
     return idx
   
   def unravel_label_index(self,idx):
       
-    ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global)
+    ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global,nrelrep=self.nrelrep)
     return ftidx
     
   def discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,
@@ -1879,6 +2013,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if is_bin_epsilon_perfeat:
       bin_epsilon_feat = bin_epsilon
       bin_epsilon = []
+      
+    if not self.compute_pose_vel:
+      discrete_idx1 = []
+      for i in discrete_idx:
+        if not featrelative[i]:
+          discrete_idx1.append(i)
+          continue
+        reli = featidx_to_relfeatidx(i)
+        relrepi = self.relfeat_to_cossin_map[reli]
+        assert (type(relrepi) is int)
+        repi = relfeatidx_to_featidx(relrepi)
+        discrete_idx1.append(repi)
+      discrete_idx = np.array(discrete_idx1)
 
     # bin_epsilon is per feature
     ftidx = []
@@ -1911,7 +2058,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
 
     assert((bin_edges is None) == (bin_samples is None))
 
-    if bin_edges is None:
+     if bin_edges is None:
       if self.sig_labels is not None:
         bin_epsilon = np.array(bin_epsilon) / self.sig_labels[self.discrete_idx]
       self.discretize_bin_edges,self.discretize_bin_samples,self.discretize_bin_means,self.discretize_bin_medians = \
@@ -2251,10 +2398,11 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         example['input'][t,-1] indicates whether the frame is masked or not. If this 
         frame is masked, then example['input'][t,:d_input_labels] will be set to 0. 
         example['labels'] is a tensor of shape contextl x d_output_continuous
-        where example['labels'][t,:] is the continuous motion from frame t to t+1. 
+        where example['labels'][t,:] is the continuous motion from frame t to t+1 and/or
+        the pose at frame t+1
         example['labels_discrete'] is a tensor of shape contextl x d_output_discrete x 
         discretize_nbins, where example['labels_discrete'][t,i,:] is one-hot encoding of 
-        discrete motion feature i from frame t to t+1. 
+        discrete motion feature i from frame t to t+1 and/or pose at frame t+1. 
         example['init'] is a tensor of shape dglobal, corresponding to the global
         position in frame 0. 
         example['mask'] is a tensor of shape contextl indicating which frames are masked.
@@ -2262,14 +2410,17 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         For causal LMs:
         example['input'] is a tensor of shape (contextl-1) x (d_input_labels + dfeat).
         if input_labels == True, example['input'][t,:d_input_labels] is the motion from 
-        frame t to t+1 and example['input'][t,d_input_labels:] are the input features for 
-        frame t+1. example['labels'] is a tensor of shape contextl x d_output
-        where example['labels'][t,:] is the motion from frame t+1 to t+2.
+        frame t to t+1 and/or the pose at frame t+1,
+        example['input'][t,d_input_labels:] are the input features for 
+        frame t+1. 
+        example['labels'] is a tensor of shape contextl x d_output
+        where example['labels'][t,:] is the motion from frame t+1 to t+2 and/or the pose at
+        frame t+2.
         example['init'] is a tensor of shape dglobal, corresponding to the global
         position in frame 1. 
         example['labels_discrete'] is a tensor of shape contextl x d_output_discrete x 
         discretize_nbins, where example['labels_discrete'][t,i,:] is one-hot encoding of 
-        discrete motion feature i from frame t+1 to t+2. 
+        discrete motion feature i from frame t+1 to t+2 and/or pose at frame t+2.
 
         For all:
         example['scale'] are the scale features for this fly, used for converting from
@@ -2426,7 +2577,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     inputidx = get_sensory_feature_idx(self.simplify_in)
     i0 = inputidx['pose'][0]
     i1 = inputidx['pose'][1]
-    input[:,i0:i1] += eta[:,featrelative]
+    input[:,i0:i1] += eta[:,self.featrelative]
     # input labels
     if self.input_labels:
       input_labels += eta
@@ -2451,7 +2602,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         posein (ndarray, dposerel): Unnormalized relative pose features for the current 
         frame globalin (ndarray, dglobal): Global position for the current frame
         pred (ndarray, d_output): Z-scored (if applicable) predicted movement from 
-        current frame to the next frame
+        current frame to the next frame/pose in the next frame. 
         isnorm (bool,optional): Whether the input pred is normalized. Default: True.
 
     Returns:
@@ -2494,7 +2645,10 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         movement_relative = self.get_relative_movement_dct(movement,iszscored=False)
         movement_relative[0,...] = movement_relative_next
       # nsamples x ntspred_relative x nfeatrelative
-      posenext = posein+movement_relative
+      if self.compute_pose_vel:
+        posenext = posein+movement_relative
+      else:
+        posenext = movement_relative.copy()
       #globalnext = globalin+movement[featglobal]
       
     if pred.ndim == posein.ndim:
@@ -2573,6 +2727,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     return err
   
   def get_next_movements(self,movements=None,example=None,iszscored=False,use_dct=False,**kwargs):
+    """
+    get_next_movements(movements=None,example=None,iszscored=False,use_dct=False,**kwargs)
+    extracts the next frame movements/pose from the input, ignoring predictions for frames further
+    into the future. 
+    Inputs:
+      movements: ... x d_output ndarray of movements. Required if example is None. Default: None. 
+      example: dict holding training/test example. Required if movements is None. Default: None.
+      iszscored: whether movements are z-scored. Default: False.
+      use_dct: whether to use DCT to extract relative pose features. Default: False.
+      Extra args are fed into get_full_labels if movements is None
+    Outputs:
+      movements_next: ... x d_output ndarray of movements/pose for the next frame.
+    """
     if movements is None:
       movements = self.get_full_labels(example=example,**kwargs)
       iszscored = True
@@ -2639,8 +2806,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.mu_input is not None:
       input0 = unzscore(input0,self.mu_input,self.sig_input)
       movements = unzscore(movements,self.mu_labels,self.sig_labels)
-      
+
+    # get movements/pose for next frame prediction
     movements_next = self.get_next_movements(movements=movements,iszscored=False,use_dct=use_dct)
+      
+    if not self.compute_pose_vel:
+      movements_next = self.convert_cos_sin_to_angle(movements_next)
       
     input0 = split_features(input0,simplify=self.simplify_in)
     Xorigin0 = global0[...,:2]
@@ -2658,7 +2829,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if self.simplify_out == 'global':
       Xfeat[...,featrelative] = np.tile(input0['pose'],szrest[:-1]+(szrest[-1]+1,1))
     else:
-      Xfeatpose = np.cumsum(np.concatenate((input0['pose'][...,None,:],movements_next[...,featrelative]),axis=-2),axis=-2)
+      Xfeatpose = np.concatenate((input0['pose'][...,None,:],movements_next[...,featrelative]),axis=-2)
+      if self.compute_pose_vel:
+        Xfeatpose = np.cumsum(Xfeatpose,axis=-2)
       Xfeat[...,featrelative] = Xfeatpose
     
     return Xfeat
@@ -2840,7 +3013,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         attn_weights = [None,]*tpred
 
       if debug:
-        movement_true = compute_movement(X=Xkp[...,fliespred],scale=scales,simplify=self.simplify_out).transpose((1,0,2)).astype(dtype)
+        movement_true = compute_movement(X=Xkp[...,fliespred],scale=scales,simplify=self.simplify_out,
+                                         compute_pose_vel=self.compute_pose_vel).transpose((1,0,2)).astype(dtype)
       
       # outputs -- hide frames past burnin
       Xkp[:,:,burnin:,fliespred] = np.nan
@@ -2852,7 +3026,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       # compute one-frame movement for pred flies between first burnin frames 
       movement0 = compute_movement(relpose=relpose0,
                                   globalpos=globalpos0,
-                                  simplify=self.simplify_out)
+                                  simplify=self.simplify_out,
+                                  compute_pose_vel=self.compute_pose_vel)
       
       movement0 = movement0.transpose((1,0,2))
       if self.flatten:
@@ -3087,9 +3262,19 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def get_movement_names(self):
     outnames_global = self.get_movement_names_global()
     if self.simplify_out == 'global':
-      outnames = outnames_global
-    else:        
-      outnames = outnames_global + [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+      return outnames_global
+    featnamesrel = [mabe.posenames[x] for x in np.nonzero(featrelative)[0]]
+    if self.compute_pose_vel:
+      outnames_rel = featnamesrel
+    else:
+      outnames_rel = [None,]*self.nrelrep
+      for i,x in enumerate(self.relfeat_to_cossin_map):
+        if type(x) is list:
+          outnames_rel[x[0]] = featnamesrel[i] + '_cos'
+          outnames_rel[x[1]] = featnamesrel[i] + '_sin'
+        else:
+          outnames_rel[x] = featnamesrel[i]
+    outnames = outnames_global + outnames_rel
     return outnames
   
   def get_outnames(self):
@@ -3218,6 +3403,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def get_full_pred(self,pred,**kwargs):
     return self.get_full_labels(example=pred,ispred=True,**kwargs)
         
+  def convert_cos_sin_to_angle(self,movements_in):
+    # relpose_cos_sin = WORKING HERE
+    if self.compute_pose_vel:
+      return movements_in.copy()
+    relpose_cos_sin = movements_in[...,-self.nrelrep:]
+    relpose_angle = relpose_cos_sin_to_angle(relpose_cos_sin,discreteidx=self.discretefeat)
+    return np.concatenate((movements_in[...,:-self.nrelrep],relpose_angle),axis=-1)
+        
   def get_full_labels(self,example=None,idx=None,use_todiscretize=False,sample=False,use_stacked=False,ispred=False,nsamples=0):
     
     if self.discretize and sample:
@@ -3246,10 +3439,11 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       else:
         labels[...,self.discrete_idx] = labels_discrete_to_continuous(labels_discrete,
                                                                       torch.tensor(self.discretize_bin_edges))
-      return labels
     else:
-      return labels_continuous.clone()
-    
+      labels = labels_continuous.clone()
+        
+    return labels
+  
   def sample_full_labels(self,example=None,idx=None,nsamples=0):
     if example is None:
       example = self[idx]
@@ -4265,18 +4459,18 @@ def select_featidx_plot(train_dataset,ntspred_plot,ntsplot_global=None,ntsplot_r
   if ntsplot_relative == 0:
     tsplot_relative = None
   elif ntsplot_relative == 1:
-    tsplot_relative = np.ones((nrelative,1),dtype=int)
+    tsplot_relative = np.ones((train_dataset.nrelrep,1),dtype=int)
   elif ntsplot_relative == train_dataset.ntspred_relative:
-    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:]+1,(nrelative,1))
+    tsplot_relative = np.tile(np.arange(ntsplot_relative,dtype=int)[None,:]+1,(train_dataset.nrelrep,1))
   else:
     # choose 0 + a variety of different timepoints for each feature so that a variety of timepoints are selected
-    tsplot_relative = np.concatenate((np.zeros((nrelative,1),dtype=int),
-                                      np.round(np.linspace(1,train_dataset.ntspred_relative-1,(ntsplot_relative-1)*nrelative)).astype(int).reshape(-1,nrelative).T),axis=-1)
+    tsplot_relative = np.concatenate((np.zeros((train_dataset.nrelrep,1),dtype=int),
+                                      np.round(np.linspace(1,train_dataset.ntspred_relative-1,(ntsplot_relative-1)*nrelative)).astype(int).reshape(-1,train_dataset.nrelrep).T),axis=-1)
   ftidx = []
   for fi,f in enumerate(featglobal):
     for ti in range(ntsplot_global):
       ftidx.append((f,train_dataset.tspred_global[tidxplot_global[fi,ti]]))
-  for fi,f in enumerate(np.nonzero(featrelative)[0]):
+  for fi,f in enumerate(np.nonzero(train_dataset.featrelative)[0]):
     for ti in range(ntsplot_relative):
       ftidx.append((f,tsplot_relative[fi,ti]))
   featidxplot = train_dataset.ravel_label_index(ftidx)
@@ -5066,7 +5260,8 @@ def read_config(jsonfile):
         pass
       else:
         raise ValueError(f'Unknown embedding type {et}')
-        
+      # end switch over embedding types
+    # end if obs_embedding_types in config
   
   return config
     
@@ -5815,31 +6010,36 @@ def compute_npad(tspred_global,dct_m):
     npad = np.maximum(dct_m.shape[0],npad)
   return npad
 
-def sanity_check_tspred(data,config,npad,scale_perfly,dct_m,t0=510,flynum=0):
+def sanity_check_tspred(data,compute_feature_params,npad,scale_perfly,contextl=512,t0=510,flynum=0):
   # sanity check on computing features when predicting many frames into the future
   # compute inputs and outputs for frames t0:t0+contextl+npad+1 with tspred_global set by config
   # and inputs ant outputs for frames t0:t0+contextl+1 with just next frame prediction.
   # the inputs should match each other 
-  # the outputs for each of the config['tspred_global'] should match the next frame 
+  # the outputs for each of the compute_feature_params['tspred_global'] should match the next frame 
   # predictions for the corresponding frame
   
-  contextl = config['contextl']
+  epsilon = 1e-6
   id = data['ids'][t0,flynum]
 
+  # compute inputs and outputs with tspred_global = compute_feature_params['tspred_global']
   contextlpad = contextl+npad
   t1 = t0+contextlpad-1
   x = data['X'][...,t0:t1+1,:]
-  xcurr1 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,dct_m=dct_m,tspred_global=config['tspred_global'],npad=npad)
+  xcurr1,idxinfo1 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,returnidx=True,npad=npad,**compute_feature_params)
 
+  # compute inputs and outputs with tspred_global = [1,]
   contextlpad = contextl+1
   t1 = t0+contextlpad-1
   x = data['X'][...,t0:t1+1,:]
-  xcurr0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32)
+  xcurr0,idxinfo0 = compute_features(x,id,flynum,scale_perfly,outtype=np.float32,tspred_global=[1,],returnidx=True,
+                                     **{k: v for k,v in compute_feature_params.items() if k != 'tspred_global'})
 
-  assert np.all(xcurr0['input']==xcurr1['input'])
-  ftidx = [(f,1) for f in featglobal] + [(f,1) for f in np.nonzero(featrelative)[0]]
-  idx = ravel_label_index(ftidx,dct_m=dct_m,tspred_global=config['tspred_global'])
-  assert np.all(xcurr1['labels'][:,idx]==xcurr0['labels'])
+  assert np.all(np.abs(xcurr0['input']-xcurr1['input']) < epsilon)
+  for f in featglobal:
+    # find row of np.array idxinfo1['labels']['global_feat_tau'] that equals (f,1)
+    i1 = np.nonzero((idxinfo1['labels']['global_feat_tau'][:,0] == f) & (idxinfo1['labels']['global_feat_tau'][:,1] == 1))[0][0]
+    i0 = np.nonzero((idxinfo0['labels']['global_feat_tau'][:,0] == f) & (idxinfo0['labels']['global_feat_tau'][:,1] == 1))[0][0]
+    assert np.all(np.abs(xcurr1['labels'][:,i1]-xcurr0['labels'][:,i0])<epsilon)
 
   return
 
@@ -5927,21 +6127,26 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   # how much to pad outputs by -- depends on how many frames into the future we will predict
   npad = compute_npad(config['tspred_global'],dct_m)
   chunk_data_params = {'npad': npad}
+  
+  compute_feature_params = {
+     "simplify_out": config['simplify_out'],
+     "simplify_in": config['simplify_in'],
+     "dct_m": dct_m,
+     "tspred_global": config['tspred_global'],
+     "compute_pose_vel": config['compute_pose_vel'],
+     "discreteidx": config['discreteidx'],
+  }
 
   # function for computing features
   reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,scale_perfly,outtype=np.float32,
-                                                            simplify_out=config['simplify_out'],
-                                                            simplify_in=config['simplify_in'],
-                                                            dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
+                                                            **compute_feature_params,**kwargs)
 
   val_reparamfun = lambda x,id,flynum,**kwargs: compute_features(x,id,flynum,val_scale_perfly,
                                                                 outtype=np.float32,
-                                                                simplify_out=config['simplify_out'],
-                                                                simplify_in=config['simplify_in'],
-                                                                dct_m=dct_m,tspred_global=config['tspred_global'],**kwargs)
+                                                                **compute_feature_params,**kwargs)
   
   # sanity check on computing features when predicting many frames into the future
-  sanity_check_tspred(data,config,npad,scale_perfly,dct_m,t0=510,flynum=0)
+  sanity_check_tspred(data,compute_feature_params,npad,scale_perfly,contextl=config['contextl'],t0=510,flynum=0)
                                     
   if not doloadtmpsavefile:
     # chunk the data if we didn't load the pre-chunked cache file
@@ -5975,6 +6180,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     'dct_ms': (dct_m,idct_m),
     'tspred_global': config['tspred_global'],
     'discrete_tspred': config['discrete_tspred'],
+    'compute_pose_vel': config['compute_pose_vel'],
   }
   train_dataset_params = {
     'input_noise_sigma': config['input_noise_sigma'],
@@ -6276,7 +6482,12 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   randstate_np = np.random.get_state()
   randstate_torch = torch.random.get_rng_state()
 
-  nsamplesfuture = 100  
+  nsamplesfuture = 32  
+  
+  # reseed numpy random number generator with randstate_np
+  np.random.set_state(randstate_np)
+  # reseed torch random number generator with randstate_torch
+  torch.random.set_rng_state(randstate_torch)
   ani = animate_predict_open_loop(model,val_dataset,valdata,val_scale_perfly,config,fliespred,t0,tpred,debug=False,
                                   plotattnweights=False,plotfuture=train_dataset.ntspred_global>1,nsamplesfuture=nsamplesfuture)
 
