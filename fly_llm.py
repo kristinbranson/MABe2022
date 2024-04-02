@@ -1990,7 +1990,15 @@ class PoseLabels:
     self.metadata = None
     self.categories = None
     
-    self.set_indices(discrete_idx)
+    # which indices of pose (next frame, global + relative) are discrete
+    self.idx_nextdiscrete_to_next = np.array(discrete_idx)
+    
+    if self.discretize_params is not None:
+      self.discretize_nbins = self.discretize_params['bin_edges'].shape[-1]
+    else:
+      self.discretize_nbins = 0
+
+    # to do: include flattening
     
     if example_in is not None:
       self.set_raw_example(example_in)
@@ -2141,120 +2149,204 @@ class PoseLabels:
   def get_d_labels_input(self):
     return self.d_next_cossin
   
-  def set_indices(self,discrete_idx):
+  # which indices of pose (next frame, global + relative) are global
+  @property
+  def idx_nextglobal_to_next(self):
+    return np.array(featglobal)
+  @property
+  def d_next_global(self):
+    return len(self.idx_nextglobal_to_next)
 
-    self.discrete_idx_in = discrete_idx
+  # which indices of pose (next frame, global + relative) are global
+  @property
+  def idx_nextglobal_to_next(self):
+    return np.array(featglobal)
+  @property
+  def d_next_global(self):
+    return len(self.idx_nextglobal_to_next)
 
-    # which indices of pose (next frame, global + relative) are global
-    self.idx_nextglobal_to_next = np.array(featglobal)
-    self.d_next_global = len(self.idx_nextglobal_to_next)
-      
-    # which indices of pose (next frame, global + relative) are relative
+  # which indices of pose (next frame, global + relative) are relative
+  @property
+  def idx_nextrelative_to_next(self):
     if self.simplify_out is None:
-      self.idx_nextrelative_to_next = np.nonzero(featrelative)[0]
+      return np.nonzero(featrelative)[0]
     else:
-      self.idx_nextrelative_to_next = np.array([])
-    self.d_next_relative = len(self.idx_nextrelative_to_next)
+      return np.array([])
+  @property
+  def d_next_relative(self):
+    return len(self.idx_nextrelative_to_next)
 
-    self.d_next = self.d_next_global + self.d_next_relative
+  @property
+  def d_next(self):
+    return self.d_next_global + self.d_next_relative
 
-    # which indices are angles
-    self.is_angle_next = featangle
-    
-    # which indices of pose (next frame, global + relative) are discrete
-    self.idx_nextdiscrete_to_next = np.array(discrete_idx)
-    
-    # which indices of pose (next frame, global + relative) are continuous
+  # which indices are angles
+  @property
+  def is_angle_next(self):
+    return featangle
+  
+  # which indices of pose (next frame, global + relative) are continuous
+  @property
+  def idx_nextcontinuous_to_next(self):
     iscontinuous = np.ones(self.d_next,dtype=bool)
     iscontinuous[self.idx_nextdiscrete_to_next] = False
-    self.idx_nextcontinuous_to_next = np.nonzero(iscontinuous)[0]
-    
-    # we will use a cosine/sine representation for relative pose
-    # next_cossin is equivalent to next if velocity is used
-    self.idx_next_to_nextcossin = list(range(self.d_next))
-    self.idx_nextcossinglobal_to_nextcossin = np.arange(self.d_next_global)
-    self.idx_nextglobal_to_nextcossinglobal = np.arange(self.d_next_global)
-    self.d_next_cossin_global = len(self.idx_nextcossinglobal_to_nextcossin)
-    if self.is_velocity:
-      self.idx_nextrelative_to_nextcossinrelative = list(range(self.d_next_relative))
-      self.d_next_cossin_relative = self.d_next_relative
-    else:
-      self.idx_nextrelative_to_nextcossinrelative,self.d_next_cossin_relative = \
-        relfeatidx_to_cossinidx(discrete_idx)
-    self.d_next_cossin = self.d_next_cossin_relative + self.d_next_cossin_global
-    self.idx_nextcossinrelative_to_nextcossin = \
-      np.setdiff1d(np.arange(self.d_next_cossin),self.idx_nextcossinglobal_to_nextcossin)
-    self.idx_next_to_nextcossin = list(range(self.d_next))
-    for inextglobal in range(self.d_next_global):
-      inext = self.idx_nextglobal_to_next[inextglobal]
-      inextcossinglobal = self.idx_nextglobal_to_nextcossinglobal[inextglobal]
-      inextcossin = self.idx_nextcossinglobal_to_nextcossin[inextcossinglobal]
-      self.idx_next_to_nextcossin[inext] = inextcossin
-    for inextrel in range(self.d_next_relative):
-      inext = self.idx_nextrelative_to_next[inextrel]
-      inextcossinrelative = self.idx_nextrelative_to_nextcossinrelative[inextrel]
-      # if type(inextcossinrelative) is list:
-      #   inextcossin = [self.idx_nextcossinrelative_to_nextcossin[x] for x in inextcossinrelative]
-      # else:
-      inextcossin = self.idx_nextcossinrelative_to_nextcossin[inextcossinrelative]
-      self.idx_next_to_nextcossin[inext] = inextcossin
+    return np.nonzero(iscontinuous)[0]
 
-    # which indices of nextcossin are discrete/continuous
-    self.idx_nextcossindiscrete_to_nextcossin = []
-    for inext in self.idx_nextdiscrete_to_next:
-      inextcossin = self.idx_next_to_nextcossin[inext]
-      self.idx_nextcossindiscrete_to_nextcossin.append(inextcossin)
-    self.idx_nextcossincontinuous_to_nextcossin = []
-    for inext in self.idx_nextcontinuous_to_next:
-      inextcossin = self.idx_next_to_nextcossin[inext]
-      if type(inextcossin) is np.ndarray:
-        self.idx_nextcossincontinuous_to_nextcossin.extend(inextcossin.tolist())
-      else:
-        self.idx_nextcossincontinuous_to_nextcossin.append(inextcossin)
-        
-    # which multi correspond to nextcossin
-    self.d_multi_relative = self.d_next_cossin_relative*self.ntspred_relative
-    self.d_multi_global = self.d_next_cossin_global*len(self.tspred_global)
-    self.d_multi = self.d_multi_global + self.d_multi_relative
-    assert (np.min(self.tspred_global) == 1)
-    self.idx_nextcossin_to_multi = self.feattpred_to_multi([(f,1) for f in range(self.d_next_cossin)])
-
-    # look up table from multi index to (feat,tpred)
-    # d_multi x 2 array
-    self.idx_multi_to_multifeattpred = self.multi_to_feattpred(np.arange(self.d_multi))
-
-    # look up table from (feat,tpred) to multi index
-    # dict
-    self.idx_multifeattpred_to_multi = {}
-    for idx,ft in enumerate(self.idx_multi_to_multifeattpred):
-      self.idx_multifeattpred_to_multi[tuple(ft.tolist())] = idx
-
-    # which indices of multi correspond to multi_relative and multi_global
-    isrelative = np.array([ft[0] in self.idx_nextcossinrelative_to_nextcossin for ft in self.idx_multi_to_multifeattpred])
-    self.idx_multirelative_to_multi = np.nonzero(isrelative)[0]
-    self.idx_multiglobal_to_multi = np.nonzero(isrelative==False)[0]
-
-    # which indices of multi correspond to multi_discrete, multi_continuous
-    isdiscrete = (np.isin(self.idx_multi_to_multifeattpred[:,0],self.idx_nextcossindiscrete_to_nextcossin) & \
-      (self.idx_multi_to_multifeattpred[:,1] == 1)) | \
-      (np.isin(self.idx_multi_to_multifeattpred[:,0],self.idx_nextcossinglobal_to_nextcossin) & \
-        np.isin(self.idx_multi_to_multifeattpred[:,1],self.discrete_tspred))    
-    self.idx_multidiscrete_to_multi = np.nonzero(isdiscrete)[0]
-    self.idx_multicontinuous_to_multi = np.nonzero(isdiscrete==False)[0]
-    self.d_multidiscrete = len(self.idx_multidiscrete_to_multi)
-    self.d_multicontinuous = len(self.idx_multicontinuous_to_multi)
-    
-    if self.discretize_params is not None:
-      self.discretize_nbins = self.discretize_params['bin_edges'].shape[-1]
-    else:
-      self.discretize_nbins = 0
-          
-    # to do: include dct
-
-    # to do: include flattening
-
-    return
+  # we will use a cosine/sine representation for relative pose
+  # next_cossin is equivalent to next if velocity is used
+  @property
+  def idx_next_to_nextcossin(self):
+    return np.arange(self.d_next)
   
+  @property
+  def idx_nextcossinglobal_to_nextcossin(self):
+    return np.arange(self.d_next_global)
+  @property
+  def d_next_cossin_global(self):
+    return len(self.idx_nextcossinglobal_to_nextcossin)
+
+  @property
+  def idx_nextglobal_to_nextcossinglobal(self):
+    return np.arange(self.d_next_global)
+
+  def get_idx_nextrelative_to_nextcossinrelative(self):
+    if self.is_velocity:
+      return np.arange(self.d_next_relative),self.d_next_relative
+    else:
+      return relfeatidx_to_cossinidx(self.idx_nextdiscrete_to_next)
+
+  @property
+  def idx_nextrelative_to_nextcossinrelative(self):
+    idx,_ = self.get_idx_nextrelative_to_nextcossinrelative()
+    return idx
+  @property
+  def d_next_cossin_relative(self):
+    _,d = self.get_idx_nextrelative_to_nextcossinrelative()
+    return d
+
+  @property
+  def d_next_cossin(self):
+    return self.d_next_cossin_relative + self.d_next_cossin_global
+
+  @property
+  def idx_nextcossinrelative_to_nextcossin(self):
+    return np.setdiff1d(np.arange(self.d_next_cossin),self.idx_nextcossinglobal_to_nextcossin)
+
+  @property
+  def idx_next_to_nextcossin(self):
+    idx = list(range(self.d_next))
+    idx_nextglobal_to_next = self.idx_nextglobal_to_next
+    idx_nextglobal_to_nextcossinglobal = self.idx_nextglobal_to_nextcossinglobal
+    idx_nextcossinglobal_to_nextcossin = self.idx_nextcossinglobal_to_nextcossin
+    idx_nextrelative_to_next = self.idx_nextrelative_to_next
+    idx_nextrelative_to_nextcossinrelative = self.idx_nextrelative_to_nextcossinrelative
+    idx_nextcossinrelative_to_nextcossin = self.idx_nextcossinrelative_to_nextcossin
+    
+    for inextglobal in range(self.d_next_global):
+      inext = idx_nextglobal_to_next[inextglobal]
+      inextcossinglobal = idx_nextglobal_to_nextcossinglobal[inextglobal]
+      inextcossin = idx_nextcossinglobal_to_nextcossin[inextcossinglobal]
+      idx[inext] = inextcossin
+      
+    for inextrel in range(self.d_next_relative):
+      inext = idx_nextrelative_to_next[inextrel]
+      inextcossinrelative = idx_nextrelative_to_nextcossinrelative[inextrel]
+      inextcossin = idx_nextcossinrelative_to_nextcossin[inextcossinrelative]
+      idx[inext] = inextcossin
+    return idx
+
+  # which indices of nextcossin are discrete/continuous
+  @property
+  def idx_nextcossindiscrete_to_nextcossin(self):
+    idx = []
+    idx_next_to_nextcossin = self.idx_next_to_nextcossin
+    for inext in self.idx_nextdiscrete_to_next:
+      inextcossin = idx_next_to_nextcossin[inext]
+      idx.append(inextcossin)
+    return idx
+  @property
+  def idx_nextcossincontinuous_to_nextcossin(self):
+    idx= []
+    idx_next_to_nextcossin = self.idx_next_to_nextcossin
+    for inext in self.idx_nextcontinuous_to_next:
+      inextcossin = idx_next_to_nextcossin[inext]
+      if type(inextcossin) is np.ndarray:
+        idx.extend(inextcossin.tolist())
+      else:
+        idx.append(inextcossin)
+    return idx
+
+  @property
+  def d_multi_relative(self):
+    return self.d_next_cossin_relative*self.ntspred_relative
+
+  @property
+  def d_multi_global(self):
+    return self.d_next_cossin_global*len(self.tspred_global)
+
+  @property
+  def d_multi(self):
+    return self.d_multi_global + self.d_multi_relative
+
+  # which multi correspond to nextcossin
+  @property
+  def idx_nextcossin_to_multi(self):
+    assert (np.min(self.tspred_global) == 1)
+    return self.feattpred_to_multi([(f,1) for f in range(self.d_next_cossin)])
+
+  # look up table from multi index to (feat,tpred)
+  # d_multi x 2 array
+  @property
+  def idx_multi_to_multifeattpred(self):
+    return self.multi_to_feattpred(np.arange(self.d_multi))
+  
+  # look up table from (feat,tpred) to multi index
+  # dict
+  @property
+  def idx_multifeattpred_to_multi(self):
+    idx_multifeattpred_to_multi = {}
+    for idx,ft in enumerate(self.idx_multi_to_multifeattpred):
+      idx_multifeattpred_to_multi[tuple(ft.tolist())] = idx
+    return idx_multifeattpred_to_multi
+
+  # which indices of multi correspond to multi_relative and multi_global
+  def get_multi_isrelative(self):
+    idx_nextcossinrelative_to_nextcossin = self.idx_nextcossinrelative_to_nextcossin
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
+    isrelative = np.array([ft[0] in idx_nextcossinrelative_to_nextcossin for ft in idx_multi_to_multifeattpred])
+    return isrelative
+  @property
+  def idx_multirelative_to_multi(self):
+    isrelative = self.get_multi_isrelative()
+    return np.nonzero(isrelative)[0]
+  @property
+  def idx_multiglobal_to_multi(self):
+    isrelative = self.get_multi_isrelative()
+    return np.nonzero(isrelative==False)[0]
+
+  # which indices of multi correspond to multi_discrete, multi_continuous
+  def get_multi_isdiscrete(self):
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
+    isdiscrete = (np.isin(idx_multi_to_multifeattpred[:,0],self.idx_nextcossindiscrete_to_nextcossin) & \
+      (idx_multi_to_multifeattpred[:,1] == 1)) | \
+      (np.isin(idx_multi_to_multifeattpred[:,0],self.idx_nextcossinglobal_to_nextcossin) & \
+        np.isin(idx_multi_to_multifeattpred[:,1],self.discrete_tspred))
+    return isdiscrete
+  @property
+  def idx_multidiscrete_to_multi(self):
+    isdiscrete = self.get_multi_isdiscrete()
+    return np.nonzero(isdiscrete)[0]  
+  @property
+  def idx_multicontinuous_to_multi(self):
+    isdiscrete = self.get_multi_isdiscrete()
+    return np.nonzero(isdiscrete==False)[0]
+  @property
+  def d_multidiscrete(self):
+    return len(self.idx_multidiscrete_to_multi)
+  @property
+  def d_multicontinuous(self):
+    return len(self.idx_multicontinuous_to_multi)
+
   def feattpred_to_multi(self,ftidx):
     idx = ravel_label_index(ftidx,ntspred_relative=self.ntspred_relative,
                             tspred_global=self.tspred_global,nrelrep=self.d_next_cossin_relative)
@@ -2290,8 +2382,9 @@ class PoseLabels:
     return labels_out
   
   def get_raw_labels_tensor_copy(self,**kwargs):
-    labels_out = self.get_raw_labels(**kwargs)
-    for k,v in labels_out.items():
+    raw_labels = self.get_raw_labels(**kwargs)
+    labels_out = {}
+    for k,v in raw_labels.items():
       if type(v) is np.ndarray:
         labels_out[k] = torch.tensor(v)
     return labels_out
@@ -2468,20 +2561,23 @@ class PoseLabels:
 
     multi_idct = np.zeros(multi.shape,dtype=multi.dtype)
     idct_m = self.idct_m.T
+    idx_nextcossinrelative_to_nextcossin = self.idx_nextcossinrelative_to_nextcossin
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
     for irel in range(self.d_next_cossin_relative):
-      i = self.idx_nextcossinrelative_to_nextcossin[irel]
-      idxfeat = np.nonzero((self.idx_multi_to_multifeattpred[:,0] == i) & \
-        (self.idx_multi_to_multifeattpred[:,1] > 1))[0]
+      i = idx_nextcossinrelative_to_nextcossin[irel]
+      idxfeat = np.nonzero((idx_multi_to_multifeattpred[:,0] == i) & \
+        (idx_multi_to_multifeattpred[:,1] > 1))[0]
       # features are in order
-      assert np.all(self.idx_multi_to_multifeattpred[idxfeat,1] == np.arange(2,self.ntspred_relative+1))
+      assert np.all(idx_multi_to_multifeattpred[idxfeat,1] == np.arange(2,self.ntspred_relative+1))
       multi_dct = multi[...,idxfeat].reshape((-1,self.ntspred_relative-1))
       multi_idct[...,idxfeat] = (multi_dct @ idct_m).reshape((multi.shape[:-1])+(self.ntspred_relative-1,))
     return multi_idct
   
   def multi_to_futureglobal(self,multi,tspred=None):
-    idx = np.isin(self.idx_multi_to_multifeattpred[:,0], self.idx_nextcossinglobal_to_nextcossin)
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
+    idx = np.isin(idx_multi_to_multifeattpred[:,0], self.idx_nextcossinglobal_to_nextcossin)
     if tspred is not None:
-      idx = idx & (np.isin(self.idx_multi_to_multifeattpred[:,1],tspred))
+      idx = idx & (np.isin(idx_multi_to_multifeattpred[:,1],tspred))
     return multi[...,idx]
 
   def get_future_global(self,tspred=None,**kwargs):
@@ -2536,8 +2632,9 @@ class PoseLabels:
     elif not hasattr(tspred,'__len__'):
       tspred = [tspred,]
     ntspred = len(tspred)
-    idxfeat = np.nonzero(np.isin(self.idx_multi_to_multifeattpred[:,0],self.idx_nextcossinrelative_to_nextcossin) & \
-        np.isin(self.idx_multi_to_multifeattpred[:,1], tspred))[0]
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
+    idxfeat = np.nonzero(np.isin(idx_multi_to_multifeattpred[:,0],self.idx_nextcossinrelative_to_nextcossin) & \
+        np.isin(idx_multi_to_multifeattpred[:,1], tspred))[0]
     return multi_idct[...,idxfeat].reshape((multi_idct.shape[:-1])+(ntspred,self.d_next_cossin_relative))
 
   def get_future_cossin_relative(self,tspred=None,**kwargs):
@@ -2550,6 +2647,13 @@ class PoseLabels:
     futurerelcs = self.get_future_cossin_relative(tspred=tspred,**kwargs)
     futurerel = np.moveaxis(self.nextcossinrelative_to_nextrelative(np.moveaxis(futurerelcs,-2,0)),0,-2)
     return futurerel
+  
+  def get_future_relative_pose(self,tspred=None,**kwargs):
+    futurerel = self.get_future_relative(tspred=tspred,**kwargs)
+    if not self.is_velocity:
+      return futurerel
+    relpose0 = self.get_next_pose_relative(**kwargs)
+    return futurerel + relpose0[...,:-1,None,:]
         
   def multi_to_nextcossin(self,multi):
     next_cossin = multi[...,self.idx_nextcossin_to_multi]
@@ -2575,8 +2679,9 @@ class PoseLabels:
     n = int(np.prod(szrest))
     next_cossin_relative = next_cossin_relative.reshape((n,T,self.d_next_cossin_relative))
     next_relative = np.zeros((n,T,self.d_next_relative),dtype=next_cossin_relative.dtype)
+    idx_nextrelative_to_nextcossinrelative = self.idx_nextrelative_to_nextcossinrelative
     for inext in range(self.d_next_relative):
-      inextcossin = self.idx_nextrelative_to_nextcossinrelative[inext]
+      inextcossin = idx_nextrelative_to_nextcossinrelative[inext]
       if type(inextcossin) is np.ndarray:
         next_relative[...,inext] = np.arctan2(next_cossin_relative[...,inextcossin[1]],
                                               next_cossin_relative[...,inextcossin[0]])
@@ -2597,8 +2702,9 @@ class PoseLabels:
     szrest = next.shape[:-1]
     n = np.prod(szrest)
     next_cossin = np.zeros((n,self.d_next_cossin),dtype=next.dtype)
+    idx_next_to_nextcossin = self.idx_next_to_nextcossin
     for inext in range(self.d_next):
-      inextcossin = self.idx_next_to_nextcossin[inext]
+      inextcossin = idx_next_to_nextcossin[inext]
       if type(inextcossin) is np.ndarray:
         next_cossin[...,inextcossin[0]] = np.cos(next[...,inext])
         next_cossin[...,inextcossin[1]] = np.sin(next[...,inext])
@@ -2686,7 +2792,8 @@ class PoseLabels:
     if self.is_velocity:
       next = np.diff(nextpose,axis=1)
     else:
-      next[...,self.idx_nextglobal_to_next] = np.diff(nextpose[...,self.idx_nextglobal_to_next],axis=1)
+      idx_nextglobal_to_next = self.idx_nextglobal_to_next
+      next[...,idx_nextglobal_to_next] = np.diff(nextpose[...,idx_nextglobal_to_next],axis=1)
     next[...,self.is_angle_next] = mabe.modrange(next[...,self.is_angle_next],-np.pi,np.pi)
     next = next.reshape(szrest+(T,self.d_next))
     
@@ -2700,14 +2807,15 @@ class PoseLabels:
     szrest = next.shape[:-2]
     n = int(np.prod(szrest))
     T = next.shape[-2]
+    idx_nextrelative_to_next = self.idx_nextrelative_to_next
     velrel = np.zeros((n,T+1,self.d_next_relative),dtype=next.dtype)
-    velrel[:,0,:] = self.init_pose[self.idx_nextrelative_to_next]
-    velrel[:,1:,:] = next[...,self.idx_nextrelative_to_next].reshape((n,T,self.d_next_relative))
+    velrel[:,0,:] = self.init_pose[idx_nextrelative_to_next]
+    velrel[:,1:,:] = next[...,idx_nextrelative_to_next].reshape((n,T,self.d_next_relative))
     velrel[:,:-1,:] = np.diff(velrel,axis=1)
     velrel = velrel[:,:-1,:]
     velrel = velrel.reshape(szrest+(T,self.d_next_relative))
     vel = next.copy()
-    vel[...,self.idx_nextrelative_to_next] = velrel
+    vel[...,idx_nextrelative_to_next] = velrel
     
     return vel
 
@@ -7503,7 +7611,11 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   #config['compute_pose_vel'] = True
 
   # debug dct
-  config['dct_tau'] = 16
+  #config['dct_tau'] = 16
+  
+  # debug no multi time-scale predictions
+  #config['tspred_global'] = [1,]
+  #config['discrete_tspred'] = [1,]
 
   if os.path.exists(tmpsavefile):
     with open(tmpsavefile,'rb') as f:
@@ -7693,7 +7805,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   
   # check relative future predictions
   if flyexample.labels.ntspred_relative > 1:
-    examplefuture = flyexample.labels.get_future_relative(zscored=False)
+    examplefuture = flyexample.labels.get_future_relative_pose(zscored=False,use_todiscretize=True)
     for tpred in range(1,flyexample.labels.ntspred_relative):
       t = flyexample.metadata['t0']+tpred
       datakpfuture = data['X'][:,:,t:t+contextl,flynum]
