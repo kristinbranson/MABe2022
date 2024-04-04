@@ -1809,7 +1809,13 @@ class ObservationInputs:
   
   def set_example(self,example_in):
     self.input = example_in['input']
-    self.init = example_in['init']
+    if 'init_all' in example_in:
+      self.init = example_in['init_all']
+    else:
+      self.init = example_in['init']
+    if 'input_init' in example_in:
+      self.input = np.concatenate((example_in['input_init'],self.input),axis=-2)
+      
     self.update_sizes()
     if 'metadata' in example_in:
       self.metadata = example_in['metadata']
@@ -1823,11 +1829,14 @@ class ObservationInputs:
   def is_zscored(self):
     return self.zscore_params is not None
   
-  def get_raw_inputs(self):
-    return self.input
+  def get_raw_inputs(self,makecopy=True):
+    if makecopy:
+      return self.input.copy()
+    else:
+      return self.input
             
-  def get_inputs(self,zscored=False):
-    input = self.get_raw_inputs()
+  def get_inputs(self,zscored=False,**kwargs):
+    input = self.get_raw_inputs(**kwargs)
 
     # todo: deal with flattening
     if self.is_zscored() and zscored == False:
@@ -1835,15 +1844,16 @@ class ObservationInputs:
     
     return input
     
-  def get_init_next(self):
+  def get_init_next(self,**kwargs):
 
     tau = self.init.shape[-1]
-    relative0 = self.get_inputs_type('pose',zscored=False)[...,:tau,:]
+    szrest = self.init.shape[:-2]
+    relative0 = self.get_inputs_type('pose',zscored=False,**kwargs)[...,:tau,:]
     global0 = self.init
 
-    next0 = np.zeros((nfeatures,tau),dtype=relative0.dtype)
-    next0[featglobal,:] = global0
-    next0[featrelative,:] = relative0.T
+    next0 = np.zeros(szrest+(nfeatures,tau),dtype=relative0.dtype)
+    next0[...,featglobal,:] = global0
+    next0[...,featrelative,:] = np.moveaxis(relative0,-1,-2)
       
     return next0
   
@@ -1920,18 +1930,21 @@ class ObservationInputs:
 
     train_inputs = self.get_raw_inputs()
     
+    # makes a copy
     if do_add_noise:
       train_inputs,input_labels,eta = self.add_noise(train_inputs,input_labels,labels)
     else:
       eta = None
 
+    # makes a copy
     train_inputs = torch.tensor(train_inputs)
-
+    train_inputs_init = None
     
     if not self.flatten_obs:
       if input_labels is not None:
-        train_inputs = torch.cat((torch.tensor(input_labels[:-self.starttoff,:]),
-                                  train_inputs[self.starttoff:,:]),dim=-1)
+        train_inputs_init = train_inputs[...,:self.starttoff,:]
+        train_inputs = torch.cat((torch.tensor(input_labels[...,:-self.starttoff,:]),
+                                  train_inputs[...,self.starttoff:,:]),dim=-1)
     else:
       ntypes = len(self.flatten_obs_idx)
       flatinput = torch.zeros(self.pre_sz+(self.ntimepoints,ntypes,self.flatten_max_dinput),dtype=train_inputs.dtype)
@@ -1940,7 +1953,7 @@ class ObservationInputs:
 
       train_inputs = flatinput
 
-    return train_inputs,eta
+    return {'input': train_inputs,'eta': eta, 'input_init': train_inputs_init}
 
   
 class PoseLabels:
@@ -2026,25 +2039,50 @@ class PoseLabels:
       return
     
     if 'labels' in example_in:
-      self.labels_raw['continuous'] = np.atleast_2d(example_in['labels'])
+      labels_in = example_in['labels']
       self.label_keys['continuous'] = 'labels'
     elif 'continuous' in example_in:
-      self.labels_raw['continuous'] = np.atleast_2d(example_in['continuous'])
+      labels_in = example_in['continuous']
       self.label_keys['continuous'] = 'continuous'
     else:
       raise ValueError('labels_in must contain labels or continuous')
+    if 'labels_init' in example_in and example_in['labels_init'] is not None:
+      labels_in = np.concatenate((example_in['labels_init'],labels_in),axis=-2)
+    elif 'continuous_init' in example_in and example_in['continuous_init'] is not None:
+      labels_in = np.concatenate((example_in['continuous_init'],labels_in),axis=-2)
+    self.labels_raw['continuous'] = np.atleast_2d(labels_in)
+
     if 'labels_discrete' in example_in:
-      self.labels_raw['discrete'] = np.atleast_3d(example_in['labels_discrete'])
+      labels_discrete = example_in['labels_discrete']      
       self.label_keys['discrete'] = 'labels_discrete'
     elif 'discrete' in example_in:
-      self.labels_raw['discrete'] = np.atleast_3d(example_in['discrete'])
+      labels_discrete = example_in['discrete']
       self.label_keys['discrete'] = 'discrete'
+    else:
+      labels_discrete = None
+    if labels_discrete is not None:
+      labels_discrete = np.atleast_3d(labels_discrete)
+      if 'labels_discrete_init' in example_in and example_in['labels_discrete_init'] is not None:
+        labels_discrete = np.concatenate((example_in['labels_discrete_init'],labels_discrete),axis=-3)
+      elif 'discrete_init' in example_in and example_in['discrete_init'] is not None:
+        labels_discrete = np.concatenate((example_in['discrete_init'],labels_discrete),axis=-3)
+      self.labels_raw['discrete'] = labels_discrete
+
     if 'labels_todiscretize' in example_in:
-      self.labels_raw['todiscretize'] = np.atleast_2d(example_in['labels_todiscretize'])
+      labels_todiscretize = example_in['labels_todiscretize']
       self.label_keys['todiscretize'] = 'labels_todiscretize'
     elif 'todiscretize' in example_in:
-      self.labels_raw['todiscretize'] = np.atleast_2d(example_in['todiscretize'])
+      labels_todiscretize = example_in['todiscretize']
       self.label_keys['todiscretize'] = 'todiscretize'
+    else:
+      labels_todiscretize = None
+    if labels_todiscretize is not None:
+      labels_todiscretize = np.atleast_2d(labels_todiscretize)
+      if 'labels_todiscretize_init' in example_in and example_in['labels_todiscretize_init'] is not None:
+        labels_todiscretize = np.concatenate((example_in['labels_todiscretize_init'],labels_todiscretize),axis=-2)
+      elif 'todiscretize_init' in example_in and example_in['todiscretize_init'] is not None:
+        labels_todiscretize = np.concatenate((example_in['todiscretize_init'],labels_todiscretize),axis=-2)
+      self.labels_raw['todiscretize'] = labels_todiscretize
     # if 'labels_stacked' in example_in:
     #   self.labels_raw['stacked'] = example_in['labels_stacked']
     #   self.label_keys['stacked'] = 'labels_stacked'
@@ -2054,6 +2092,7 @@ class PoseLabels:
     self.scale = example_in['scale']
     if 'metadata' in example_in:
       self.metadata = example_in['metadata']
+      
     if 'categories' in example_in:
       self.categories = example_in['categories']
     if self.is_continuous():
@@ -2131,17 +2170,32 @@ class PoseLabels:
     else:
       return self.init_pose[:,starttoff]
     
-  def get_init_global(self,starttoff=None):
-    init_global = self.init_pose[self.idx_nextglobal_to_next,:]
-    if starttoff is not None:
-      init_global = init_global[:,starttoff]
-    return init_global
+  def get_init_global(self,starttoff=None,makecopy=True):
+    init_global0 = self.init_pose[...,self.idx_nextglobal_to_next,:]
+    if starttoff is None:
+      init_global = init_global0
+      if makecopy:
+        init_global = init_global.copy()
+      else:
+        init_global = init_global0
+      return init_global
+    init_global = init_global0[...,starttoff]
+    if makecopy:
+      init_global = init_global.copy()
+      init_global0 = init_global0.copy()
+    return init_global,init_global0
     
-  def get_scale(self):
-    return self.scale
+  def get_scale(self,makecopy=True):
+    if makecopy:
+      return self.scale.copy()
+    else:
+      return self.scale
   
-  def get_categories(self):
-    return self.categories
+  def get_categories(self,makecopy=True):
+    if makecopy:
+      return self.categories.copy()
+    else:
+      return self.categories
   
   def get_metadata(self):
     return self.metadata
@@ -2366,23 +2420,28 @@ class PoseLabels:
   def is_continuous(self):
     return 'continuous' in self.labels_raw
   
-  def get_raw_labels(self,format='standard',ts=None):
-    if format == 'standard' and ts is None:
-      return self.labels_raw
-    # format = 'input'
+  def get_raw_labels(self,format='standard',ts=None,makecopy=True):
     labels_out = {}
     for kin in self.labels_raw.keys():
       if format == 'standard':
         kout = kin
       else:
         kout = self.label_keys[kin]
-      labels_out[kout] = self.labels_raw[kin]
+      if makecopy:
+        labels_out[kout] = self.labels_raw[kin].copy()
+      else:
+        labels_out[kout] = self.labels_raw[kin]
       if ts is not None:
         labels_out[kout] = labels_out[kout][...,ts,:]
+        
+    labels_out['init'] = self.get_init_global(makecopy=makecopy)
+    labels_out['scale'] = self.get_scale(makecopy=makecopy)
+    labels_out['categories'] = self.get_categories(makecopy=makecopy)
+        
     return labels_out
   
   def get_raw_labels_tensor_copy(self,**kwargs):
-    raw_labels = self.get_raw_labels(**kwargs)
+    raw_labels = self.get_raw_labels(makecopy=False,**kwargs)
     labels_out = {}
     for k,v in raw_labels.items():
       if type(v) is np.ndarray:
@@ -2397,6 +2456,7 @@ class PoseLabels:
   
   def get_train_labels(self,added_noise=None):
 
+    # makes a copy
     raw_labels = self.get_raw_labels_tensor_copy()
     
     # to do: add noise
@@ -2407,9 +2467,22 @@ class PoseLabels:
     if self.is_discretized():
       train_labels['discrete'] = raw_labels['discrete'][...,self.starttoff:,:,:]
       train_labels['todiscretize'] = raw_labels['todiscretize'][...,self.starttoff:,:]
-    
+      train_labels['discrete_init'] = raw_labels['discrete'][...,:self.starttoff,:,:]
+      train_labels['todiscretize_init'] = raw_labels['todiscretize'][...,:self.starttoff,:]
+    else:
+      train_labels['discrete'] = None
+      train_labels['todiscretize'] = None
+      train_labels['discrete_init'] = None
+      train_labels['todiscretize_init'] = None
+
+    train_labels['init_all'] = raw_labels['init']
+    train_labels['init'] = raw_labels['init'][...,self.starttoff]
+    train_labels['scale'] = raw_labels['scale']
+    train_labels['categories'] = raw_labels['categories']
+        
     if not self.flatten_labels:
       train_labels['continuous'] = raw_labels['continuous'][...,self.starttoff:,:]
+      train_labels['continuous_init'] = raw_labels['continuous'][...,:self.starttoff,:]
     else:
       contextl = self.ntimepoints
       dtype = raw_labels['continuous'].dtype
@@ -2434,6 +2507,7 @@ class PoseLabels:
         #   newmask[:,-1] = mask.clone()
       train_labels['continuous'] = flatlabels
       train_labels['continuous_stacked'] = raw_labels['continuous']
+      train_labels['continuous_init'] = None
       
     return train_labels
   
@@ -2489,7 +2563,7 @@ class PoseLabels:
 
   def get_multi(self,use_todiscretize=False,nsamples=0,zscored=False,collapse_samples=False,ts=None):
     
-    labels_raw = self.get_raw_labels(format='standard',ts=ts)
+    labels_raw = self.get_raw_labels(format='standard',ts=ts,makecopy=False)
 
     # to do: add flattening support here
 
@@ -2537,7 +2611,7 @@ class PoseLabels:
     if self.is_zscored() and (zscored == False):
       multi = self.zscore_multi(multi)
       
-    labels_raw = self.get_raw_labels(format='standard')
+    labels_raw = self.get_raw_labels(format='standard',makecopy=False)
     
     if ts is None:
       ts = slice(None)
@@ -2750,7 +2824,7 @@ class PoseLabels:
     n = relrep.shape[0]
     T = relrep.shape[1]
 
-    relpose0 = self.init_pose[self.idx_nextrelative_to_next,starttoff]
+    relpose0 = self.init_pose[...,self.idx_nextrelative_to_next,starttoff]
     
     if self.is_velocity:
       relpose = np.cumsum(np.concatenate((relpose0.reshape((n,1,-1)),relrep),axis=-2),axis=-2)
@@ -2851,14 +2925,33 @@ class PoseLabels:
 
   def nextpose_to_nextkeypoints(self,pose):
     
+    if self.scale.ndim == 1:
+      nflies = 1
+    else:
+      nflies = int(np.prod(self.scale.shape[:-1]))
+    
     # input to mabe.feat2kp is expected to be an np.ndarray with shape nfeatures x T x nflies
-    szrest = pose.shape[:-1]
-    n = int(np.prod(szrest))
-    # todo: make a version of this that works with torch tensors and without transposing
-    pose = pose.reshape((n,self.d_next)).T
-    kp = mabe.feat2kp(pose,self.scale)
-    kp = kp[...,0].transpose((2,0,1))
-    kp = kp.reshape(szrest+kp.shape[-2:])
+    if nflies == 1:
+      szrest = pose.shape[:-1]
+      n = int(np.prod(szrest))
+      pose = pose.reshape((n,self.d_next)).T
+      scale = self.scale
+    else:
+      szrest = pose.shape[:-2]
+      T = pose.shape[-2]
+      n = int(np.prod(szrest))
+      assert n == nflies
+      pose = pose.reshape((n,T,self.d_next)).transpose((1,2,0))
+      scale = self.scale.reshape((nflies,-1)).T
+    kp = mabe.feat2kp(pose,scale)
+    if nflies == 1:
+      kp = kp[...,0].transpose((2,0,1))
+      kp = kp.reshape(szrest+kp.shape[-2:])
+    else:
+      # kp will be nkpts x 2 x T x nflies
+      kp= kp.transpose((3,2,0,1))
+      # kp is now nflies x T x nkpts x 2
+      kp = kp.reshape(szrest+kp.shape[1:])
     return kp
     
   def get_next_keypoints(self,**kwargs):
@@ -2901,6 +2994,14 @@ class PoseLabels:
     next = next + eta_next
     self.set_next(next,zscored=zscored)
         
+def dict_convert_torch_to_numpy(d):
+  for k,v in d.items():
+    if type(v) is torch.Tensor:
+      d[k] = v.numpy()
+    elif type(v) is dict:
+      d[k] = dict_convert_torch_to_numpy(v)
+  return d
+
 class FlyExample:
   def __init__(self,example_in=None,dataset=None,**kwargs):
 
@@ -2911,18 +3012,87 @@ class FlyExample:
     self.set_params(default_params,override=False)
     if self.dct_m is not None and self.idct_m is None:
       self.idct_m = np.linalg.inv(self.dct_m)
+
+    # copy the dicts
+    if example_in is not None:
+      example_in = {k: v for k,v in example_in.items()}
+      if 'metadata' in example_in:
+        example_in['metadata'] = {k: v for k,v in example_in['metadata'].items()}
+
+    is_train_example = (example_in is not None) and ('input' in example_in) \
+      and (type(example_in['input']) is torch.Tensor)
+      
+    if is_train_example:
+      example_in = dict_convert_torch_to_numpy(example_in)
+      # if we offset the example, adjust back
+      if 't0' in example_in['metadata']:
+        if 'labels_init' in example_in:
+          starttoff = example_in['labels_init'].shape[-2]
+        elif 'continuous_init' in example_in:
+          starttoff = example_in['continuous_init'].shape[-2]
+        else:
+          starttoff = 0
+        example_in['metadata']['t0'] -= starttoff
       
     zscore_params_input,zscore_params_labels = self.split_zscore_params(self.zscore_params)
+    self.labels = PoseLabels(example_in,zscore_params=zscore_params_labels,
+                             **self.get_poselabel_params())
+
+    if is_train_example and self.do_input_labels:
+      self.remove_labels_from_input(example_in)
+
     self.inputs = ObservationInputs(example_in,zscore_params=zscore_params_input,
                                     **self.get_observationinputs_params())
     init_pose = self.inputs.get_init_next()
-    self.labels = PoseLabels(example_in,init_next=init_pose,zscore_params=zscore_params_labels,
-                             **self.get_poselabel_params())
+    
+    self.labels.set_init_pose(init_pose)
+    
+    self.pre_sz = self.labels.pre_sz
+    
     if 'metadata' in example_in:
       self.metadata = example_in['metadata']
     
     return
   
+  def copy_subindex(self,idx_pre=None,ts=None):
+    
+    example = self.get_raw_example(makecopy=True)
+    
+    if idx_pre is not None:
+      ks = ['continuous', 'discrete', 'todiscretize', 'input','init','scale','categories']
+      for k in ks:
+        example[k] = example[k][idx_pre]
+      for k in example['metadata'].keys():
+        example['metadata'][k] = example['metadata'][k][idx_pre]
+        
+    if ts is not None:
+      # hasn't been tested yet...
+      ks = ['continuous', 'discrete', 'todiscretize', 'input']
+      cattextra = example['categories'].shape[-1] - example['continuous'].shape[-2]
+      if hasattr(ts,'__len__'):
+        assert np.all(np.diff(ts) == 1), 'ts must be consecutive'
+        toff = ts[0]
+        example['categories'] = example['categories'][...,ts[0]:ts[1]+cattextra,:]
+      else:
+        toff = ts
+        example['categories'] = example['categories'][...,ts:ts+cattextra,:]
+      for k in ks:
+        if k == 'discrete':
+          example[k] = example[k][...,ts,:,:]
+        else:
+          example[k] = example[k][...,ts,:]
+      example['metadata']['t0'] += toff
+      
+    new = FlyExample(example_in=example,**self.get_params())
+    return new
+
+  def remove_labels_from_input(self,example_in):
+    if not self.do_input_labels:
+      return
+
+    d_labels = self.labels.get_d_labels_input()
+    example_in['input'] = example_in['input'][...,d_labels:]
+      
   def set_params(self,params,override=True):
     for k,v in params.items():
       if override or (not hasattr(self,k)) or (getattr(self,k) is None):
@@ -2931,7 +3101,6 @@ class FlyExample:
   def get_default_params(self):
           
     params = {
-      'do_input_labels': False,
       'zscore_params': None,
       'do_input_labels': True,
       'starttoff': 1,
@@ -2951,11 +3120,15 @@ class FlyExample:
     }
     return params
     
+  def get_params(self):
+    default_params = self.get_default_params()
+    params = {k:getattr(self,k) for k in default_params.keys()}
+    return params
   
   def get_params_from_dataset(self,dataset):
     params = {
       'zscore_params': dataset.get_zscore_params(),
-      'input_labels': dataset.input_labels,
+      'do_input_labels': dataset.input_labels,
       'starttoff': dataset.get_start_toff(),
       'flatten_labels': dataset.flatten_labels,
       'flatten_obs': dataset.flatten_obs,
@@ -3009,12 +3182,16 @@ class FlyExample:
   def get_inputs(self):
     return self.inputs
   
-  def get_metadata(self):
-    return self.metadata
+  def get_metadata(self,makecopy=True):
+    if makecopy:
+      return copy.deepcopy(self.metadata)
+    else:
+      return self.metadata
   
-  def get_raw_example(self,format='standard'):
-    example = self.labels.get_raw_labels(format=format)
-    example['input'] = self.inputs.get_raw_inputs()
+  def get_raw_example(self,format='standard',makecopy=True):
+    example = self.labels.get_raw_labels(format=format,makecopy=makecopy)
+    example['input'] = self.inputs.get_raw_inputs(makecopy=makecopy)
+    example['metadata'] = self.get_metadata(makecopy=makecopy)
     return example
   
   def get_input_labels(self):
@@ -3027,27 +3204,32 @@ class FlyExample:
       
     # to do: add noise
     starttoff = self.starttoff
-    init = torch.tensor(self.labels.get_init_global(starttoff))
-    scale = torch.tensor(self.labels.get_scale())
-    categories = torch.tensor(self.labels.get_categories())
+    # copy made by torch.tensor
     metadata = copy.deepcopy(self.get_metadata())
     metadata['t0'] += starttoff
     metadata['frame0'] += starttoff
 
     input_labels = self.get_input_labels()
 
-    train_inputs,eta = self.inputs.get_train_inputs(input_labels=input_labels,
+    train_inputs = self.inputs.get_train_inputs(input_labels=input_labels,
                                                     labels=self.labels,
                                                     do_add_noise=do_add_noise)
-    train_labels = self.labels.get_train_labels(added_noise=eta)
+    train_labels = self.labels.get_train_labels(added_noise=train_inputs['eta'])
     
     flatten = self.flatten_labels or self.flatten_obs
+    assert flatten == False, 'flatten not implemented'
         
-    res = {'input': train_inputs, 'labels': train_labels['continuous'], 
+    res = {'input': train_inputs['input'], 'labels': train_labels['continuous'], 
            'labels_discrete': train_labels['discrete'],
            'labels_todiscretize': train_labels['todiscretize'],
-           'init': init, 'scale': scale, 'categories': categories,
-           'metadata': metadata}
+           'init': train_labels['init'], 'scale': train_labels['scale'], 
+           'categories': train_labels['categories'],
+           'metadata': metadata,
+           'input_init': train_inputs['input_init'],
+           'labels_init': train_labels['continuous_init'],
+           'labels_discrete_init': train_labels['discrete_init'],
+           'labels_todiscretize_init': train_labels['todiscretize_init'],
+           'init_all': train_labels['init_all'],}
 
     return res
 
@@ -3836,6 +4018,14 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     # categories = torch.as_tensor(datacurr['categories'].copy())
     # metadata =copy.deepcopy(datacurr['metadata'])
     
+    res = self.data[idx].get_train_example()
+    res['input'],mask,dropout_mask = self.mask_input(res['input'])
+    if mask is not None:
+      res['mask'] = mask
+    if dropout_mask is not None:
+      res['dropout_mask'] = dropout_mask
+      
+    return res
     
     datacurr = copy.deepcopy(self.data[idx])
     
@@ -6141,45 +6331,68 @@ def debug_plot_pose_prob(example,train_dataset,predcpu,tplot,fig=None,ax=None,h=
     
   return h,ax,fig
 
+def subsample_batch(example,nsamples=1,samples=None,dataset=None):
+  israw = type(example) is dict
+  islist = type(example) is list
+  if samples is not None:
+    nsamples = len(samples)
+
+  if israw:
+    batch_size = example['input'].shape[0]
+  elif islist:
+    batch_size = len(example)
+  elif type(example) is FlyExample:
+    batch_size = int(np.prod(example.pre_sz))
+    if batch_size == 1:
+      return [example,],np.arange(1)
+  else:
+    raise ValueError(f'Unknown type {type(example)}')
+
+  if samples is None:
+    nsamples = np.minimum(nsamples,batch_size)
+    samples = np.round(np.linspace(0,batch_size-1,nsamples)).astype(int)
+  else:
+    assert np.max(samples) < batch_size 
+
+  if islist:
+    return [example[i] for i in samples],samples
+
+  if israw:
+    rawbatch = example
+    examplelist = []
+    for samplei in samples:
+      examplecurr = get_batch_idx(rawbatch,samplei)
+      flyexample = FlyExample(example_in=examplecurr,dataset=dataset)
+      examplelist.append(flyexample)
+  else:
+    examplelist = []
+    for samplei in samples:
+      examplecurr = example.copy_subindex(idx_pre=samplei)
+      examplelist.append(examplecurr)
+      
+  return examplelist,samples  
+
 def debug_plot_pose(example,train_dataset=None,pred=None,data=None,
                     true_discrete_mode='to_discretize',
                     pred_discrete_mode='sample',
                     ntsplot=5,nsamplesplot=3,h=None,ax=None,fig=None,
                     tsplot=None):
  
-  isbatch = type(example) is dict
+  example,samplesplot = subsample_batch(example,nsamples=nsamplesplot,
+                                        dataset=train_dataset)
 
-  if isbatch:
-    batch = example
-    example = []
-    batch_size = batch['input'].shape[0]
-    nsamplesplot = np.minimum(nsamplesplot,batch_size)
-    samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
-    for samplei in samplesplot:
-      examplecurr = get_batch_idx(example,samplei)
-      flyexample = FlyExample(train_example=examplecurr,dataset=train_dataset)
-      example.append(flyexample)
-  elif type(example) is FlyExample:
-    example = [example,]
-    samplesplot = [0,]
-  else:
-    assert type(example) is list
-    batch_size = len(example)
-    nsamplesplot = np.minimum(nsamplesplot,batch_size)
-    samplesplot = np.round(np.linspace(0,batch_size-1,nsamplesplot)).astype(int)
-    example = [example[i] for i in samplesplot]
-    
-  isbatchpred = type(pred) is dict
-  if isbatchpred:
+
+  israwpred = type(pred) is dict
+  if israwpred:
     batchpred = pred
     pred = []
     for i,samplei in enumerate(samplesplot):
       predcurr = get_batch_idx(batchpred,samplei)
       flyexample = FlyExample(train_example=example[i],dataset=train_dataset)
       flyexample.labels.set_prediction(predcurr)
-      example.append(flyexample)
+      pred.append(flyexample)
   elif type(pred) is FlyExample:
-    pred = [pred,]
+    pred,_ = subsample_batch(pred,samples=samplesplot)
 
   nsamplesplot = len(example)
   if pred is not None:
@@ -7608,10 +7821,10 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   config = read_config(configfile)
 
   # debug velocity representation
-  #config['compute_pose_vel'] = True
+  config['compute_pose_vel'] = True
 
   # debug dct
-  #config['dct_tau'] = 16
+  config['dct_tau'] = 4
   
   # debug no multi time-scale predictions
   #config['tspred_global'] = [1,]
@@ -7813,6 +8026,48 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
       err_relative_future = np.max(np.abs(datafeatfuture[:,featrelative]-examplefuture[:,tpred-1,:]))
       print(f'max diff between data and t+{tpred} relative prediction: {err_relative_future:e}')
       
+  # get a training example
+  trainexample = train_dataset[0]
+  flyexample1 = FlyExample(example_in=trainexample,dataset=train_dataset)
+  trainexample1 = flyexample1.get_train_example()
+  for k,v in trainexample.items():
+    if not k in trainexample1:
+      print(f'Missing key {k}')
+    elif type(v) is torch.Tensor:
+      isdata = torch.isnan(v) == False
+      isdata1 = torch.isnan(trainexample1[k]) == False
+      if not torch.all(isdata == isdata1):
+        print(f'nan mismatch for {k}')
+      isdata = isdata & isdata1
+      err = torch.max(torch.abs(v[isdata]-trainexample1[k][isdata])).item()
+      print(f'max diff {k}: {err:e}')
+    else:
+      print(f'not comparing {k}')
+      
+  # initialize example from batch
+  train_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                batch_size=config['batch_size'],
+                                                shuffle=False,
+                                                pin_memory=True,
+                                                )
+  raw_batch = next(iter(train_dataloader))
+  example_batch = FlyExample(example_in=raw_batch,dataset=train_dataset)
+  trainbatch1 = example_batch.get_train_example()
+  for k,v in raw_batch.items():
+    if not k in trainbatch1:
+      print(f'Missing key {k}')
+    elif type(v) is torch.Tensor:
+      isdata = torch.isnan(v) == False
+      isdata1 = torch.isnan(trainbatch1[k]) == False
+      if not torch.all(isdata == isdata1):
+        print(f'nan mismatch for {k}')
+      isdata = isdata & isdata1
+      err = torch.max(torch.abs(v[isdata]-trainbatch1[k][isdata])).item()
+      print(f'max diff {k}: {err:e}')
+    else:
+      print(f'not comparing {k}')
+
+  debug_plot_pose(example_batch,data=data)
   print('Goodbye!')
 
 def main(configfile,loadmodelfile=None,restartmodelfile=None):

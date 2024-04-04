@@ -1860,6 +1860,7 @@ def angledist2xy(origin,angle,dist):
   return xy
 
 def feat2kp(Xfeat,scale_perfly,flyid=None):
+  # Xfeat is nfeatures x T x nflies
   ndim = np.ndim(Xfeat)
   if ndim >= 2:
     T = Xfeat.shape[1]
