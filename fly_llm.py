@@ -1846,6 +1846,9 @@ class ObservationInputs:
     
   def get_init_next(self,**kwargs):
 
+    if self.init is None:
+      return None
+
     tau = self.init.shape[-1]
     szrest = self.init.shape[:-2]
     relative0 = self.get_inputs_type('pose',zscored=False,**kwargs)[...,:tau,:]
@@ -2006,7 +2009,8 @@ class PoseLabels:
     # which indices of pose (next frame, global + relative) are discrete
     self.idx_nextdiscrete_to_next = np.array(discrete_idx)
     
-    if self.discretize_params is not None:
+    if (self.discretize_params is not None) and ('bin_edges' in self.discretize_params) \
+      and (self.discretize_params['bin_edges'] is not None):
       self.discretize_nbins = self.discretize_params['bin_edges'].shape[-1]
     else:
       self.discretize_nbins = 0
@@ -2248,10 +2252,6 @@ class PoseLabels:
 
   # we will use a cosine/sine representation for relative pose
   # next_cossin is equivalent to next if velocity is used
-  @property
-  def idx_next_to_nextcossin(self):
-    return np.arange(self.d_next)
-  
   @property
   def idx_nextcossinglobal_to_nextcossin(self):
     return np.arange(self.d_next_global)
@@ -2799,6 +2799,41 @@ class PoseLabels:
   def set_next(self,next,**kwargs):
     nextcossin = self.next_to_nextcossin(next)
     self.set_nextcossin(nextcossin,**kwargs)
+    
+  def convert_idx_next_to_nextcossin(self,idx_next):
+
+    if not hasattr(idx_next,'__len__'):
+      idx_next = [idx_next,]
+      
+    idx_next_to_nextcossin = self.idx_next_to_nextcossin
+    
+    idx_next_cossin = []
+    for i in idx_next:
+      ic = idx_next_to_nextcossin[i]
+      if type(ic) is np.ndarray:
+        idx_next_cossin = idx_next_cossin + ic.tolist()
+      else:
+        idx_next_cossin.append(ic)
+
+    return idx_next_cossin
+  
+  def convert_idx_nextcossin_to_multi(self,idx_nextcossin):
+    idx_nextcossin_to_multi = self.idx_nextcossin_to_multi
+    idx_multi = idx_nextcossin_to_multi[idx_nextcossin]
+    return idx_multi
+  
+  def convert_idx_next_to_multi(self,idx_next):
+    idx_next_cossin = self.convert_idx_next_to_nextcossin(idx_next)
+    idx_multi = self.convert_idx_nextcossin_to_multi(idx_next_cossin)
+    
+    return idx_multi
+
+  def convert_idx_next_to_multi_anyt(self,idx_next):
+    idx_next_cossin = self.convert_idx_next_to_nextcossin(idx_next)
+    idx_multi_to_multifeattpred = self.idx_multi_to_multifeattpred
+    idx_multi_anyt = np.nonzero(np.isin(idx_multi_to_multifeattpred[:,0],idx_next_cossin))[0]
+    ts = idx_multi_to_multifeattpred[idx_multi_anyt,1]
+    return idx_multi_anyt,ts
 
   def globalvel_to_globalpos(self,globalvel,starttoff=0,globalpos0=None):
     
@@ -2838,7 +2873,6 @@ class PoseLabels:
     szrest = next.shape[:-2]
     n = int(np.prod(szrest))
     starttoff = 0
-    tinit = self.init_pose.shape[-1]
     T = next.shape[-2]
     next = next.reshape((n,T,self.d_next))
 
@@ -3049,7 +3083,7 @@ class FlyExample:
     
     self.pre_sz = self.labels.pre_sz
     
-    if 'metadata' in example_in:
+    if (example_in is not None) and ('metadata' in example_in):
       self.metadata = example_in['metadata']
     
     return
@@ -3290,6 +3324,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       maskflag = (masktype is not None) or (pdropout_past>0.)
     self.maskflag = maskflag
 
+    # TODO REMOVE THESE
     # features used for representing relative pose
     if compute_pose_vel:
       self.nrelrep = nrelative
@@ -3307,6 +3342,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       self.dct_m = dct_ms[0]
       self.idct_m = dct_ms[1]
     self.tspred_global = tspred_global
+    
+    # TODO REMOVE THESE
     # indices of labels corresponding to the next frame if multiple frames are predicted
     tnext = np.min(self.tspred_global)
     self.nextframeidx_global = self.ravel_label_index([(f,tnext) for f in featglobal])
@@ -3329,19 +3366,27 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       assert(pdropout_past == 0.)
       
     self.input_labels = input_labels
+    # TODO REMOVE THESE
     if self.input_labels:
       self.d_input_labels = self.d_output_nextframe
     else:
       self.d_input_labels = 0
     
     # which outputs to discretize, which to keep continuous
+    # TODO REMOVE THESE
     self.discrete_idx = np.array([])
+    
     self.discrete_tspred = np.array([1,])
     self.discretize = False
+
+    # TODO REMOVE THESE
     self.continuous_idx = np.arange(self.d_output)
+    
     self.discretize_nbins = None
     self.discretize_bin_samples = None
     self.discretize_bin_edges = None
+    self.discretize_bin_means = None
+    self.discretize_bin_medians = None
     
     self.mu_input = None
     self.sig_input = None
@@ -3351,6 +3396,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.dtype = np.float32
     
     self.flatten_labels = False
+    self.flatten_obs_idx = None
     self.flatten_obs = False
     self.flatten_nobs_types = None
     self.flatten_nlabel_types = None
@@ -3377,27 +3423,11 @@ class FlyMLMDataset(torch.utils.data.Dataset):
 
     # store examples in objects
     self.data = []
-    #kwlabels = self.get_poselabels_params()
-    #kwinputs = self.get_observationinputs_params()
     for example_in in data:
       self.data.append(FlyExample(example_in,dataset=self))
 
     self.set_train_mode()
 
-  def get_poselabels_params(self):
-    kwlabels = {'discrete_idx':self.discretefeat,
-            'tspred_global':self.tspred_global,
-            'ntspred_relative':self.ntspred_relative,
-            'discretize_params':self.get_discretize_params(),
-            'is_velocity':self.compute_pose_vel,
-            'simplify_out':self.simplify_out}
-    return kwlabels
-  
-  def get_observationinputs_params(self):
-    kwinputs = {'simplify_in':self.simplify_in,
-                'flatten_obs_idx':self.flatten_obs_idx}
-    return kwinputs
-    
   @property
   def ntimepoints(self):
     # number of time points
@@ -3464,6 +3494,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           
   def set_flatten_params(self,flatten_labels=False,flatten_obs_idx=None,flatten_do_separate_inputs=False):
     
+    # TODO REMOVE THESE
     self.flatten_labels = flatten_labels
     self.flatten_obs_idx = flatten_obs_idx
     if self.flatten_labels:
@@ -3530,11 +3561,13 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         
     return
   
+  # TODO REMOVE THESE
   def ravel_label_index(self,ftidx):
     
     idx = ravel_label_index(ftidx,dct_m=self.dct_m,tspred_global=self.tspred_global,nrelrep=self.nrelrep)
     return idx
   
+  # TODO REMOVE THESE
   def unravel_label_index(self,idx):
       
     ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global,nrelrep=self.nrelrep)
@@ -3558,45 +3591,26 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       discrete_idx = np.array(discrete_idx)
     if not isinstance(discrete_tspred,np.ndarray):
       discrete_tspred = np.array(discrete_tspred)
-
-    is_bin_epsilon_perfeat = len(bin_epsilon) == len(discrete_idx)
-    if is_bin_epsilon_perfeat:
-      bin_epsilon_feat = bin_epsilon
-      bin_epsilon = []
       
-    if not self.compute_pose_vel:
-      discrete_idx1 = []
-      for i in discrete_idx:
-        if not featrelative[i]:
-          discrete_idx1.append(i)
-          continue
-        reli = featidx_to_relfeatidx(i)
-        relrepi = self.relfeat_to_cossin_map[reli]
-        assert (type(relrepi) is int)
-        repi = relfeatidx_to_featidx(relrepi)
-        discrete_idx1.append(repi)
-      discrete_idx = np.array(discrete_idx1)
+    self.discrete_tspred = discrete_tspred
 
-    # bin_epsilon is per feature
-    ftidx = []
-    for i,f in enumerate(discrete_idx):
-      for t in discrete_tspred:
-        if f in featglobal:
-          ftidx.append((f,t))
-          if is_bin_epsilon_perfeat:
-            bin_epsilon.append(bin_epsilon_feat[i])
-        else:
-          # only t = 1 can be discrete for relative features
-          if t == 1:
-            ftidx.append((f,1))
-            if is_bin_epsilon_perfeat:
-              bin_epsilon.append(bin_epsilon_feat[i])
-    self.discrete_idx = self.ravel_label_index(ftidx)
-    order = np.argsort(self.discrete_idx)
-    self.discrete_idx = self.discrete_idx[order]
-    bin_epsilon = np.array(bin_epsilon)
-    if is_bin_epsilon_perfeat:
-      bin_epsilon = bin_epsilon[order]
+    bin_epsilon_feat = np.array(bin_epsilon)
+    assert len(bin_epsilon_feat) <= len(discrete_idx)
+    if len(bin_epsilon_feat) < len(discrete_idx):
+      bin_epsilon_feat = np.concatenate((bin_epsilon_feat,np.zeros(len(discrete_idx)-len(bin_epsilon_feat))))
+
+    # translate to multi representation
+    dummyexample = FlyExample(dataset=self)
+    discreteidx_next = discrete_idx
+    bin_epsilon = np.zeros(dummyexample.labels.d_multi)
+    bin_epsilon[:] = np.nan
+    for i,i_next in enumerate(discreteidx_next):
+      idx_multi_curr,ts = dummyexample.labels.convert_idx_next_to_multi_anyt(i_next)
+      idx_multi_curr = idx_multi_curr[np.isin(idx_multi_curr,dummyexample.labels.idx_multidiscrete_to_multi)]
+      bin_epsilon[idx_multi_curr] = bin_epsilon_feat[i]
+
+    self.discrete_idx = np.nonzero(np.isnan(bin_epsilon) == False)[0]
+    self.bin_epsilon = bin_epsilon[self.discrete_idx]
     
     self.discretize_nbins = nbins
     self.continuous_idx = np.ones(self.d_output,dtype=bool)
@@ -3604,13 +3618,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     self.continuous_idx = np.nonzero(self.continuous_idx)[0]
     self.d_output_continuous = len(self.continuous_idx)
     self.d_output_discrete = len(self.discrete_idx)
-    self.discrete_tspred = discrete_tspred
 
     assert((bin_edges is None) == (bin_samples is None))
 
     if bin_edges is None:
       if self.sig_labels is not None:
-        bin_epsilon = np.array(bin_epsilon) / self.sig_labels[self.discrete_idx]
+        bin_epsilon = np.array(self.bin_epsilon) / self.sig_labels[self.discrete_idx]
       self.discretize_bin_edges,self.discretize_bin_samples,self.discretize_bin_means,self.discretize_bin_medians = \
         fit_discretize_labels(data,self.discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
     else:
@@ -3631,11 +3644,12 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     return data
   
   def get_discretize_params(self):
+
     discretize_params = {
-      'bin_edges': self.discretize_bin_edges.copy(),
-      'bin_samples': self.discretize_bin_samples.copy(),
-      'bin_means': self.discretize_bin_means.copy(),
-      'bin_medians': self.discretize_bin_medians.copy(),
+      'bin_edges': self.discretize_bin_edges,
+      'bin_samples': self.discretize_bin_samples,
+      'bin_means': self.discretize_bin_means,
+      'bin_medians': self.discretize_bin_medians,
     }
     return discretize_params
     
@@ -3762,6 +3776,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     return data
       
   def get_zscore_params(self):
+    
     zscore_params = {
       'mu_input': self.mu_input.copy(),
       'sig_input': self.sig_input.copy(),
@@ -6911,6 +6926,7 @@ def read_config(jsonfile):
     else:
       raise ValueError(f"Unknown type {config['flatten_obs_idx']} for flatten_obs_idx")
 
+  # discreteidx will reference mabe.posenames
   if type(config['discreteidx']) == str:
     if config['discreteidx'] == 'global':
       config['discreteidx'] = featglobal.copy()
