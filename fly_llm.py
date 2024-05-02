@@ -2560,6 +2560,9 @@ class PoseLabels:
   def is_continuous(self):
     return 'continuous' in self.labels_raw
   
+  def is_masked(self):
+    return 'mask' in self.labels_raw
+  
   def get_raw_labels(self,format='standard',ts=None,makecopy=True):
     labels_out = {}
     for kin in self.labels_raw.keys():
@@ -2752,6 +2755,19 @@ class PoseLabels:
       multi = self.unzscore_multi(multi)
       
     return multi
+  
+  def get_multi_discrete(self,makecopy=True,ts=None):
+    if not self.is_discretized():
+      nts = len_wrapper(ts,self.ntimepoints)
+      return np.zeros((self.pre_sz+(nts,0,0)),dtype=self.dtype)
+    labels_raw = self.get_raw_labels(format='standard',ts=ts,makecopy=makecopy)
+    return labels_raw['discrete']
+  
+  def get_mask(self,makecopy=True,ts=None):
+    if not self.is_masked():
+      return None
+    labels_raw = self.get_raw_labels(format='standard',ts=ts,makecopy=makecopy)
+    return labels_raw['mask']
   
   def set_multi(self,multi,zscored=False,ts=None):
     
@@ -3248,7 +3264,7 @@ class PoseLabels:
     ntspred_global = len(self.tspred_global)
     if ntsplot_global is None and ntsplot is not None:
       ntsplot_global = ntsplot
-    if ntsplot_global is None or (ntsplot_global >= ntspred_global):
+    if ntsplot_global is None or (ntsplot >= ntspred_global):
       idxglobal = self.idx_multiglobal_to_multi
       ftglobal = idx_multi_to_multifeattpred[idxglobal,:]
       ntsplot_global = ntspred_global
@@ -3273,6 +3289,9 @@ class PoseLabels:
       idxrelative = self.idx_multirelative_to_multi
       ftrelative = idx_multi_to_multifeattpred[idxrelative,:]
       ntsplot_relative = ntspred_relative
+    elif ntsplot_relative == 0:
+      idxrelative = np.zeros((0,),dtype=int)
+      ftrelative = np.zeros((0,2),dtype=int)
     else:
       d_next_relative = self.d_next_relative
       tplot_relative = np.concatenate((np.ones((d_next_relative,1),dtype=int),
@@ -6681,6 +6700,13 @@ def stack_batch_list(allx,n=None):
   xv = xv.flatten(0,1)
   return xv
   
+def len_wrapper(x,defaultlen=None):
+  if x is None:
+    return defaultlen
+  if hasattr(x,'__len__'):
+    return len(x)
+  return 1
+  
 def stackhelper(all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discrete,nplot):
 
   predv = torch.stack(all_pred[:nplot],dim=0)
@@ -6723,61 +6749,64 @@ def stackhelper(all_pred,all_labels,all_mask,all_pred_discrete,all_labels_discre
   
   return predv,labelsv,maskv,pred_discretev
   
-def debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev=None,labels_discretev=None,outnames=None,maskidx=None,ax=None,prctile_lim=.1,naxc=1,featidxplot=None,dataset=None):
+def debug_plot_predictions_vs_labels(all_pred,all_labels,ax=None,
+                                     prctile_lim=.1,naxc=1,featidxplot=None,
+                                     gaplen=2):
   
-  d_output = predv.shape[-1]
+  d_output = all_pred[0].d_multi
+  predv_cont = np.stack([pred.get_multi() for pred in all_pred],axis=0)
+  labelsv_cont = np.stack([label.get_multi() for label in all_labels],axis=0)
+  nans = np.zeros((len(all_pred),gaplen,d_output),dtype=all_labels[0].dtype) + np.nan
+  predv_cont = np.reshape(np.concatenate((predv_cont,nans),axis=1),(-1,d_output))
+  labelsv_cont = np.reshape(np.concatenate((labelsv_cont,nans),axis=1),(-1,d_output))
+  if all_labels[0].is_discretized():
+    predv_discrete = np.stack([pred.get_multi_discrete() for pred in all_pred],axis=0)
+    labelsv_discrete = np.stack([labels.get_multi_discrete() for labels in all_labels],axis=0)
+    nans = np.zeros((len(all_pred),gaplen)+predv_discrete.shape[-2:],dtype=all_labels[0].dtype) + np.nan
+    predv_discrete = np.reshape(np.concatenate((predv_discrete,nans),axis=1),(-1,)+predv_discrete.shape[-2:])
+    labelsv_discrete = np.reshape(np.concatenate((labelsv_discrete,nans),axis=1),(-1,)+labelsv_discrete.shape[-2:])
   
-  if featidxplot is not None:
-    predv = predv[:,featidxplot]
-    labelsv = labelsv[:,featidxplot]
-    outnames = [outnames[i] for i in featidxplot]
-    if labels_discretev is not None and len(labels_discretev) > 0:
-      tmp = torch.zeros((labels_discretev.shape[0],d_output,labels_discretev.shape[2]),dtype=labels_discretev.dtype)
-      tmp[:] = np.nan
-      tmp[:,dataset.discrete_idx,:] = labels_discretev
-      labels_discretev = tmp[:,featidxplot,:]
-      tmp = torch.zeros((labels_discretev.shape[0],d_output,labels_discretev.shape[2]),dtype=labels_discretev.dtype)
-      tmp[:] = np.nan
-      tmp[:,dataset.discrete_idx,:] = pred_discretev
-      pred_discretev = tmp[:,featidxplot,:]
-    else:
-      labels_discretev = None
-      pred_discretev = None
-    d_output = len(featidxplot)
+  if featidxplot is None:
+    featidxplot = np.arange(d_output)
+  nfeat = len(featidxplot)
   
-  ismasked = maskidx is not None and len(maskidx) > 0
-  naxr = int(np.ceil(d_output/naxc))
+  ismasked = all_labels[0].is_masked()
+  if ismasked:
+    maskv = np.stack([label.get_mask() for label in all_labels],axis=0)
+  naxr = int(np.ceil(nfeat/naxc))
   if ax is None:
     fig,ax = plt.subplots(naxr,naxc,sharex='all',figsize=(20,20))
     ax = ax.flatten()
     plt.tight_layout(h_pad=0)
 
   pred_cmap = lambda x: plt.get_cmap("tab10")(x%10)
-  for i in range(d_output):
+  discrete_idx = list(all_labels[0].idx_multidiscrete_to_multi)
+  outnames = all_labels[0].get_multi_names()
+  for i,feati in enumerate(featidxplot):
     ax[i].cla()
-    if outnames is not None:
-      ti = ax[i].set_title(outnames[i],y=1.0,pad=-14,color=pred_cmap(i),loc='left')
+    ti = ax[i].set_title(outnames[feati],y=1.0,pad=-14,color=pred_cmap(feati),loc='left')
     
-    if pred_discretev is not None and len(pred_discretev) > 0 and (not torch.all(torch.isnan(pred_discretev[:,i,:]))):
-      predcurr = pred_discretev[:,i,:].T
-      labelscurr = labels_discretev[:,i,:].T
-      zlabels = torch.max(labelscurr[torch.isnan(labelscurr)==False])
-      zpred = torch.max(predcurr[torch.isnan(predcurr)==False])
-      im = torch.stack((1-labelscurr/zlabels,1-predcurr/zpred,torch.ones(predcurr.shape)),dim=-1)
-      im[torch.isnan(im)] = 1.
-      ax[i].imshow(im.numpy(),aspect='auto')
+    if feati in discrete_idx:
+      disci = discrete_idx.index(feati)
+      predcurr = predv_discrete[:,disci,:].T
+      labelscurr = labelsv_discrete[:,disci,:].T
+      zlabels = np.nanmax(labelscurr)
+      zpred = np.nanmax(predcurr)
+      im = np.stack((1-labelscurr/zlabels,1-predcurr/zpred,np.ones(predcurr.shape)),axis=-1)
+      im[np.isnan(im)] = 1.
+      ax[i].imshow(im,aspect='auto')
     else:    
-      lims = torch.quantile(labelsv[:,i][torch.isnan(labelsv[:,i])==False],torch.tensor([prctile_lim/100.,1-prctile_lim/100.]))
-      ax[i].plot(labelsv[:,i],'k-',label='True')
+      lims = np.nanpercentile(np.concatenate([labelsv_cont[:,feati],predv_cont[:,feati]],axis=0),[prctile_lim,100-prctile_lim])
+      ax[i].plot(labelsv_cont[:,feati],'k-',label='True')
       if ismasked:
-        ax[i].plot(maskidx,predv[maskidx,i],'.',color=pred_cmap(i),label='Pred')
+        ax[i].plot(maskidx,predv_cont[maskidx,i],'.',color=pred_cmap(feati),label='Pred')
       else:
-        ax[i].plot(predv[:,i],'-',color=pred_cmap(i),label='Pred')
+        ax[i].plot(predv_cont[:,feati],'-',color=pred_cmap(feati),label='Pred')
       #ax[i].set_ylim([-ylim_nstd,ylim_nstd])
       ax[i].set_ylim(lims)
       if outnames is not None:
         plt.setp(ti,color=pred_cmap(i))
-  ax[0].set_xlim([0,labelsv.shape[0]])
+  ax[0].set_xlim([0,labelsv_cont.shape[0]])
     
   return fig,ax
 
@@ -8621,47 +8650,34 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
     debug_plot_global_error(all_pred,all_labels,train_dataset)
 
   # crop to nplot for plotting
-  nplot = 8000 #min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
-  predv = predv[:nplot,:]
-  labelsv = labelsv[:nplot,:]
-  if len(maskv) > 0:
-    maskv = maskv[:nplot,:]
-  pred_discretev = pred_discretev[:nplot,:]
-  labels_discretev = labels_discretev[:nplot,:]
-  
-  if maskv is not None and len(maskv) > 0:
-    maskidx = torch.nonzero(maskv)[:,0]
-  else:
-    maskidx = None
+  nplot = min(len(all_labels),8000//config['batch_size']//config['contextl']+1)
   
   ntspred_plot = np.minimum(4,train_dataset.ntspred_global)
-  featidxplot = select_featidx_plot(train_dataset,ntspred_plot)
+  featidxplot,ftplot = all_labels[0].select_featidx_plot(ntspred_plot)
   naxc = np.maximum(1,int(np.round(len(featidxplot)/nfeatures)))
-  fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,naxc=naxc,featidxplot=featidxplot,dataset=val_dataset)
+  fig,ax = debug_plot_predictions_vs_labels(all_pred[:nplot],all_labels[:nplot],naxc=naxc,featidxplot=featidxplot)
   if train_dataset.ntspred_global > 1:
-    featidxplot = select_featidx_plot(train_dataset,ntspred_plot=train_dataset.ntspred_global,ntsplot_relative=0)
+    featidxplot,ftplot = all_labels[0].select_featidx_plot(ntsplot=train_dataset.ntspred_global,ntsplot_relative=0)
     naxc = np.maximum(1,int(np.round(len(featidxplot)/nfeatures)))
-    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,naxc=naxc,featidxplot=featidxplot,dataset=val_dataset)
-  
-  if train_dataset.ntspred_global > 1:
-    featidxplot = train_dataset.ravel_label_index([(featglobal[0],t) for t in train_dataset.tspred_global])
-    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset)
+    fig,ax = debug_plot_predictions_vs_labels(all_pred[:nplot],all_labels[:nplot],naxc=naxc,featidxplot=featidxplot)
+    featidxplot,_ = all_labels[0].select_featidx_plot(ntsplot=1,ntsplot_relative=1)
+    fig,ax = debug_plot_predictions_vs_labels(all_pred[:nplot],all_labels[:nplot],naxc=naxc,featidxplot=featidxplot)
 
-  if train_dataset.dct_tau > 0:
-    fstrs = ['left_middle_leg_tip_angle','left_front_leg_tip_angle','left_wing_angle']
-    fs = [mabe.posenames.index(x) for x in fstrs]
-    featidxplot = train_dataset.ravel_label_index([(f,i+1) for i in range(train_dataset.dct_tau+1) for f in fs])
-    fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset,naxc=len(fs))
+  # if train_dataset.dct_tau > 0:
+  #   fstrs = ['left_middle_leg_tip_angle','left_front_leg_tip_angle','left_wing_angle']
+  #   fs = [mabe.posenames.index(x) for x in fstrs]
+  #   featidxplot = train_dataset.ravel_label_index([(f,i+1) for i in range(train_dataset.dct_tau+1) for f in fs])
+  #   fig,ax = debug_plot_predictions_vs_labels(predv,labelsv,pred_discretev,labels_discretev,outnames=outnames,maskidx=maskidx,featidxplot=featidxplot,dataset=val_dataset,naxc=len(fs))
 
-    predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
-    labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
-    fsdct = [np.array(mabe.posenames)[featrelative].tolist().index(x) for x in fstrs]
-    predrelative_dct = predrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
-    labelsrelative_dct = labelsrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
-    outnamescurr = [f'{f}_dt{i+1}' for i in range(train_dataset.dct_tau) for f in fstrs]
-    fig,ax = debug_plot_predictions_vs_labels(torch.as_tensor(predrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
-                                              torch.as_tensor(labelsrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
-                                              outnames=outnamescurr,maskidx=maskidx,naxc=len(fstrs))
+  #   predrelative_dct = train_dataset.get_relative_movement_dct(predv.numpy())
+  #   labelsrelative_dct = train_dataset.get_relative_movement_dct(labelsv.numpy())
+  #   fsdct = [np.array(mabe.posenames)[featrelative].tolist().index(x) for x in fstrs]
+  #   predrelative_dct = predrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
+  #   labelsrelative_dct = labelsrelative_dct[:,:,fsdct].astype(train_dataset.dtype)
+  #   outnamescurr = [f'{f}_dt{i+1}' for i in range(train_dataset.dct_tau) for f in fstrs]
+  #   fig,ax = debug_plot_predictions_vs_labels(torch.as_tensor(predrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
+  #                                             torch.as_tensor(labelsrelative_dct.reshape((-1,train_dataset.dct_tau*len(fsdct)))),
+  #                                             outnames=outnamescurr,maskidx=maskidx,naxc=len(fstrs))
 
 
   # generate an animation of open loop prediction
