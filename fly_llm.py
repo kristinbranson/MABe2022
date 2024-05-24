@@ -25,6 +25,9 @@ import pathlib
 import pickle
 import gzip
 
+matplotlib.use('tkagg')
+plt.ion()
+
 print('fly_llm...')
 
 codedir = pathlib.Path(__file__).parent.resolve()
@@ -1180,7 +1183,10 @@ def compute_sensory_wrapper(Xkp,flynum,theta_main=None,returnall=False,returnidx
 
 def combine_inputs(relpose=None,sensory=None,input=None,labels=None,dim=0):
   if input is None:
-    input = np.concatenate((relpose,sensory),axis=dim)
+    if sensory is None:
+      input = relpose
+    else:
+      input = np.concatenate((relpose,sensory),axis=dim)
   if labels is not None:
     input = np.concatenate((input,labels),axis=dim)
   return input 
@@ -1265,7 +1271,7 @@ def ravel_label_index(ftidx,dct_m=None,tspred_global=[1,],nrelrep=None,d_output=
   
   return idx.reshape(sz[:-1])
 
-def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
+def compute_features(X,id=None,flynum=0,scale_perfly=None,smush=True,outtype=None,
                      simplify_out=None,simplify_in=None,dct_m=None,tspred_global=[1,],
                      npad=1,compute_pose_vel=True,discreteidx=[],returnidx=False):
   
@@ -1284,17 +1290,24 @@ def compute_features(X,id,flynum,scale_perfly,smush=True,outtype=None,
     endidx = None
   else:
     endidx = -npad
-  out = compute_sensory_wrapper(X[:,:,:endidx,:],flynum,theta_main=globalpos[featthetaglobal,:endidx],
-                                returnall=True,returnidx=returnidx)
-  sensory,wall_touch,otherflies_vision,otherflies_touch = out[:4]
-  if returnidx:
-    idxinfo = {}
-    idxinfo['input'] = out[4]
+  if simplify_in == 'no_sensory':
+    sensory = None
+    res['input'] = relpose.T
+    if returnidx:
+      idxinfo['input'] = {}
+      idxinfo['input']['relpose'] = [0,relpose.shape[0]]
+  else:
+    out = compute_sensory_wrapper(X[:,:,:endidx,:],flynum,theta_main=globalpos[featthetaglobal,:endidx],
+                                  returnall=True,returnidx=returnidx)
+    sensory,wall_touch,otherflies_vision,otherflies_touch = out[:4]
+    if returnidx:
+      idxinfo = {}
+      idxinfo['input'] = out[4]
 
-  res['input'] = combine_inputs(relpose=relpose[:,:endidx],sensory=sensory).T
-  if returnidx:
-    idxinfo['input'] = {k: [vv+relpose.shape[0] for vv in v] for k,v in idxinfo['input'].items()}
-    idxinfo['input']['relpose'] = relpose.shape[0]
+    res['input'] = combine_inputs(relpose=relpose[:,:endidx],sensory=sensory).T
+    if returnidx:
+      idxinfo['input'] = {k: [vv+relpose.shape[0] for vv in v] for k,v in idxinfo['input'].items()}
+      idxinfo['input']['relpose'] = [0,relpose.shape[0]]
 
   out = compute_movement(relpose=relpose,globalpos=globalpos,simplify=simplify_out,dct_m=dct_m,
                          tspred_global=tspred_global,compute_pose_vel=compute_pose_vel,
@@ -1766,25 +1779,25 @@ def zscore(x,mu,sig):
 
 class ObservationInputs:
 
-  def __init__(self,example_in=None,Xkp=None,fly=0,scale=None,zscore_params=None,
-               simplify_in=None,flatten_obs=False,flatten_obs_idx=None,starttoff=1):
+  def __init__(self,example_in=None,Xkp=None,fly=0,scale=None,dataset=None,dozscore=False,**kwargs):
     
     # to do: deal with flattening
     
     self.input = None
     self.init = None
-    self.simplify_in = simplify_in
     self.metadata = None
-    self.zscore_params = zscore_params
     self.d_input = None
-    self.flatten_obs = flatten_obs
-    self.flatten_obs_idx = flatten_obs_idx
+  
+    self.set_params(kwargs)
+    if dataset is not None:
+      self.set_params(self.get_params_from_dataset(dataset),override=False)
+    default_params = FlyExample.get_default_params()
+    self.set_params(default_params,override=False)
+    
     self.sensory_feature_idx,self.sensory_feature_szs = \
-      get_sensory_feature_shapes(simplify=self.simplify_in)
-    self.starttoff = starttoff
-      
+      get_sensory_feature_shapes(simplify=self.simplify_in)      
     if example_in is not None:
-      self.set_example(example_in)
+      self.set_example(example_in,dozscore=dozscore)
     elif Xkp is not None:
       self.set_inputs_from_keypoints(Xkp,fly,scale)
 
@@ -1807,7 +1820,48 @@ class ObservationInputs:
     self.d_input = self.input.shape[-1]
     self.pre_sz = self.input.shape[:-2]
   
-  def set_example(self,example_in):
+  @staticmethod
+  def flyexample_to_observationinput_params(params):
+    zscore_params_input,_ = FlyExample.split_zscore_params(params['zscore_params'])
+    kwinputs = {'zscore_params':zscore_params_input,}
+    if 'simplify_in' in params:
+      kwinputs['simplify_in'] = params['simplify_in']
+    if 'flatten_obs' in params:
+      kwinputs['flatten_obs'] = params['flatten_obs']
+    if 'starttoff' in params:
+      kwinputs['starttoff'] = params['starttoff']
+    if 'flatten_obs_idx' in params:
+      kwinputs['flatten_obs_idx'] = params['flatten_obs_idx']
+    if 'do_input_labels' in params:
+      kwinputs['do_input_labels'] = params['do_input_labels']
+    return kwinputs
+  
+  @staticmethod
+  def get_default_params():
+    params = FlyExample.get_default_params()
+    params = ObservationInputs.flyexample_to_observationinput_params(params)
+    return params
+  
+  def get_params(self):
+    params = {
+      'zscore_params':self.zscore_params,
+      'simplify_in':self.simplify_in,
+      'flatten_obs':self.flatten_obs,
+    }
+    return params
+  
+  def set_params(self,params,override=True):
+    for k,v in params.items():
+      if override or (not hasattr(self,k)) or (getattr(self,k) is None):
+        setattr(self,k,v)
+  
+  @staticmethod
+  def get_params_from_dataset(dataset):
+    params = FlyExample.get_params_from_dataset(dataset)
+    params = ObservationInputs.flyexample_to_observationinput_params(params)
+    return params
+  
+  def set_example(self,example_in,dozscore=False):
     self.input = example_in['input']
     if 'init_all' in example_in:
       self.init = example_in['init_all']
@@ -1817,6 +1871,10 @@ class ObservationInputs:
       self.input = np.concatenate((example_in['input_init'],self.input),axis=-2)
       
     self.update_sizes()
+    
+    if dozscore:
+      self.input = zscore(self.input,self.zscore_params['mu_input'],self.zscore_params['sig_input'])
+    
     if 'metadata' in example_in:
       self.metadata = example_in['metadata']
 
@@ -1965,14 +2023,9 @@ class ObservationInputs:
   
 class PoseLabels:
   def __init__(self,example_in=None,init_next=None,
-               Xkp=None,scale=None,
-               simplify_out=None,
-               discrete_idx=[],tspred_global=[1,],
-               ntspred_relative=1,
-               zscore_params=None,discretize_params=None,
-               is_velocity=True,flatten_labels=False,
-               do_add_noise=False,discrete_tspred=[1,],
-               starttoff=1,dct_m=None,idct_m=None):
+               Xkp=None,scale=None,metadata=None,
+               dozscore=False,dodiscretize=False,
+               dataset=None,**kwargs):
     
     # different representations of labels:
     # labels_raw -- representation used for training/prediction
@@ -1984,35 +2037,24 @@ class PoseLabels:
     # stacked: (sz) x ntypes x d_output_flatten
     # these will be z-scored if zscore_params is not None
     # 
-    # full_labels_discrete_idx: indices of 
+    # full_labels_discreteidx: indices of 
 
-    self.labels_raw = {}
-    self.simplify_out = simplify_out
-    self.tspred_global = np.array(tspred_global)
-    self.ntspred_relative = ntspred_relative
-    self.zscore_params = zscore_params
-    self.discretize_params = discretize_params
-    self.is_velocity = is_velocity
-    self.flatten_labels = flatten_labels
-    self.init_pose = init_next
-    self.do_add_noise = do_add_noise
-    self.starttoff = starttoff
-    self.discrete_tspred = discrete_tspred
-    self.dct_m = dct_m
-    self.idct_m = idct_m
-    if self.idct_m is None and self.dct_m is not None:
-      self.idct_m = np.linalg.inv(self.dct_m)
-    
+    self.set_params(kwargs)
+    if dataset is not None:
+      self.set_params(self.get_params_from_dataset(dataset),override=False)
+    default_params = PoseLabels.get_default_params()
+    self.set_params(default_params,override=False)
+
+    # default_params = self.get_default_params()
+    # self.set_params(default_params,override=False)
+
     # copy over labels_in
     self.label_keys = {}
     self.labels_raw = {}
     self.pre_sz = None
-    self.metadata = None
+    self.metadata = metadata
     self.categories = None
-    
-    # which indices of pose (next frame, global + relative) are discrete
-    self.idx_nextdiscrete_to_next = np.array(discrete_idx)
-    
+        
     if (self.discretize_params is not None) and ('bin_edges' in self.discretize_params) \
       and (self.discretize_params['bin_edges'] is not None):
       self.discretize_nbins = self.discretize_params['bin_edges'].shape[-1]-1
@@ -2020,9 +2062,11 @@ class PoseLabels:
       self.discretize_nbins = 0
 
     # to do: include flattening
+
+    self.init_pose = init_next
     
     if example_in is not None:
-      self.set_raw_example(example_in)
+      self.set_raw_example(example_in,dozscore=dozscore,dodiscretize=dodiscretize)
     elif Xkp is not None:
       self.set_keypoints(Xkp,scale)
 
@@ -2030,8 +2074,6 @@ class PoseLabels:
       assert self.d_multicontinuous == self.labels_raw['continuous'].shape[-1]
     if self.is_discretized() and 'discrete' in self.labels_raw:
       assert self.d_multidiscrete == self.labels_raw['discrete'].shape[-2]
-
-    self.init_pose = init_next
     
     return
   
@@ -2066,7 +2108,7 @@ class PoseLabels:
         raise ValueError('pred must contain discrete or labels_discrete')
     return
   
-  def set_raw_example(self,example_in):
+  def set_raw_example(self,example_in,dozscore=False,dodiscretize=False):
 
     if example_in is None:
       self.labels_raw = {}
@@ -2148,6 +2190,11 @@ class PoseLabels:
       
     if 'categories' in example_in:
       self.categories = example_in['categories']
+      
+    if dozscore and self.is_zscored():
+      self.labels_raw['continuous'] = self.zscore_multi(self.labels_raw['continuous'])
+    if dodiscretize and self.is_discretized():
+      self.discretize_multi(self.labels_raw)
   
   def append_raw(self,pred):
     if 'labels' in pred:
@@ -2234,11 +2281,32 @@ class PoseLabels:
         self.labels_raw['todiscretize'][...,self.starttoff:,:] = np.nan
     return
   
+  @staticmethod
+  def flyexample_to_poselabels_params(params):
+    if 'zscore_params' in params:
+      _,zscore_params_labels = FlyExample.split_zscore_params(params['zscore_params'])
+      params['zscore_params'] = zscore_params_labels
+    toremove = ['do_input_labels','flatten_obs','simplify_in','flatten_obs_idx']      
+    for k in toremove:
+      if k in params:
+        del params[k]
+    return params
   
+  @staticmethod
+  def get_default_params():
+    params = FlyExample.get_default_params()
+    params = PoseLabels.flyexample_to_poselabels_params(params)
+    return params
+  
+  def get_params_from_dataset(self,dataset):
+    params = FlyExample.get_params_from_dataset(dataset)
+    params = PoseLabels.flyexample_to_poselabels_params(params)
+    return params
+
   def get_params(self):
     kwlabels = {
       'zscore_params':self.zscore_params,
-      'discrete_idx':self.idx_nextdiscrete_to_next,
+      'discreteidx':self.idx_nextdiscrete_to_next,
       'tspred_global':self.tspred_global,
       'discrete_tspred':self.discrete_tspred,
       'ntspred_relative':self.ntspred_relative,
@@ -2251,6 +2319,14 @@ class PoseLabels:
       'idct_m':self.idct_m,
       }
     return kwlabels
+  
+  def set_params(self,params,override=True):
+    translatedict = {'discreteidx':'idx_nextdiscrete_to_next'}
+    for k,v in params.items():
+      if k in translatedict:
+        k = translatedict[k]
+      if override or (not hasattr(self,k)) or (getattr(self,k) is None):
+        setattr(self,k,v)
   
   @property
   def ntimepoints(self):
@@ -3086,14 +3162,14 @@ class PoseLabels:
     T = nextpose.shape[-2]
     nextpose = nextpose.reshape((n,T,self.d_next))
     init_pose = nextpose[...,0,:]
-    next = np.zeros((n,T-1,self.d_next),dtype=nextpose.dtype)
     if self.is_velocity:
       next = np.diff(nextpose,axis=1)
     else:
       idx_nextglobal_to_next = self.idx_nextglobal_to_next
+      next = nextpose[...,1:,:].copy()
       next[...,idx_nextglobal_to_next] = np.diff(nextpose[...,idx_nextglobal_to_next],axis=1)
     next[...,self.is_angle_next] = mabe.modrange(next[...,self.is_angle_next],-np.pi,np.pi)
-    next = next.reshape(szrest+(T,self.d_next))
+    next = next.reshape(szrest+(T-1,self.d_next))
     
     return next,init_pose
   
@@ -3143,9 +3219,10 @@ class PoseLabels:
     return nextpose_global
   
   def set_next_pose(self,nextpose):
+    self.pre_sz = nextpose.shape[:-2]
     next,init_pose = self.nextpose_to_next(nextpose)
+    self.set_init_pose(init_pose.T)
     self.set_next(next,zscored=False)
-    self.set_init_pose(init_pose)
 
   def nextpose_to_nextkeypoints(self,pose):
     
@@ -3183,18 +3260,38 @@ class PoseLabels:
       next_pose = self.get_next_pose(zscored=False,**kwargs)
       next_keypoints = self.nextpose_to_nextkeypoints(next_pose)
       return next_keypoints
+  
+  def discretize_multi(self,example):
+    if not self.is_discretized():
+      return
+    assert example['continuous'].shape[-1] == self.d_multi
+    discretize_idx = self.idx_multidiscrete_to_multi
+    example['todiscretize'] = example['continuous'][...,discretize_idx].copy()
+    example['discrete'] = discretize_labels(example['todiscretize'],self.discretize_params['bin_edges'],soften_to_ends=True)
+    example['continuous'] = example['continuous'][...,self.idx_multicontinuous_to_multi]
+    return
     
   def set_keypoints(self,Xkp,scale=None):
 
     if (scale is None) and (self.scale is not None):
       scale = self.scale
-    nextpose,scale_out = mabe.kp2feat(Xkp,scale_perfly=scale,return_scale=True)
-    if scale is None:
-      self.scale = scale_out
-    else:
-      self.scale = scale
-    self.set_next_pose(nextpose)
+      
+    # function for computing features
+    example = compute_features(Xkp[...,None],scale_perfly=scale,outtype=np.float32,
+                               simplify_out=self.simplify_out,
+                               dct_m=self.dct_m,
+                               tspred_global=self.tspred_global,
+                               compute_pose_vel=self.is_velocity,
+                               discreteidx=self.idx_nextdiscrete_to_next,
+                               simplify_in='no_sensory')
     
+    if self.is_zscored():
+      self.zscore(example)
+
+    if self.is_discretized():
+      self.discretize(example)
+    
+    self.set_raw_example(example)
     return
     
   def get_next_velocity(self,**kwargs):
@@ -3293,9 +3390,9 @@ class PoseLabels:
       idxrelative = np.zeros((0,),dtype=int)
       ftrelative = np.zeros((0,2),dtype=int)
     else:
-      d_next_relative = self.d_next_relative
-      tplot_relative = np.concatenate((np.ones((d_next_relative,1),dtype=int),
-                                        np.round(np.linspace(2,ntspred_relative,(ntsplot_relative-1)*d_next_relative)).astype(int).reshape(-1,d_next_relative).T),axis=-1)
+      d_next_cossin_relative = self.d_next_cossin_relative
+      tplot_relative = np.concatenate((np.ones((d_next_cossin_relative,1),dtype=int),
+                                        np.round(np.linspace(2,ntspred_relative,(ntsplot_relative-1)*d_next_cossin_relative)).astype(int).reshape(-1,d_next_cossin_relative).T),axis=-1)
       ftrelative = []
       idxrelative = []
       for fi,f in enumerate(self.idx_nextcossinrelative_to_nextcossin):
@@ -3322,12 +3419,13 @@ def dict_convert_torch_to_numpy(d):
   return d
 
 class FlyExample:
-  def __init__(self,example_in=None,dataset=None,**kwargs):
+  def __init__(self,example_in=None,dataset=None,Xkp=None,flynum=None,scale=None,metadata=None,
+               dozscore=False,dodiscretize=False,**kwargs):
 
     self.set_params(kwargs)
     if dataset is not None:
       self.set_params(self.get_params_from_dataset(dataset),override=False)
-    default_params = self.get_default_params()
+    default_params = FlyExample.get_default_params()
     self.set_params(default_params,override=False)
     if self.dct_m is not None and self.idct_m is None:
       self.idct_m = np.linalg.inv(self.dct_m)
@@ -3337,6 +3435,10 @@ class FlyExample:
       example_in = {k: v for k,v in example_in.items()}
       if 'metadata' in example_in:
         example_in['metadata'] = {k: v for k,v in example_in['metadata'].items()}
+    elif Xkp is not None:
+      example_in = self.compute_features(Xkp,flynum,scale,metadata)
+      dozscore = True
+      dodiscretize = True
 
     is_train_example = (example_in is not None) and ('input' in example_in) \
       and (type(example_in['input']) is torch.Tensor)
@@ -3353,15 +3455,17 @@ class FlyExample:
           starttoff = 0
         example_in['metadata']['t0'] -= starttoff
       
-    self.labels = PoseLabels(example_in,**self.get_poselabel_params())
+    self.labels = PoseLabels(example_in,dozscore=dozscore,dodiscretize=dodiscretize,**self.get_poselabel_params())
 
     if is_train_example and self.do_input_labels:
       self.remove_labels_from_input(example_in)
 
-    self.inputs = ObservationInputs(example_in,**self.get_observationinputs_params())
+    self.inputs = ObservationInputs(example_in,dozscore=dozscore,**self.get_observationinputs_params())
     init_pose = self.inputs.get_init_next()
     
     self.labels.set_init_pose(init_pose)
+
+    self.set_zscore_params(self.zscore_params)
     
     self.pre_sz = self.labels.pre_sz
     
@@ -3369,6 +3473,18 @@ class FlyExample:
       self.metadata = example_in['metadata']
     
     return
+  
+  def compute_features(self,Xkp,flynum=0,scale=None,metadata=None):
+    
+    example = compute_features(Xkp,flynum=flynum,scale_perfly=scale,outtype=np.float32,
+                               simplify_in=self.simplify_in,
+                               simplify_out=self.simplify_out,
+                               dct_m=self.dct_m,
+                               tspred_global=self.tspred_global,
+                               compute_pose_vel=self.is_velocity,
+                               discreteidx=self.discreteidx)
+        
+    return example
   
   def copy(self):
     return self.copy_subindex()
@@ -3413,11 +3529,15 @@ class FlyExample:
     example_in['input'] = example_in['input'][...,d_labels:]
       
   def set_params(self,params,override=True):
+    synonyms = {'compute_pose_vel': 'is_velocity'}
     for k,v in params.items():
+      if k in synonyms:
+        k = synonyms[k]
       if override or (not hasattr(self,k)) or (getattr(self,k) is None):
         setattr(self,k,v)
-  
-  def get_default_params(self):
+
+  @staticmethod
+  def get_default_params():
           
     params = {
       'zscore_params': None,
@@ -3440,11 +3560,12 @@ class FlyExample:
     return params
     
   def get_params(self):
-    default_params = self.get_default_params()
+    default_params = FlyExample.get_default_params()
     params = {k:getattr(self,k) for k in default_params.keys()}
     return params
   
-  def get_params_from_dataset(self,dataset):
+  @staticmethod
+  def get_params_from_dataset(dataset):
     params = {
       'zscore_params': dataset.get_zscore_params(),
       'do_input_labels': dataset.input_labels,
@@ -3466,29 +3587,15 @@ class FlyExample:
     return params
   
   def get_poselabel_params(self):
-    _,zscore_params_labels = self.split_zscore_params(self.zscore_params)
-    kwlabels = {
-      'zscore_params':zscore_params_labels,
-      'discrete_idx':self.discreteidx,
-      'tspred_global':self.tspred_global,
-      'discrete_tspred':self.discrete_tspred,
-      'ntspred_relative':self.ntspred_relative,
-      'discretize_params':self.discretize_params,
-      'is_velocity':self.is_velocity,
-      'simplify_out':self.simplify_out,
-      'starttoff':self.starttoff,
-      'flatten_labels':self.flatten_labels,
-      'dct_m':self.dct_m,
-      'idct_m':self.idct_m,
-      }
-    return kwlabels
+    params = self.get_params()
+    params = PoseLabels.flyexample_to_poselabels_params(params)
+
+    return params
   
   def get_observationinputs_params(self):
-    zscore_params_input,_ = self.split_zscore_params(self.zscore_params)
-    kwinputs = {'zscore_params':zscore_params_input,
-                'simplify_in':self.simplify_in,
-                'flatten_obs_idx':self.flatten_obs_idx}
-    return kwinputs
+    params = self.get_params()
+    params = ObservationInputs.flyexample_to_observationinput_params(params)
+    return params
   
   @property
   def ntimepoints(self):
@@ -3558,7 +3665,8 @@ class FlyExample:
     metadata['frame0'] += starttoff    
     return metadata
 
-  def split_zscore_params(self,zscore_params):
+  @staticmethod
+  def split_zscore_params(zscore_params):
     if zscore_params is not None:
       zscore_params_input = {'mu_input':zscore_params['mu_input'],'sig_input':zscore_params['sig_input']}
       zscore_params_labels = {'mu_labels':zscore_params['mu_labels'],'sig_labels':zscore_params['sig_labels']}
@@ -3568,9 +3676,9 @@ class FlyExample:
     return zscore_params_input,zscore_params_labels
   
   def set_zscore_params(self,zscore_params):
-    zscore_params_input,zscore_params_labels = self.split_zscore_params(zscore_params)
+    zscore_params_input,zscore_params_labels = FlyExample.split_zscore_params(zscore_params)
     self.inputs.set_zscore_params(zscore_params_input)
-    init_pose = self.inputs.get_init_next(zscored=False)
+    init_pose = self.inputs.get_init_next()
     self.labels.set_zscore_params(zscore_params_labels)
     self.labels.set_init_pose(init_pose)
 
@@ -3666,7 +3774,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     
     # which outputs to discretize, which to keep continuous
     # TODO REMOVE THESE
-    self.discrete_idx = np.array([])
+    self.discreteidx = np.array([])
     
     self.discrete_tspred = np.array([1,])
     self.discretize = False
@@ -3755,7 +3863,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   @property
   def noutput_tokens_per_timepoint(self):
     if self.flatten_labels and self.discretize:
-      return len(self.discrete_idx) + int(self.continuous)
+      return len(self.discreteidx) + int(self.continuous)
     else:
       return 1
     
@@ -3774,8 +3882,11 @@ class FlyMLMDataset(torch.utils.data.Dataset):
   def ntspred_global(self):
     return len(self.tspred_global)
           
+  @property
+  def ntspred_max(self):
+    return np.maximum(self.ntspred_relative,self.ntspred_global)
           
-  @ property
+  @property
   def is_zscored(self):
     return self.mu_input is not None
   
@@ -3866,35 +3977,35 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     ftidx = unravel_label_index(idx,dct_m=self.dct_m,tspred_global=self.tspred_global,nrelrep=self.nrelrep)
     return ftidx
     
-  def discretize_labels(self,data,discrete_idx,discrete_tspred,nbins=50,
+  def discretize_labels(self,data,discreteidx,discrete_tspred,nbins=50,
                         bin_edges=None,bin_samples=None,bin_epsilon=None,
                         bin_means=None,bin_medians=None,**kwargs):    
     """
-    discretize_labels(self,discrete_idx,discrete_tspred,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs)
-    For each feature in discrete_idx, discretize the labels into nbins bins. For each example in the data,
-    labels_discrete is an ndarray of shape T x len(discrete_idx) x nbins, where T is the number of time points, and 
+    discretize_labels(self,discreteidx,discrete_tspred,nbins=50,bin_edges=None,bin_samples=None,bin_epsilon=None,**kwargs)
+    For each feature in discreteidx, discretize the labels into nbins bins. For each example in the data,
+    labels_discrete is an ndarray of shape T x len(discreteidx) x nbins, where T is the number of time points, and 
     indicates whether the label is in each bin, with soft-binning. 
-    labels_todiscretize is an ndarray of shape T x len(discrete_idx) with the original continuous labels.
+    labels_todiscretize is an ndarray of shape T x len(discreteidx) with the original continuous labels.
     labels gets replaced with an ndarray of shape T x len(continuous_idx) with the continuous labels.
-    discretize_bin_edges is an ndarray of shape len(discrete_idx) x (nbins+1) with the bin edges for each discrete feature.
-    discretize_bin_samples is an ndarray of shape nsamples x len(discrete_idx) x nbins with samples from each bin
+    discretize_bin_edges is an ndarray of shape len(discreteidx) x (nbins+1) with the bin edges for each discrete feature.
+    discretize_bin_samples is an ndarray of shape nsamples x len(discreteidx) x nbins with samples from each bin
     """
         
-    if not isinstance(discrete_idx,np.ndarray):
-      discrete_idx = np.array(discrete_idx)
+    if not isinstance(discreteidx,np.ndarray):
+      discreteidx = np.array(discreteidx)
     if not isinstance(discrete_tspred,np.ndarray):
       discrete_tspred = np.array(discrete_tspred)
       
     self.discrete_tspred = discrete_tspred
 
     bin_epsilon_feat = np.array(bin_epsilon)
-    assert len(bin_epsilon_feat) <= len(discrete_idx)
-    if len(bin_epsilon_feat) < len(discrete_idx):
-      bin_epsilon_feat = np.concatenate((bin_epsilon_feat,np.zeros(len(discrete_idx)-len(bin_epsilon_feat))))
+    assert len(bin_epsilon_feat) <= len(discreteidx)
+    if len(bin_epsilon_feat) < len(discreteidx):
+      bin_epsilon_feat = np.concatenate((bin_epsilon_feat,np.zeros(len(discreteidx)-len(bin_epsilon_feat))))
 
     # translate to multi representation
     dummyexample = FlyExample(dataset=self)
-    discreteidx_next = discrete_idx
+    discreteidx_next = discreteidx
     bin_epsilon = np.zeros(dummyexample.labels.d_multi)
     bin_epsilon[:] = np.nan
     for i,i_next in enumerate(discreteidx_next):
@@ -3902,23 +4013,23 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       idx_multi_curr = idx_multi_curr[np.isin(idx_multi_curr,dummyexample.labels.idx_multidiscrete_to_multi)]
       bin_epsilon[idx_multi_curr] = bin_epsilon_feat[i]
 
-    self.discrete_idx = np.nonzero(np.isnan(bin_epsilon) == False)[0]
-    self.bin_epsilon = bin_epsilon[self.discrete_idx]
+    self.discreteidx = np.nonzero(np.isnan(bin_epsilon) == False)[0]
+    self.bin_epsilon = bin_epsilon[self.discreteidx]
     
     self.discretize_nbins = nbins
     self.continuous_idx = np.ones(self.d_output,dtype=bool)
-    self.continuous_idx[self.discrete_idx] = False
+    self.continuous_idx[self.discreteidx] = False
     self.continuous_idx = np.nonzero(self.continuous_idx)[0]
     self.d_output_continuous = len(self.continuous_idx)
-    self.d_output_discrete = len(self.discrete_idx)
+    self.d_output_discrete = len(self.discreteidx)
 
     assert((bin_edges is None) == (bin_samples is None))
 
     if bin_edges is None:
       if self.sig_labels is not None:
-        bin_epsilon = np.array(self.bin_epsilon) / self.sig_labels[self.discrete_idx]
+        bin_epsilon = np.array(self.bin_epsilon) / self.sig_labels[self.discreteidx]
       self.discretize_bin_edges,self.discretize_bin_samples,self.discretize_bin_means,self.discretize_bin_medians = \
-        fit_discretize_labels(data,self.discrete_idx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
+        fit_discretize_labels(data,self.discreteidx,nbins=nbins,bin_epsilon=bin_epsilon,**kwargs)
     else:
       self.discretize_bin_samples = bin_samples
       self.discretize_bin_edges = bin_edges
@@ -3927,7 +4038,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       assert nbins == bin_edges.shape[-1]-1
         
     for example in data:
-      example['labels_todiscretize'] = example['labels'][:,self.discrete_idx]
+      example['labels_todiscretize'] = example['labels'][:,self.discreteidx]
       example['labels_discrete'] = discretize_labels(example['labels_todiscretize'],self.discretize_bin_edges,soften_to_ends=True)
       example['labels'] = example['labels'][:,self.continuous_idx]
     
@@ -3954,7 +4065,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     if zscored or (self.mu_labels is None):
       bin_edges = self.discretize_bin_edges
     else:
-      bin_edges = self.unzscore_labels(self.discretize_bin_edges.T,self.discrete_idx).T
+      bin_edges = self.unzscore_labels(self.discretize_bin_edges.T,self.discreteidx).T
     
     return bin_edges
   
@@ -3967,7 +4078,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     else:
       sz = self.discretize_bin_samples.shape
       bin_samples = self.discretize_bin_samples.transpose(0,2,1).reshape((sz[0]*sz[2],sz[1]))
-      bin_samples = self.unzscore_labels(bin_samples,self.discrete_idx)
+      bin_samples = self.unzscore_labels(bin_samples,self.discreteidx)
       bin_samples = bin_samples.reshape((sz[0],sz[2],sz[1])).transpose(0,2,1)
     
     return bin_samples
@@ -4427,7 +4538,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     #   if self.continuous:
     #     labelsprev[1:,self.continuous_idx] = labels[:-1,:]
     #   if self.discretize:
-    #     labelsprev[1:,self.discrete_idx] = labels_todiscretize[:-1,:]
+    #     labelsprev[1:,self.discreteidx] = labels_todiscretize[:-1,:]
     #   eta = labelsprev*etamult
 
     # input pose
@@ -4471,7 +4582,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
     for i in range(idxglobal.shape[0]):
       for j in range(idxglobal.shape[1]):
         idx = idxglobal[i,j]
-        didx = np.nonzero(self.discrete_idx==idx)[0]
+        didx = np.nonzero(self.discreteidx==idx)[0]
         if len(didx) == 0:
           continue
         movement_global_discrete[...,i,j,:] = movement_discrete[...,didx[0],:]
@@ -4751,7 +4862,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
          # movement not set for last time points, will be 0s
         if self.flatten_labels:
           for i in range(movement.shape[1]):
-            if i < len(self.discrete_idx):
+            if i < len(self.discreteidx):
               dmovement = self.discretize_nbins
             else:
               dmovement = len(self.continuous_idx)
@@ -4851,7 +4962,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
           # compute the pose for pred flies for first burnin frames
           labelscurr = PoseLabels(Xkp=Xkp[...,fly],scale=scales[...,i],
                                   simplify_out=self.simplify_out,
-                                  discrete_idx=self.discretefeat,
+                                  discreteidx=self.discretefeat,
                                   tspred_global=self.tspred_global,
                                   ntspred_relative=self.ntspred_relative,
                                   zscore_params=self.zscore_params,
@@ -4865,7 +4976,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
         # compute the pose for pred flies for first burnin frames
         labelscurr = PoseLabels(Xkp=Xkp[...,:burnin,fly],scale=scales[...,i],
                                 simplify_out=self.simplify_out,
-                                discrete_idx=self.discretefeat,
+                                discreteidx=self.discretefeat,
                                 tspred_global=self.tspred_global,
                                 ntspred_relative=self.ntspred_relative,
                                 zscore_params=self.zscore_params,
@@ -4906,9 +5017,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       #   zmovementcurr = self.zscore_nextframe_labels(movement0[...,i])
       #   if self.flatten:
       #     if self.discretize:
-      #       zmovement_todiscretize = zmovementcurr[...,self.discrete_idx]
+      #       zmovement_todiscretize = zmovementcurr[...,self.discreteidx]
       #       zmovement_discrete = discretize_labels(zmovement_todiscretize,self.discretize_bin_edges,soften_to_ends=True)
-      #       zmovement[:burnin-1,:len(self.discrete_idx),:self.discretize_nbins,i] = zmovement_discrete
+      #       zmovement[:burnin-1,:len(self.discreteidx),:self.discretize_nbins,i] = zmovement_discrete
       #     if self.continuous:
       #       zmovement[:burnin-1,-1,:len(self.continuous_idx),i] = zmovementcurr[...,self.continuous_idx]            
       #   else:
@@ -5022,7 +5133,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                 with torch.no_grad():
                   predtoken = model(xcurr[None,:lastidx+token,...].to(device),mask=net_mask,is_causal=is_causal)
                 # to-do: integrate with labels object
-                if token < len(self.discrete_idx):
+                if token < len(self.discreteidx):
                   # sample
                   sampleprob = torch.softmax(predtoken[0,-1,:self.discretize_nbins],dim=-1)
                   binnum = int(weighted_sample(sampleprob,nsamples=nsamples1))
@@ -5037,8 +5148,8 @@ class FlyMLMDataset(torch.utils.data.Dataset):
                   zmovementcurr = self.discretize_bin_samples[sample,token,binnum]
                   
                   # store in output
-                  zmovementout[:,self.discrete_idx[token]] = zmovementcurr
-                else: # else token < len(self.discrete_idx)
+                  zmovementout[:,self.discreteidx[token]] = zmovementcurr
+                else: # else token < len(self.discreteidx)
                   # continuous
                   zmovementout[:,self.continuous_idx] = predtoken[0,-1,:len(self.continuous_idx)].cpu()
                   zmovementout_flattened[token,:len(self.continuous_idx)] = zmovementout[self.continuous_idx,0]
@@ -5295,9 +5406,9 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       if self.d_output_continuous > 0:
         labels[...,self.continuous_idx] = labels_continuous
       if use_todiscretize and (labels_todiscretize is not None):
-        labels[...,self.discrete_idx] = labels_todiscretize
+        labels[...,self.discreteidx] = labels_todiscretize
       else:
-        labels[...,self.discrete_idx] = labels_discrete_to_continuous(labels_discrete,
+        labels[...,self.discreteidx] = labels_discrete_to_continuous(labels_discrete,
                                                                       torch.tensor(self.discretize_bin_edges))
     else:
       labels = labels_continuous.clone()
@@ -5339,7 +5450,7 @@ class FlyMLMDataset(torch.utils.data.Dataset):
       binnum = weighted_sample(labels_discrete[...,i,:].reshape((n,nbins)),nsamples=nsamples)
       sample = torch.randint(low=0,high=nsamples_per_bin,size=(nsamples,n))
       labelscurr = torch.Tensor(self.discretize_bin_samples[sample,i,binnum].reshape((nsamples,)+szrest))
-      labels[...,self.discrete_idx[i]] = labelscurr
+      labels[...,self.discreteidx[i]] = labelscurr
       
     if nsamples == 0:
       labels = labels[0]
@@ -6773,6 +6884,9 @@ def debug_plot_predictions_vs_labels(all_pred,all_labels,ax=None,
   ismasked = all_labels[0].is_masked()
   if ismasked:
     maskv = np.stack([label.get_mask() for label in all_labels],axis=0)
+    nans = np.zeros((len(all_pred),gaplen),dtype=all_labels[0].dtype) + np.nan
+    maskv = np.reshape(np.concatenate((maskv,nans),axis=1),(-1,))
+    maskidx = np.nonzero(maskv)[0]
   naxr = int(np.ceil(nfeat/naxc))
   if ax is None:
     fig,ax = plt.subplots(naxr,naxc,sharex='all',figsize=(20,20))
@@ -6780,14 +6894,14 @@ def debug_plot_predictions_vs_labels(all_pred,all_labels,ax=None,
     plt.tight_layout(h_pad=0)
 
   pred_cmap = lambda x: plt.get_cmap("tab10")(x%10)
-  discrete_idx = list(all_labels[0].idx_multidiscrete_to_multi)
+  discreteidx = list(all_labels[0].idx_multidiscrete_to_multi)
   outnames = all_labels[0].get_multi_names()
   for i,feati in enumerate(featidxplot):
     ax[i].cla()
     ti = ax[i].set_title(outnames[feati],y=1.0,pad=-14,color=pred_cmap(feati),loc='left')
     
-    if feati in discrete_idx:
-      disci = discrete_idx.index(feati)
+    if feati in discreteidx:
+      disci = discreteidx.index(feati)
       predcurr = predv_discrete[:,disci,:].T
       labelscurr = labelsv_discrete[:,disci,:].T
       zlabels = np.nanmax(labelscurr)
@@ -7478,7 +7592,7 @@ def initialize_model(config,train_dataset,device):
     model = TransformerModel(d_input,d_output,**MODEL_ARGS).to(device)
     
     if train_dataset.discretize:
-      # this should be maybe be len(train_dataset.discrete_idx) / train_dataset.d_output
+      # this should be maybe be len(train_dataset.discreteidx) / train_dataset.d_output
       config['weight_discrete'] = len(config['discreteidx']) / nfeatures
       if config['modeltype'] == 'mlm':
         criterion = mixed_masked_criterion
@@ -7582,7 +7696,7 @@ def predict_all(dataloader,dataset,model,config,mask):
 def parse_modelfile(modelfile):
   _,filestr = os.path.split(modelfile)
   filestr,_ = os.path.splitext(filestr)
-  m = re.match('fly(.*)_epoch\d+_(\d{8}T\d{6})',filestr)
+  m = re.match(r'fly(.*)_epoch\d+_(\d{8}T\d{6})',filestr)
   if m is None:
     modeltype_str = ''
     savetime = ''
@@ -7648,12 +7762,20 @@ def animate_predict_open_loop(model,dataset,data,scale_perfly,config,fliespred,t
   if burnin is None:
     burnin = config['contextl']-1
 
-  Xkp_true = data['X'][...,t0:t0+tpred,:].copy()
+  Xkp_true = data['X'][...,t0:t0+tpred+dataset.ntspred_max,:].copy()
   Xkp = Xkp_true.copy()
 
-  #fliespred = np.nonzero(mabe.get_real_flies(Xkp))[0]
   ids = data['ids'][t0,fliespred]
   scales = scale_perfly[:,ids]
+
+
+  #fliespred = np.nonzero(mabe.get_real_flies(Xkp))[0]
+  for i,flynum in enumerate(fliespred):
+    id = data['ids'][t0,flynum]
+    scale = scale_perfly[:,id]
+    metadata = {'flynum': flynum, 'id': id, 't0': t0, 'videoidx': data['videoidx'][t0,0], 'frame0': data['frames'][t0,0]}
+    Xkp_obj = PoseLabels(Xkp=Xkp_true[...,flynum],scale=scale,metadata=metadata,dataset=dataset)
+
 
   if plotfuture:
     # subtract one from tspred_global, as the tspred_global for predicted data come from the previous frame
@@ -8057,7 +8179,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   config = read_config(configfile)
 
   # debug velocity representation
-  config['compute_pose_vel'] = True
+  config['compute_pose_vel'] = False
 
   # debug dct
   config['dct_tau'] = 4
@@ -8158,18 +8280,34 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   train_dataset = FlyMLMDataset(X,**train_dataset_params,**dataset_params)
   
   flyexample = train_dataset.data[0]
+  
+  # compare flyexample initialized from FlyMLMDataset and from keypoints directly
+  contextlpad = train_dataset.contextl + npad + 1
+  Xkp = data['X'][:,:,flyexample.metadata['t0']:flyexample.metadata['t0']+contextlpad,:]
+  flyexample_kp = FlyExample(Xkp=Xkp,scale=scale_perfly[:,flyexample.metadata['id']],
+                             flynum=flyexample.metadata['flynum'],metadata=flyexample.metadata,
+                             **train_dataset.get_flyexample_params())
+  print(f"comparing flyexample initialized from FlyMLMDataset and from keypoints directly")
+  print('max diff between continuous labels: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['continuous']-flyexample.labels.labels_raw['continuous'])))
+  print('max diff between discrete labels: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['discrete']-flyexample.labels.labels_raw['discrete'])))
+  print('max diff between todiscretize: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['todiscretize']-flyexample.labels.labels_raw['todiscretize'])))  
+  multi = flyexample.labels.get_multi(use_todiscretize=True,zscored=False)
+  multi_kp = flyexample_kp.labels.get_multi(use_todiscretize=True,zscored=False)
+  print('max diff between multi labels: %e'%np.max(np.abs(multi-multi_kp)))
 
+  # compare pose feature representation in and outside PoseLabels -- diff should be 0
+  err_chunk_multi = np.max(np.abs(X[0]['labels']-flyexample.labels.get_multi(use_todiscretize=True,zscored=False)))
+  print('max diff between chunked labels and multi: %e'%err_chunk_multi)  
+
+  # extract frames associated with metadata in flyexample
   contextl = flyexample.ntimepoints
   datakp,id = data_to_kp_from_metadata(data,flyexample.metadata,contextl)
+  # compute next frame pose feature representation directly
   datafeat = mabe.kp2feat(datakp.transpose(1,2,0),scale_perfly[:,id])[...,0].T  
 
-  err_chunk_multi = np.max(np.abs(X[0]['labels']-flyexample.labels.get_multi(use_todiscretize=True,zscored=False)))
-  print('max diff between chunked labels and multi: %e'%err_chunk_multi)
-  
-  examplefeat = flyexample.labels.get_next_pose(use_todiscretize=True,zscored=False)
-  
   if config['compute_pose_vel']:
 
+    print('\nComparing next frame movements from train_dataset to those from flyexample')
     chunknext = train_dataset.get_next_movements(movements=X[0]['labels'])
     examplenext = flyexample.labels.get_next(use_todiscretize=True,zscored=False)
     err_chunk_next = np.max(np.abs(chunknext-examplenext))
@@ -8177,6 +8315,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     
   else:
     
+    print('\nComparing next frame pose feature representation from train_dataset to that from flyexample')
     chunknextcossin = train_dataset.get_next_movements(movements=X[0]['labels'])
     examplenextcossin = flyexample.labels.get_nextcossin(use_todiscretize=True,zscored=False)
     err_chunk_nextcossin = np.max(np.abs(chunknextcossin-examplenextcossin))
@@ -8208,7 +8347,9 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   print('max diff between data and example keypoints: %e'%err_max_example_data_kp)
     
   debug_plot_pose(flyexample,data=data)  
-  debug_plot_pose(flyexample,pred=flyexample,tsplot=train_dataset.tspred_global)
+  # elements of the list tspred_global that are smaller than contextl
+  tsplot = [t for t in train_dataset.tspred_global if t < contextl]
+  debug_plot_pose(flyexample,pred=flyexample,tsplot=tsplot)
   
   if config['compute_pose_vel']:
 
@@ -8224,7 +8365,8 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     old_ex = old_train_dataset[0]
     
     compare_dicts(old_ex,new_ex)
-    
+
+    print('\nComparing old fly llm code to new:')    
     mean_err_discrete = torch.mean(torch.sqrt(torch.sum((old_ex['labels_discrete']-new_ex['labels_discrete'])**2.,dim=-1))).item()
     print('mean error between old and new discrete labels: %e'%mean_err_discrete)
 
@@ -8238,6 +8380,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     print('max error between old and new init: %e'%max_err_init)
   
   # check global future predictions
+  print('\nChecking that representations of many frames into the future match')
   for tpred in flyexample.labels.tspred_global:
     examplefuture = flyexample.labels.get_future_globalpos(use_todiscretize=True,tspred=tpred,zscored=False)
     t = flyexample.metadata['t0']+tpred
@@ -8258,12 +8401,14 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
       print(f'max diff between data and t+{tpred} relative prediction: {err_relative_future:e}')
       
   # get a training example
+  print('\nComparing training example from dataset to creating a new FlyExample from that training example, and converting back to a training example')
   trainexample = train_dataset[0]
   flyexample1 = FlyExample(example_in=trainexample,dataset=train_dataset)
   trainexample1 = flyexample1.get_train_example()
   compare_dicts(trainexample,trainexample1)
       
   # initialize example from batch
+  print('\nComparing training batch to FlyExample created from that batch converted back to a training batch')
   train_dataloader = torch.utils.data.DataLoader(train_dataset,
                                                 batch_size=config['batch_size'],
                                                 shuffle=False,
@@ -8280,6 +8425,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   #old_fly_llm.debug_plot_sample_inputs(old_train_dataset,raw_batch)
   
   print('Goodbye!')
+  plt.show(block=True)
 
 def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
@@ -8686,13 +8832,13 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
   # all frames must have real data
   
   burnin = config['contextl']-1
-  contextlpad = burnin + 1
+  contextlpad = burnin + train_dataset.ntspred_max
   allisdata = interval_all(valdata['isdata'],contextlpad)
   isnotsplit = interval_all(valdata['isstart']==False,tpred)[1:,...]
   canstart = np.logical_and(allisdata[:isnotsplit.shape[0],:],isnotsplit)
-  flynum = 2
-  t0 = np.nonzero(canstart[:,flynum])
-  idxstart = 40000
+  flynum = 3 # 2
+  t0 = np.nonzero(canstart[:,flynum])[0]
+  idxstart = np.minimum(40000,len(t0)-1)
   if len(t0) > idxstart:
     t0 = t0[idxstart]
   else:
@@ -8724,7 +8870,7 @@ def main(configfile,loadmodelfile=None,restartmodelfile=None):
 
 def debug_plot_histograms(dataset,alpha=1):
   r = np.random.rand(dataset.discretize_bin_samples.shape[0])-.5
-  ftidx = dataset.unravel_label_index(dataset.discrete_idx)
+  ftidx = dataset.unravel_label_index(dataset.discreteidx)
   #ftidx[featrelative[ftidx[:,0]],1]+=1
   fs = np.unique(ftidx[:,0])
   ts = np.unique(ftidx[:,1])
@@ -8742,9 +8888,9 @@ def debug_plot_histograms(dataset,alpha=1):
   bin_edges = dataset.discretize_bin_edges
   bin_samples = dataset.discretize_bin_samples
   if dataset.sig_labels is not None:
-    bin_edges = unzscore(bin_edges,dataset.mu_labels[dataset.discrete_idx,None],dataset.sig_labels[dataset.discrete_idx,None])
-    bin_samples = unzscore(bin_samples,dataset.mu_labels[None,dataset.discrete_idx,None],dataset.sig_labels[None,dataset.discrete_idx,None])
-  for i,idx in enumerate(dataset.discrete_idx):
+    bin_edges = unzscore(bin_edges,dataset.mu_labels[dataset.discreteidx,None],dataset.sig_labels[dataset.discreteidx,None])
+    bin_samples = unzscore(bin_samples,dataset.mu_labels[None,dataset.discreteidx,None],dataset.sig_labels[None,dataset.discreteidx,None])
+  for i,idx in enumerate(dataset.discreteidx):
     f = ftidx[i,0]
     t = ftidx[i,1]
     fi = np.nonzero(fs==f)[0][0]
@@ -9009,7 +9155,7 @@ def debug_plot_dct_relative_error(predv,labelsv,train_dataset):
 
 def debug_plot_histogram_edges(train_dataset):
   bin_edges = train_dataset.get_bin_edges(zscored=False)
-  ftidx = train_dataset.unravel_label_index(train_dataset.discrete_idx)
+  ftidx = train_dataset.unravel_label_index(train_dataset.discreteidx)
   fs = np.unique(ftidx[:,0])
   ts = np.unique(ftidx[:,1])
   fig,ax = plt.subplots(1,len(fs),sharey=True)
@@ -9040,6 +9186,6 @@ if __name__ == "__main__":
     assert os.path.isdir(args.cleandir)      
     removedfiles = clean_intermediate_results(args.cleandir)
   else:
-    #debug_fly_example(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
-    main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
+    debug_fly_example(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
+    #main(args.configfile,loadmodelfile=args.loadmodelfile,restartmodelfile=args.restartmodelfile)
   #explore_representation(args.configfile)
