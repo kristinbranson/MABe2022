@@ -3434,7 +3434,7 @@ class FlyExample:
     if example_in is not None:
       example_in = {k: v for k,v in example_in.items()}
       if 'metadata' in example_in:
-        example_in['metadata'] = {k: v for k,v in example_in['metadata'].items()}
+        example_in['metadata'] = {k: copy.deepcopy(v) for k,v in example_in['metadata'].items()}
     elif Xkp is not None:
       example_in = self.compute_features(Xkp,flynum,scale,metadata)
       dozscore = True
@@ -3454,6 +3454,7 @@ class FlyExample:
         else:
           starttoff = 0
         example_in['metadata']['t0'] -= starttoff
+        example_in['metadata']['frame0'] -= starttoff
       
     self.labels = PoseLabels(example_in,dozscore=dozscore,dodiscretize=dodiscretize,**self.get_poselabel_params())
 
@@ -8126,8 +8127,9 @@ def sanity_check_temporal_dep(train_dataloader,device,train_src_mask,is_causal,m
     matches = torch.all(pred2[:,:tmess]==pred[:,:tmess]).item()
     assert matches
     
-def compare_dicts(old_ex,new_ex):
+def compare_dicts(old_ex,new_ex,maxerr=None):
   for k,v in old_ex.items():
+    err = 0.
     if not k in new_ex:
       print(f'Missing key {k}')
     elif type(v) is torch.Tensor:
@@ -8149,6 +8151,9 @@ def compare_dicts(old_ex,new_ex):
         print(f'max diff {k}: {err:e}')
       except:
         print(f'not comparing {k}')
+    if maxerr is not None:
+      assert err < maxerr
+
   return
 
 def data_to_kp_from_metadata(data,metadata,ntimepoints):
@@ -8173,7 +8178,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   #tmpsavefile = 'chunkeddata20240325_decimated.pkl'
   tmpsavefile = 'tmp_small_usertrainval.pkl'
 
-  #configfile = 'config_fly_llm_multitime_20230825.json'
+  configfile = 'config_fly_llm_multitime_20230825.json'
 
   # configuration parameters for this model
   config = read_config(configfile)
@@ -8288,16 +8293,25 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
                              flynum=flyexample.metadata['flynum'],metadata=flyexample.metadata,
                              **train_dataset.get_flyexample_params())
   print(f"comparing flyexample initialized from FlyMLMDataset and from keypoints directly")
-  print('max diff between continuous labels: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['continuous']-flyexample.labels.labels_raw['continuous'])))
-  print('max diff between discrete labels: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['discrete']-flyexample.labels.labels_raw['discrete'])))
-  print('max diff between todiscretize: %e'%np.max(np.abs(flyexample_kp.labels.labels_raw['todiscretize']-flyexample.labels.labels_raw['todiscretize'])))  
+  err = np.max(np.abs(flyexample_kp.labels.labels_raw['continuous']-flyexample.labels.labels_raw['continuous']))
+  print('max diff between continuous labels: %e'%err)
+  assert err < 1e-9
+  err = np.max(np.abs(flyexample_kp.labels.labels_raw['discrete']-flyexample.labels.labels_raw['discrete'])) 
+  print('max diff between discrete labels: %e'%err)
+  assert err < 1e-9
+  err = np.max(np.abs(flyexample_kp.labels.labels_raw['todiscretize']-flyexample.labels.labels_raw['todiscretize']))
+  print('max diff between todiscretize: %e'%err)  
+  assert err < 1e-9
   multi = flyexample.labels.get_multi(use_todiscretize=True,zscored=False)
   multi_kp = flyexample_kp.labels.get_multi(use_todiscretize=True,zscored=False)
-  print('max diff between multi labels: %e'%np.max(np.abs(multi-multi_kp)))
+  err = np.max(np.abs(multi-multi_kp))
+  print('max diff between multi labels: %e'%err)
+  assert err < 1e-9
 
-  # compare pose feature representation in and outside PoseLabels -- diff should be 0
+  # compare pose feature representation in and outside PoseLabels
   err_chunk_multi = np.max(np.abs(X[0]['labels']-flyexample.labels.get_multi(use_todiscretize=True,zscored=False)))
   print('max diff between chunked labels and multi: %e'%err_chunk_multi)  
+  assert err_chunk_multi < 1e-3
 
   # extract frames associated with metadata in flyexample
   contextl = flyexample.ntimepoints
@@ -8312,7 +8326,8 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     examplenext = flyexample.labels.get_next(use_todiscretize=True,zscored=False)
     err_chunk_next = np.max(np.abs(chunknext-examplenext))
     print('max diff between chunked labels and next: %e'%err_chunk_next)
-    
+    assert err_chunk_next < 1e-3
+
   else:
     
     print('\nComparing next frame pose feature representation from train_dataset to that from flyexample')
@@ -8320,32 +8335,40 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     examplenextcossin = flyexample.labels.get_nextcossin(use_todiscretize=True,zscored=False)
     err_chunk_nextcossin = np.max(np.abs(chunknextcossin-examplenextcossin))
     print('max diff between chunked labels and nextcossin: %e'%err_chunk_nextcossin)
+    assert err_chunk_nextcossin < 1e-3
 
     chunknext = train_dataset.convert_cos_sin_to_angle(chunknextcossin)
     examplenext = flyexample.labels.get_next(use_todiscretize=True,zscored=False)
     err_chunk_next = np.max(np.abs(chunknext-examplenext))
     print('max diff between chunked labels and next: %e'%err_chunk_next)
+    assert err_chunk_next < 1e-3
 
     examplefeat = flyexample.labels.get_next_pose(use_todiscretize=True,zscored=False)
     
     err_chunk_data_feat = np.max(np.abs(chunknext[:,featrelative]-datafeat[1:,featrelative]))
     print('max diff between chunked and data relative features: %e'%err_chunk_data_feat)
-    
+    assert err_chunk_data_feat < 1e-3
+
     err_example_chunk_feat = np.max(np.abs(chunknext[:,featrelative]-examplefeat[1:,featrelative]))
     print('max diff between chunked and example relative features: %e'%err_example_chunk_feat)
+    assert err_example_chunk_feat < 1e-3
 
   err_example_data_global = np.max(np.abs(datafeat[:,featglobal]-examplefeat[:,featglobal]))
   print('max diff between data and example global features: %e'%err_example_data_global)
+  assert err_example_data_global < 1e-3
 
   err_example_data_feat = np.max(np.abs(datafeat[:,featrelative]-examplefeat[:,featrelative]))
   print('max diff between data and example relative features: %e'%err_example_data_feat)
+  assert err_example_data_feat < 1e-3
   
   examplekp = flyexample.labels.get_next_keypoints(use_todiscretize=True)
   err_mean_example_data_kp = np.mean(np.abs(datakp[:]-examplekp))
   print('mean diff between data and example keypoints: %e'%err_mean_example_data_kp)
+  assert err_mean_example_data_kp < 1e-2
   err_max_example_data_kp = np.max(np.abs(datakp[:]-examplekp))
   print('max diff between data and example keypoints: %e'%err_max_example_data_kp)
-    
+  assert err_max_example_data_kp < 1e-1
+
   debug_plot_pose(flyexample,data=data)  
   # elements of the list tspred_global that are smaller than contextl
   tsplot = [t for t in train_dataset.tspred_global if t < contextl]
@@ -8364,20 +8387,24 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     new_ex = flyexample.get_train_example()
     old_ex = old_train_dataset[0]
     
-    compare_dicts(old_ex,new_ex)
+    compare_dicts(old_ex,new_ex,maxerr=1e-3)
 
     print('\nComparing old fly llm code to new:')    
     mean_err_discrete = torch.mean(torch.sqrt(torch.sum((old_ex['labels_discrete']-new_ex['labels_discrete'])**2.,dim=-1))).item()
     print('mean error between old and new discrete labels: %e'%mean_err_discrete)
+    assert mean_err_discrete < 1e-3
 
     max_err_continuous = torch.max(torch.abs(old_ex['labels']-new_ex['labels'])).item()
     print('max error between old and new continuous labels: %e'%max_err_continuous)
+    assert max_err_continuous < 1e-3
     
     max_err_input = torch.max(torch.abs(new_ex['input']-old_ex['input'])).item()
     print('max error between old and new input: %e'%max_err_input)
+    assert max_err_input < 1e-3
     
     max_err_init = torch.max(torch.abs(new_ex['init']-old_ex['init'])).item()
     print('max error between old and new init: %e'%max_err_init)
+    assert max_err_init < 1e-3
   
   # check global future predictions
   print('\nChecking that representations of many frames into the future match')
@@ -8389,6 +8416,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
     datafeatfuture = mabe.kp2feat(datakpfuture,scale_perfly[:,id])[...,0].T  
     err_global_future = np.max(np.abs(datafeatfuture[:,featglobal]-examplefuture[:,0,:]))
     print(f'max diff between data and t+{tpred} global prediction: {err_global_future:e}')
+    assert err_global_future < 1e-6
   
   # check relative future predictions
   if flyexample.labels.ntspred_relative > 1:
@@ -8399,13 +8427,14 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
       datafeatfuture = mabe.kp2feat(datakpfuture,scale_perfly[:,id])[...,0].T  
       err_relative_future = np.max(np.abs(datafeatfuture[:,featrelative]-examplefuture[:,tpred-1,:]))
       print(f'max diff between data and t+{tpred} relative prediction: {err_relative_future:e}')
+      assert err_relative_future < 1e-6
       
   # get a training example
   print('\nComparing training example from dataset to creating a new FlyExample from that training example, and converting back to a training example')
   trainexample = train_dataset[0]
   flyexample1 = FlyExample(example_in=trainexample,dataset=train_dataset)
   trainexample1 = flyexample1.get_train_example()
-  compare_dicts(trainexample,trainexample1)
+  compare_dicts(trainexample,trainexample1,maxerr=1e-9)
       
   # initialize example from batch
   print('\nComparing training batch to FlyExample created from that batch converted back to a training batch')
@@ -8417,7 +8446,7 @@ def debug_fly_example(configfile=None,loadmodelfile=None,restartmodelfile=None):
   raw_batch = next(iter(train_dataloader))
   example_batch = FlyExample(example_in=raw_batch,dataset=train_dataset)
   trainbatch1 = example_batch.get_train_example()
-  compare_dicts(raw_batch,trainbatch1)
+  compare_dicts(raw_batch,trainbatch1,maxerr=1e-9)
 
   debug_plot_pose(example_batch,data=data)
   debug_plot_sample(example_batch,train_dataset)
